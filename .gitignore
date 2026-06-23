@@ -1,0 +1,45 @@
+# Python / tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+
+# Local machine files
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Keep raw research files on disk, but do not track them in the outline repo.
+runtime/
+
+# Ignore the older full OmniFlow mirror that may remain in this directory.
+src/foundation/
+src/omniflow/
+src/utg/
+tests/vector/
+tests/scripts/
+tests/utg_core/
+docs/reference/
+scripts/omnitransfer_*.py
+
+# Keep the new lightweight outline structure.
+!src/omnitransfer/
+!src/omnitransfer/**
+!tests/test_*.py
+!docs/
+!docs/*.md
+!artifacts/
+!artifacts/**
+
+# The keep-rules above should not re-include generated Python caches.
+**/__pycache__/
+*.py[cod]
