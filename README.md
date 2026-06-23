@@ -1,17 +1,18 @@
 # OmniTransfer
 
-OmniTransfer is a lightweight research repository outline for source-context
-UI grounding relocation on mobile GUI agents.
+OmniTransfer is a lightweight research repository outline for replay-time UI
+grounding in GUI record-and-replay systems.
 
 The task is:
 
 ```text
-input:  source UI graph G_s, source point/node p_s, target UI graph G_t
-output: target point/node p_t
+input:  recorded source UI graph G_s, source element e_s, target replay graph G_t
+output: corresponding target replay element e_t
 ```
 
-It is not action prediction. The cached function or planner decides the action
-type; OmniTransfer only relocates the target grounding.
+It is not action prediction. The recorded trace or cached function already
+decides the operation type; OmniTransfer only relocates the recorded target on
+the current replay screen.
 
 ## Repository Layout
 
@@ -61,10 +62,11 @@ current path inventory.
 
 ## One-Line Method
 
-OmniTransfer ranks target UI candidates using source grounding features,
-target-candidate features, local UI structure, and optional historical context.
-The first deployable version is a structured ranker rather than a VLM or
-end-to-end action model.
+Record-and-replay fails when recorded coordinates or selectors no longer
+identify the intended UI target. OmniTransfer treats replay as
+source-conditioned GUI grounding: first find plausible target regions on the
+current screen, then select the candidate corresponding to the recorded source
+element and local context.
 
 ## Smoke Check
 

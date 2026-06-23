@@ -31,25 +31,36 @@ Local path:
 runtime/evals/temdroid_semfinder_action_transfer_compare_20260615/
 ```
 
-## Metric
+## Metrics
 
-The main metric is Top1 target grounding accuracy:
+The main metric is Top1 replay target grounding accuracy:
 
 ```text
 Top1 = count(argmax_i score_i == gold) / number_of_queries
 ```
 
-Latency should be reported with average and p95.
+Safety metrics are equally important for record-and-replay:
+
+```text
+false_positive_rate = concrete target predicted when gold is NULL
+abstain_accuracy = NULL predicted when target is absent or ambiguous
+wrong_target_rate = concrete target predicted but candidate is not gold
+```
+
+Latency should be reported with average and p95 because this component sits on
+the replay hot path.
 
 ## Baseline Families
 
 - fixed coordinate replay
 - text/resource/class feature scorer
+- raw UI-tree exact replay
+- UI-tree plus anchor replay
 - paper IH-layout approximation
 - GBDT structured ranker
-- LightGlue external visual matcher
-- optional VLM API baseline
-- OmniTransfer structured ranker
+- attention-based grounding baseline
+- LoRA bbox-generation baseline
+- two-layer source-conditioned grounder
 
 ## Reporting Rule
 
