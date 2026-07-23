@@ -517,10 +517,7 @@ class LearnedGraphMatcher:
         )
         with torch.no_grad():
             logits = self.model(*inputs)["logits_ab"][source_index]
-            selected_logits = torch.cat(
-                [logits[candidate_indices], logits[-1:].clone()],
-                dim=0,
-            )
+            selected_logits = logits[candidate_indices]
             probabilities = torch.softmax(selected_logits, dim=0)
         ranked = sorted(
             (
@@ -529,16 +526,13 @@ class LearnedGraphMatcher:
             ),
             key=lambda item: (-item[1], item[0]),
         )
-        null_probability = float(probabilities[-1])
         best_id, best_probability = ranked[0]
         second_probability = max(
-            [null_probability, *(score for _, score in ranked[1:])],
-            default=null_probability,
+            (score for _, score in ranked[1:]),
+            default=0.0,
         )
         margin = best_probability - second_probability
-        scores = tuple([*ranked, ("__NULL__", null_probability)])
-        if null_probability >= best_probability:
-            return LearnedMatch(None, null_probability, margin, "learned_null", scores)
+        scores = tuple(ranked)
         if best_probability < min_probability or margin < min_margin:
             return LearnedMatch(None, best_probability, margin, "learned_low_confidence", scores)
         target_node = next(node for node in target.nodes if node.node_id == best_id)

@@ -86,10 +86,7 @@ class NumpyMutualGraphMatcher:
         if not candidate_indices:
             return LearnedMatch(None, 0.0, 0.0, "target_candidates_missing", ())
         logits = self._forward(source, target)["logits_ab"][source_index]
-        selected_logits = np.concatenate(
-            (logits[candidate_indices], logits[-1:]),
-            axis=0,
-        )
+        selected_logits = logits[candidate_indices]
         probabilities = _softmax(selected_logits, axis=0)
         ranked = sorted(
             (
@@ -98,16 +95,13 @@ class NumpyMutualGraphMatcher:
             ),
             key=lambda item: (-item[1], item[0]),
         )
-        null_probability = float(probabilities[-1])
         best_id, best_probability = ranked[0]
         second_probability = max(
-            [null_probability, *(score for _, score in ranked[1:])],
-            default=null_probability,
+            (score for _, score in ranked[1:]),
+            default=0.0,
         )
         margin = best_probability - second_probability
-        scores = tuple([*ranked, ("__NULL__", null_probability)])
-        if null_probability >= best_probability:
-            return LearnedMatch(None, null_probability, margin, "learned_null", scores)
+        scores = tuple(ranked)
         if best_probability < min_probability or margin < min_margin:
             return LearnedMatch(
                 None,

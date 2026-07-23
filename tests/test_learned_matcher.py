@@ -105,7 +105,7 @@ def test_relation_matcher_forward_and_partial_assignment_loss() -> None:
     assert any(isinstance(module, torch.nn.MultiheadAttention) for module in model.modules())
 
 
-def test_inference_adapter_returns_failure_when_null_wins() -> None:
+def test_inference_adapter_ignores_null_logit() -> None:
     torch = pytest.importorskip("torch")
     source = _graph("source")
     target = _graph("target", delete_y=60)
@@ -115,6 +115,7 @@ def test_inference_adapter_returns_failure_when_null_wins() -> None:
             source_count = inputs[0].shape[0]
             target_count = inputs[3].shape[0]
             logits_ab = torch.zeros((source_count, target_count + 1))
+            logits_ab[:, 1] = 2.0
             logits_ab[:, -1] = 10.0
             logits_ba = torch.zeros((target_count, source_count + 1))
             logits_ba[:, -1] = 10.0
@@ -126,9 +127,10 @@ def test_inference_adapter_returns_failure_when_null_wins() -> None:
         source_node_id="delete",
     )
 
-    assert result.target_node is None
-    assert result.reason == "learned_null"
-    assert result.scores[-1][0] == "__NULL__"
+    assert result.target_node is not None
+    assert result.target_node.node_id == "delete"
+    assert result.reason == "learned_match"
+    assert all(candidate_id != "__NULL__" for candidate_id, _ in result.scores)
 
 
 def test_visual_encoder_is_jointly_trained_when_screenshots_exist(tmp_path) -> None:
