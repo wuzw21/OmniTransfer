@@ -1,0 +1,50 @@
+{
+  "schema_version": "omnitransfer_android_control_source_manifest_v1",
+  "dataset": "google-research/AndroidControl",
+  "audited_on": "2026-07-20",
+  "license": "Apache-2.0",
+  "source": "https://storage.googleapis.com/gresearch/android_control/",
+  "paper": "https://arxiv.org/abs/2406.03679",
+  "format": "GZIP TFRecord containing TensorFlow Example and AndroidAccessibilityForest protobuf payloads",
+  "protobuf_revision": "53617fa588c2610e3936da8dbca41c1ba406c013",
+  "total_bytes": 49930448595,
+  "demonstrations": 15283,
+  "apps": 833,
+  "official_splits": {
+    "train_episodes": 13603,
+    "validation_episodes": 137,
+    "test_episodes": 1543,
+    "url": "https://storage.googleapis.com/gresearch/android_control/splits.json"
+  },
+  "test_subsplits": {
+    "IDD": 721,
+    "task_unseen": 803,
+    "app_unseen": 631,
+    "category_unseen": 700,
+    "url": "https://storage.googleapis.com/gresearch/android_control/test_subsplits.json"
+  },
+  "objects": [
+    {"name": "android_control-00000-of-00020", "bytes": 2492987829, "md5_base64": "QuhP+X5aiP+iD5amlNM6tA=="},
+    {"name": "android_control-00001-of-00020", "bytes": 2381590403, "md5_base64": "YEgUqLKmkb3Myu+sn8w9Hw=="},
+    {"name": "android_control-00002-of-00020", "bytes": 2524501320, "md5_base64": "mRohMITXMgOv5lW9uKZJzg=="},
+    {"name": "android_control-00003-of-00020", "bytes": 2521787571, "md5_base64": "1iHt5nD8mJDebNXfbj+J9A=="},
+    {"name": "android_control-00004-of-00020", "bytes": 2492154967, "md5_base64": "ZSFUhsEdL1vVQJFe2LqxHQ=="},
+    {"name": "android_control-00005-of-00020", "bytes": 2494079253, "md5_base64": "cYA4TqdZfFsjB7W4EG0mGQ=="},
+    {"name": "android_control-00006-of-00020", "bytes": 2581962545, "md5_base64": "7JbtvucLhWuXtqBbzgHMlQ=="},
+    {"name": "android_control-00007-of-00020", "bytes": 2676941243, "md5_base64": "2HNcLWRLKhv0UThR5794aA=="},
+    {"name": "android_control-00008-of-00020", "bytes": 2483337369, "md5_base64": "yZOE6/Ovq/pmw5LKS1YlLg=="},
+    {"name": "android_control-00009-of-00020", "bytes": 2630264084, "md5_base64": "e18whCgrcbQPau+20rST7Q=="},
+    {"name": "android_control-00010-of-00020", "bytes": 2495033402, "md5_base64": "bYj0TvfhuOWPEMDn5rebZw=="},
+    {"name": "android_control-00011-of-00020", "bytes": 2418884116, "md5_base64": "WTUWA7Mb43BC136dE1dtbQ=="},
+    {"name": "android_control-00012-of-00020", "bytes": 2503753753, "md5_base64": "WHKZpHKm7J2TPT1KcGViuA=="},
+    {"name": "android_control-00013-of-00020", "bytes": 2516494995, "md5_base64": "XJsXkpP/+XuN+tSu/tbBAQ=="},
+    {"name": "android_control-00014-of-00020", "bytes": 2453866804, "md5_base64": "7mIiIt7gp06xBCaBESPb6Q=="},
+    {"name": "android_control-00015-of-00020", "bytes": 2345501105, "md5_base64": "fpY5ZABCLM6bNS6m3Yi3uA=="},
+    {"name": "android_control-00016-of-00020", "bytes": 2398778868, "md5_base64": "B5GCzf12qeGXgWEf0Adu1w=="},
+    {"name": "android_control-00017-of-00020", "bytes": 2421224827, "md5_base64": "4WtwF/Tx1c48pKyH/SGF5Q=="},
+    {"name": "android_control-00018-of-00020", "bytes": 2538585489, "md5_base64": "Q8JvIFjosrJjLUKu9fgxgg=="},
+    {"name": "android_control-00019-of-00020", "bytes": 2558503032, "md5_base64": "xuJJrmWvdUT1zlKYsKN0pg=="}
+  ],
+  "storage_policy": "stream one shard directly into an atomic 384px Unified UIGraph bundle; do not retain the raw 49.93 GB snapshot on 9207",
+  "model_policy": "actions, goals, and instructions are label-only metadata; inference uses the same learned relation and cross-attention matcher"
+}

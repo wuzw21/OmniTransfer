@@ -1,0 +1,128 @@
+{
+  "schema_version": "omnitransfer_modern_gui_dataset_research_v1",
+  "audited_on": "2026-07-20",
+  "selection_rule": "Prefer screenshot plus bounded structured elements that can enter the one Unified UIGraph matcher path without coordinate or identifier shortcuts.",
+  "candidates": [
+    {
+      "dataset": "OS-Copilot/OS-Atlas-data/android_world",
+      "revision": "e3a4c90c5f6129c25efdaa0671b08a11f7cb8f3f",
+      "license": "Apache-2.0",
+      "bytes": 2357063223,
+      "scale": "15,905 screenshots and 89,860 bounded Android elements",
+      "usable_fields": ["img_filename", "instruction", "bbox", "data_type"],
+      "decision": "acquire_exact_subset_and_pretrain_now",
+      "reason": "Independent modern AndroidWorld collection that enters the same graph and verified augmentation path without heuristic correspondence labels."
+    },
+    {
+      "dataset": "google-research/AndroidControl",
+      "revision": "public 20-shard release audited 2026-07-20",
+      "license": "Apache-2.0",
+      "bytes": 49930448595,
+      "scale": "15,283 demonstrations, 14,548 tasks, and 833 Android apps",
+      "usable_fields": ["screenshots", "accessibility_trees", "actions", "step_instructions"],
+      "decision": "stream_all_official_shards_into_atomic_compact_graph_bundles",
+      "reason": "Excellent app diversity and true accessibility trees; the TensorFlow-free streaming importer avoids retaining the verified 49.93 GB raw snapshot on 9207."
+    },
+    {
+      "dataset": "UI-MOPD/Uni-GUI-OpenMobile",
+      "revision": "774eb20f97724bf64faa9e66b1572f05b1688e38",
+      "license": "Apache-2.0",
+      "bytes": 9384688170,
+      "scale": "2,640 trajectories, about 25.9K steps, 19 open-source Android apps",
+      "usable_fields": ["screenshot", "ui_elements", "bbox", "attributes", "action_bbox", "trajectory"],
+      "decision": "acquire_full_and_pretrain_now",
+      "reason": "Newest direct MobileViews-like source; every audited step has bounded UI elements."
+    },
+    {
+      "dataset": "biglab/webui-70k-elements",
+      "revision": "0e39a706c86507a52df935c2f10094334bbb7557",
+      "converted_parquet_revision": "8b74f86a8418b4578ad85e73eaba3d6e7280ed9d",
+      "license": "research terms; screenshot copyright may remain with source sites",
+      "bytes": 11396715289,
+      "scale": "173,546 screenshot rows from the domain-disjoint Web-70k training subset; official validation and test contain 21,168 and 41,994 rows",
+      "usable_fields": ["image", "labels", "contentBoxes", "key_name"],
+      "decision": "acquire_after_openmobile_and_pretrain",
+      "reason": "Largest storage-feasible screenshot plus bounded-element source; adds web and viewport diversity without a second matcher path."
+    },
+    {
+      "dataset": "osunlp/Multimodal-Mind2Web",
+      "revision": "1b4c6a8cf9f77b7a5e0d641959935c80c4a05889",
+      "license": "OpenRAIL",
+      "bytes": 13577379722,
+      "scale": "7,775 train actions plus frozen cross-task, cross-website, and cross-domain splits",
+      "usable_fields": ["screenshot", "raw_html", "cleaned_html", "positive_candidates", "negative_candidates", "bounding_box_rect"],
+      "decision": "next_web_and_webview_pilot",
+      "reason": "Direct screenshot/DOM candidate supervision fits the same graph and learned NULL path."
+    },
+    {
+      "dataset": "UI-MOPD/Uni-GUI-Mobile",
+      "revision": "45244387a3c284810894bc2be974b28014dcf838",
+      "license": "Apache-2.0",
+      "bytes": 6860379334,
+      "scale": "871 trajectories and about 14K steps",
+      "usable_fields": ["screenshot", "action_bbox", "trajectory"],
+      "decision": "defer",
+      "reason": "Task records expose action boxes but not a full per-screen UI element set."
+    },
+    {
+      "dataset": "public_foldable_GUI_mapping_corpora",
+      "revision": "GitHub, Hugging Face, arXiv, and existing GUI dataset device metadata audited 2026-07-21",
+      "license": "not_applicable",
+      "bytes": 0,
+      "scale": "no verified public folded/unfolded screenshot plus UI-tree correspondence corpus found",
+      "usable_fields": [],
+      "decision": "collect_versioned_FoldTransfer_pairs_on_9207",
+      "reason": "Ordinary aspect-ratio variation is not fold posture. The installed emulator resources expose Pixel 10 Pro Fold CLOSED, HALF_OPENED, OPENED, and REAR_DISPLAY_MODE states, enabling controlled same-task collection after SDK preflight."
+    },
+    {
+      "dataset": "OpenGVLab/GUI-Odyssey",
+      "revision": "71e0e7e2d169c642e7a99c264d82ffecadf67889",
+      "license": "CC-BY-4.0",
+      "bytes": 66876181949,
+      "scale": "7,735 episodes, 92,158 screenshots, 201 apps, six devices",
+      "usable_fields": ["screenshot", "click_coordinate", "trajectory"],
+      "decision": "outcome_or_visual_only",
+      "reason": "Large mobile coverage, but action coordinates do not provide a verified candidate graph."
+    },
+    {
+      "dataset": "Bofeee5675/GUI-Net-1M",
+      "revision": "60d1e644fcff7d3b62093baec03fe7efeb0d98a1",
+      "license": "Apache-2.0",
+      "bytes": 569811220713,
+      "scale": "100K to 1M category; split archives total about 570GB",
+      "usable_fields": ["screenshot", "generated_GUI_training_annotations"],
+      "decision": "defer_pending_schema_and_storage",
+      "reason": "No verified stable hierarchy path yet and current server free space cannot hold the release safely."
+    },
+    {
+      "dataset": "ONE-Lab/GUI-World",
+      "revision": "7901fa3f0b9e36afa87d24ff9ecd48037c7fd6a0",
+      "license": "CC-BY-4.0",
+      "bytes": 93948758422,
+      "scale": "12,379 media/annotation files dominated by 12,171 MP4 videos",
+      "usable_fields": ["video", "question_answer_annotations"],
+      "decision": "benchmark_reference_only",
+      "reason": "Dynamic GUI understanding benchmark, not element correspondence data."
+    },
+    {
+      "dataset": "HuggingFaceM4/WebSight",
+      "revision": "b11f8172f89c992b56ac702319e02c428cca4a4e",
+      "license": "CC-BY-4.0",
+      "bytes": 317180101480,
+      "scale": "1M to 10M HTML/screenshot category",
+      "usable_fields": ["screenshot", "HTML"],
+      "decision": "stream_later_for_render_stable_augmentation",
+      "reason": "Excellent synthetic web scale, but rendering is required to recover verified node geometry."
+    }
+  ],
+  "priority_order": [
+    "finish MobileViews 50K and scale toward the full official shard",
+    "finish full Uni-GUI-OpenMobile snapshot and package-disjoint import",
+    "acquire WebUI 70K train only and keep its official domain-disjoint validation/test frozen",
+    "acquire the exact 2.36 GB OS-Atlas AndroidWorld subset and mix it with replay from earlier domains",
+    "stream all 20 AndroidControl shards and preserve its official unseen-app and unseen-category benchmark subsets",
+    "collect a separate FoldTransfer benchmark instead of treating aspect-ratio augmentation as foldable data",
+    "pilot Multimodal-Mind2Web for action-candidate supervision",
+    "expand only when mapping dev, NULL recall, and strict 50ms latency improve"
+  ]
+}

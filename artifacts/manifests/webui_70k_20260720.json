@@ -1,0 +1,67 @@
+{
+  "schema_version": "omnitransfer_external_dataset_acquisition_v1",
+  "dataset": "biglab/webui-70k-elements",
+  "source": "https://huggingface.co/datasets/biglab/webui-70k-elements",
+  "source_revision": "0e39a706c86507a52df935c2f10094334bbb7557",
+  "converted_parquet_revision": "8b74f86a8418b4578ad85e73eaba3d6e7280ed9d",
+  "license": "research terms; screenshot copyright may remain with source sites",
+  "official_statistics": {
+    "original_corpus": "400K web UIs",
+    "train_subset": "Web-70k, domain-disjoint from official validation and test",
+    "repacked_rows": 173546,
+    "download_bytes": 11396715289,
+    "fields": ["image", "labels", "contentBoxes", "key_name"]
+  },
+  "official_splits": {
+    "policy": "pages grouped by domain before 70/10/20 train/validation/test split",
+    "validation_dataset": "biglab/webui-val-elements",
+    "validation_rows": 21168,
+    "test_dataset": "biglab/webui-test-elements",
+    "test_rows": 41994,
+    "formal_eval_is_never_training_data": true
+  },
+  "adapter": {
+    "release": "/home/wuzewen/Projects/Omni/OmniTransfer/runtime/releases/webui-import-20260720-3fc4c3770b93",
+    "entrypoint": "scripts/import_webui.py",
+    "output": "lossless 384px screenshot plus visible bounded semantic elements",
+    "policies": {
+      "offscreen_or_unbounded_elements": "exclude",
+      "origin_id": "augmentation label only",
+      "element_boxes": "learned geometry input, never a rule matcher",
+      "matcher": "same shared encoder, relation self-attention, bidirectional cross-attention, and learned NULL"
+    }
+  },
+  "server": {
+    "ssh_alias": "9207",
+    "root": "/home/wuzewen/Projects/Omni/OmniTransfer/runtime/datasets/webui_70k_20260720",
+    "status": "complete_source_snapshot",
+    "verified_files": 26,
+    "verified_bytes": 11396715289,
+    "download_manifest": "/home/wuzewen/Projects/Omni/OmniTransfer/runtime/datasets/webui_70k_20260720/parquet/download_manifest.json",
+    "storage_policy": "verify SHA-256 from the Hub linked ETag before atomic rename"
+  },
+  "server_mock": {
+    "status": "verified",
+    "source_file": "0000.parquet",
+    "source_bytes": 315882468,
+    "source_sha256": "5e6ec637da2c4f455793fa68358eca8d092e38b4a4026fbabdd82a5acd2ffdd1",
+    "accepted_screens": 20,
+    "nodes": 668,
+    "average_nodes": 33.4,
+    "max_nodes": 77,
+    "viewports": 6
+  },
+  "pilot_training_bundle": {
+    "dataset": "biglab/webui-7k-elements",
+    "rows": 20029,
+    "verified_files": 4,
+    "verified_bytes": 1307811128,
+    "accepted_screens": 18602,
+    "skipped": {"invalid_elements": 187, "too_few_nodes": 1240},
+    "node_count": 602513,
+    "average_nodes": 32.3896892807225,
+    "max_nodes": 903,
+    "viewports": 6,
+    "status": "resumed training from the completed MobileViews 50K checkpoint on all accepted screens"
+  }
+}

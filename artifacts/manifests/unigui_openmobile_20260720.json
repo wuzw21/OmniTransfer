@@ -1,0 +1,87 @@
+{
+  "schema_version": "omnitransfer_external_dataset_acquisition_v1",
+  "dataset": "UI-MOPD/Uni-GUI-OpenMobile",
+  "release": "2026-07-07 snapshot",
+  "license": "Apache-2.0",
+  "source_revision": "774eb20f97724bf64faa9e66b1572f05b1688e38",
+  "source": "https://huggingface.co/datasets/UI-MOPD/Uni-GUI-OpenMobile",
+  "official_statistics": {
+    "trajectories": 2640,
+    "steps": "about 25.9K",
+    "apps": 19,
+    "platform": "AndroidWorld open-source Android apps"
+  },
+  "repository_audit": {
+    "bytes": 9384688170,
+    "files": 41539,
+    "png_files": 34344,
+    "json_files": 7193,
+    "gated": false
+  },
+  "verified_schema": {
+    "metadata": "goal plus steps; every audited step has logical_screen_size and ui_elements",
+    "ui_element_fields": [
+      "bbox_pixels",
+      "resource_name",
+      "text",
+      "content_description",
+      "class_name",
+      "package_name",
+      "interaction_flags"
+    ],
+    "task": "app package, query, action, action bbox, screenshot name, and review flags"
+  },
+  "server": {
+    "ssh_alias": "9207",
+    "hostname": "baldursgate",
+    "root": "/home/wuzewen/Projects/Omni/OmniTransfer/runtime/datasets/unigui_openmobile_20260720",
+    "download_endpoint": "https://hf-mirror.com",
+    "download_policy": "fixed-revision LFS download with per-file SHA-256 verification, retry repair, expected file-count audit, and atomic rename",
+    "status": "complete",
+    "verified_png_files": 34344,
+    "verified_json_files": 7193,
+    "repaired_files": 8,
+    "pid_at_submission": 2571652
+  },
+  "adapter": {
+    "release": "/home/wuzewen/Projects/Omni/OmniTransfer/runtime/releases/openmobile-import-20260720-67e1400fca26",
+    "entrypoint": "scripts/import_openmobile.py",
+    "output_image": "lossless PNG with 384px long side",
+    "split_unit": "app_package with deterministic exact group counts",
+    "split_seed": 17,
+    "policies": {
+      "duplicate_screens": "exclude by source SHA-256",
+      "invisible_or_unbounded_nodes": "exclude",
+      "relations": "smallest strict bounding-box container, preferring same-package containers",
+      "geometry_mismatch": "exclude",
+      "origin_id": "label-only",
+      "action_bbox": "label-only; never an inference matcher branch"
+    }
+  },
+  "server_mock": {
+    "status": "verified",
+    "source": "official split2_1000_ExpenseAddMultipleFromMarkor step 0",
+    "accepted_screens": 1,
+    "nodes": 21,
+    "geometry_mismatch": false,
+    "server_tests": "51 passed with Python 3.11 and Torch 2.9.0+cu128"
+  },
+  "full_training_bundle": {
+    "status": "complete",
+    "root": "/home/wuzewen/Projects/Omni/OmniTransfer/runtime/datasets/unigui_openmobile_20260720/graphs_seed17_384",
+    "metadata_files_scanned": 1913,
+    "accepted_trajectories": 1912,
+    "accepted_screens": 23213,
+    "split_counts": {"train": 18682, "dev": 3260, "test": 1271},
+    "split_package_counts": {"train": 14, "dev": 2, "test": 2},
+    "nodes": 789487,
+    "average_nodes": 34.01055443070693,
+    "max_nodes": 133,
+    "skipped": {
+      "duplicate_image": 3284,
+      "geometry_mismatch": 2,
+      "invalid_ui_elements": 7,
+      "too_few_nodes": 99
+    }
+  }
+}

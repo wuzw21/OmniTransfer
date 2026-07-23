@@ -1,0 +1,70 @@
+{
+  "schema_version": "omnitransfer_external_dataset_acquisition_v1",
+  "dataset": "OS-Copilot/OS-Atlas-data",
+  "subset": "android_world",
+  "source": "https://huggingface.co/datasets/OS-Copilot/OS-Atlas-data",
+  "source_revision": "e3a4c90c5f6129c25efdaa0671b08a11f7cb8f3f",
+  "license": "Apache-2.0",
+  "official_statistics": {
+    "screenshots": 15905,
+    "unique_screenshot_names": 15905,
+    "bounded_elements": 89860,
+    "screens_with_at_least_two_elements": 11978,
+    "platform": "AndroidWorld sampled environments"
+  },
+  "selected_files": [
+    {
+      "path": "mobile_domain/aw_mobile.json",
+      "bytes": 31860297,
+      "sha256": "8c53594c8e21975b7ba498824b687297f2f7bc43460a07b9c959f63b674a38b0"
+    },
+    {
+      "path": "mobile_domain/mobile_images.zip",
+      "bytes": 2325202926,
+      "sha256": "d88fe06b2cb6a8db149cd0c9a2c1c03b9c61599bf467bfc002fea25fa2841d93"
+    }
+  ],
+  "selection_policy": "download two exact manifest entries without cloning or smudging the approximately 816 GB full repository",
+  "adapter": {
+    "release": "/home/wuzewen/Projects/Omni/OmniTransfer/runtime/releases/os-atlas-aw-20260720-1d485c77f8b8",
+    "entrypoint": "scripts/import_os_atlas_mobile.py",
+    "output": "lossless 384px screenshot plus bounded elements in Unified UIGraph",
+    "split_unit": "image_uuid",
+    "split_warning": "the source omits app ids, so held-out images are diagnostics rather than app-disjoint evaluation",
+    "policies": {
+      "origin_id": "augmentation_label_only",
+      "grounding_boxes": "learned geometry input, never a rule matcher",
+      "visual_crop": "follows latent element while layout relations are independently augmented",
+      "matcher": "shared trainable encoder, relation self-attention, bidirectional cross-attention, learned NULL"
+    }
+  },
+  "server": {
+    "ssh_alias": "9207",
+    "hostname": "baldursgate",
+    "root": "/home/wuzewen/Projects/Omni/OmniTransfer/runtime/datasets/os_atlas_aw_20260720",
+    "status": "complete",
+    "download_method": "exact manifest entries with fixed revision and SHA-256 verification",
+    "archive_audit": {
+      "files": 15905,
+      "uncompressed_bytes": 2322705652,
+      "free_bytes_before_extract": 13659607040
+    },
+    "pid_at_submission": 2594871
+  },
+  "full_training_bundle": {
+    "status": "complete",
+    "root": "/home/wuzewen/Projects/Omni/OmniTransfer/runtime/datasets/os_atlas_aw_20260720/graphs_seed17_384",
+    "source_records": 15905,
+    "indexed_images": 15905,
+    "accepted_screens": 11776,
+    "split_counts": {"train": 10608, "dev": 578, "test": 590},
+    "nodes": 84698,
+    "average_nodes": 7.192425271739131,
+    "max_nodes": 54,
+    "skipped": {
+      "duplicate_image": 198,
+      "invalid_screen": 9,
+      "too_few_nodes": 3922
+    }
+  }
+}

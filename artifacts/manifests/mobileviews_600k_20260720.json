@@ -1,0 +1,67 @@
+{
+  "schema_version": "omnitransfer_external_dataset_acquisition_v1",
+  "dataset": "mllmTeam/MobileViews",
+  "release": "MobileViews-600K",
+  "license": "mit",
+  "source_revision": "c734715eb90a8f3ac0c80973f93ee63950e5a8c8",
+  "source": "https://huggingface.co/datasets/mllmTeam/MobileViews",
+  "server": {
+    "ssh_alias": "9207",
+    "hostname": "baldursgate",
+    "root": "/home/wuzewen/Projects/Omni/OmniTransfer/runtime/datasets/mobileviews_600k_20260720",
+    "download_endpoint": "https://hf-mirror.com",
+    "reason_for_mirror": "huggingface.co timed out from the server"
+  },
+  "shard": {
+    "name": "MobileViews_0-150000.parquet",
+    "rows": 150001,
+    "row_groups": 300,
+    "bytes": 25922626062,
+    "sha256": "440ceb895a4819de6e929fb39f7b8b6f869068f24c2862a92f876ddb687cca42",
+    "columns": ["image_content", "json_content"],
+    "download_policy": ".part, resume, full SHA-256 verification, atomic rename",
+    "status": "verified"
+  },
+  "adapter": {
+    "release": "/home/wuzewen/Projects/Omni/OmniTransfer/runtime/releases/mobileviews-adapter-20260720-d18d47ee87fe",
+    "code_digest": "d18d47ee87fe2886be7b43f0de6e89d55fd12520ffc630f881542b651b030653",
+    "entrypoint": "scripts/import_mobileviews.py",
+    "output_image": "lossless PNG with 384px long side",
+    "split_unit": "package",
+    "split_seed": 17,
+    "policies": {
+      "invisible_nodes": "remove and reconnect visible descendants",
+      "unknown_package": "exclude",
+      "geometry_mismatch": "exclude",
+      "origin_id": "label_only",
+      "package": "split_metadata_only"
+    }
+  },
+  "verified_row0": {
+    "image_size": [1080, 2340],
+    "package": "com.aroramatrimony",
+    "visible_nodes": 29,
+    "max_depth": 11,
+    "geometry_in_bounds_rate": 1.0
+  },
+  "bundle": {
+    "target_screens": 50000,
+    "output": "/home/wuzewen/Projects/Omni/OmniTransfer/runtime/datasets/mobileviews_600k_20260720/graphs_50000_seed17_384",
+    "status": "verified",
+    "pid_at_submission": 2531892,
+    "rows_scanned": 50899,
+    "accepted_screens": 50000,
+    "split_counts": {"train": 38584, "dev": 6190, "test": 5226},
+    "split_package_counts": {"train": 4990, "dev": 628, "test": 599},
+    "node_count": 2787698,
+    "average_nodes": 55.75396,
+    "max_nodes": 8400,
+    "skipped": {"geometry_mismatch": 824, "too_few_nodes": 75}
+  },
+  "researched_enrichment": {
+    "dataset": "HongxinLi/AutoGUI-v1.1-MobileViews-FuncGnd-s1000",
+    "size": "5.08 GB",
+    "indexed_rows": 17222,
+    "decision": "do not mix until target boxes are verified against Unified UIGraph nodes"
+  }
+}

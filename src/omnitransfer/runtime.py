@@ -2,72 +2,410 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+import hashlib
+import math
+import os
+from pathlib import Path
 from typing import Any
 
+from omnitransfer.mutual_matcher import MutualGraphMatcher
+from omnitransfer.numpy_matcher import NumpyMutualGraphMatcher
 from omnitransfer.ui_graph import UIGraph, UINode, graph_from_record
+
+
+_MIN_ANCHOR_OFFSET = -1.0
+_MAX_ANCHOR_OFFSET = 2.0
+_MATCHER_MODE = "mutual_graph_matcher_v2"
+_DEFAULT_MATCHER_CHECKPOINT = (
+    Path(__file__).resolve().parent
+    / "checkpoints"
+    / "pair_evidence_mutual_v2_e3e9e2f0_20260722"
+    / "seeded_visual_seed17.pt"
+)
+_DEFAULT_MATCHER_SHA256 = (
+    "e2c879b5046c86e7493f3eb18c46a24bbe180ae5c483e779a53097384fdc4ad5"
+)
+_DEFAULT_NUMPY_MATCHER_CHECKPOINT = _DEFAULT_MATCHER_CHECKPOINT.with_suffix(".npz")
+_DEFAULT_NUMPY_MATCHER_SHA256 = (
+    "700de8fac2ba5f8e723ed2e812704f33de62dead3051b9d0279369a70f07ae37"
+)
 
 
 def action_transfer(
     *,
-    source_xml: str,
     target_xml: str,
+    source_xml: str | None = None,
     source_point: tuple[float, float] | None = None,
     source_element_id: str | None = None,
+    source_element: dict[str, Any] | None = None,
+    source_offset: tuple[float, float] | None = None,
+    source_coordinate_space: str | None = None,
+    target_display_size: tuple[float, float] | None = None,
+    source_package_name: str | None = None,
+    target_package_name: str | None = None,
+    source_activity_name: str | None = None,
+    target_activity_name: str | None = None,
     action_type: str = "click",
     top_k: int = 1,
     history: Any = None,
 ) -> dict[str, Any]:
-    """Relocate one recorded source target onto the current UI tree."""
+    """Relocate one recorded target and return coordinates in target XML pixels.
 
+    Android display and screenshot scaling belong to the caller. Semantic
+    source-to-target matching uses only the XML coordinate systems.
+    """
+
+    del source_element, source_coordinate_space, target_display_size, history
+    if not source_xml:
+        return {
+            "mapped": False,
+            "mapping_mode": _MATCHER_MODE,
+            "reason": "source_graph_required",
+        }
+    source_package = str(source_package_name or "").strip()
+    target_package = str(target_package_name or "").strip()
+    if source_package and target_package and source_package != target_package:
+        return {
+            "mapped": False,
+            "mapping_mode": "page_identity",
+            "reason": "target_page_identity_mismatch",
+            "source_package_name": source_package,
+            "target_package_name": target_package,
+        }
     source = graph_from_record({"xml": source_xml}, graph_id="source")
     target = graph_from_record({"xml": target_xml}, graph_id="target")
     source_node = _source_node(source, source_point, source_element_id)
-    if source_node is None or source_node.bbox is None:
+    if source_node is None:
         return {
             "mapped": False,
-            "mapping_mode": "missing_source_target",
-            "reason": "source_point_or_element_id_required",
+            "mapping_mode": _MATCHER_MODE,
+            "reason": "source_target_missing",
         }
-    point = source_point or _center(source_node.bbox)
-    ranked = sorted(
-        (
-            (_score(source_node, candidate, action_type), candidate)
-            for candidate in target.nodes
-            if candidate.bbox is not None and candidate.enabled
-        ),
-        key=lambda item: (-item[0], item[1].node_id),
+    offset = _source_offset(source_node, source_point, source_offset)
+    if offset is None:
+        return {
+            "mapped": False,
+            "mapping_mode": _MATCHER_MODE,
+            "reason": "source_point_or_offset_required",
+        }
+    equivalent_target = _equivalent_graph_target(source, target, source_node)
+    if equivalent_target is not None:
+        return _mapped_result(
+            source=source,
+            target=target,
+            source_node=source_node,
+            target_node=equivalent_target,
+            offset=offset,
+            mapping_mode="equivalent_ui_graph",
+            score=1.0,
+            margin=1.0,
+            ranked=[(1.0, equivalent_target)],
+            top_k=top_k,
+            action_type=action_type,
+            source_activity_name=source_activity_name,
+            target_activity_name=target_activity_name,
+        )
+    candidates = tuple(
+        node.node_id
+        for node in target.nodes
+        if node.bbox is not None and node.enabled
     )
-    ranked = [item for item in ranked if item[0] > 0]
-    if not ranked or (len(ranked) > 1 and ranked[0][0] == ranked[1][0]):
+    try:
+        matcher = _get_matcher()
+        match = matcher.predict(
+            source,
+            target,
+            source_node_id=source_node.node_id,
+            candidate_node_ids=candidates,
+            min_probability=_matcher_threshold("OMNITRANSFER_MATCHER_MIN_PROBABILITY"),
+            min_margin=_matcher_threshold("OMNITRANSFER_MATCHER_MIN_MARGIN"),
+        )
+    except Exception as error:
         return {
             "mapped": False,
-            "mapping_mode": "ambiguous" if ranked else "absent",
-            "reason": "target_identity_not_unique",
+            "mapping_mode": _MATCHER_MODE,
+            "reason": "matcher_unavailable",
+            "error": str(error) or type(error).__name__,
+            "src_element": _node_dict(source_node),
+            "source_size": _graph_size(source),
+            "target_size": _graph_size(target),
         }
-    score, target_node = ranked[0]
-    target_point = _project(point, source_node.bbox, target_node.bbox)
-    candidates = [
-        {
-            "candidate_id": candidate.node_id,
-            "bbox": list(candidate.bbox or ()),
-            "score": candidate_score,
+    ranked = _learned_candidates(target, match.scores)
+    target_node = match.target_node
+    if target_node is None or target_node.bbox is None:
+        return {
+            "mapped": False,
+            "mapping_mode": _MATCHER_MODE,
+            "reason": str(match.reason or "matcher_abstained"),
+            "src_element": _node_dict(source_node),
+            "source_size": _graph_size(source),
+            "target_size": _graph_size(target),
+            "score": float(match.probability),
+            "margin": float(match.margin),
+            "top_candidates": _candidate_dicts(ranked, top_k),
         }
-        for candidate_score, candidate in ranked[: max(1, int(top_k))]
-    ]
+    return _mapped_result(
+        source=source,
+        target=target,
+        source_node=source_node,
+        target_node=target_node,
+        offset=offset,
+        mapping_mode=_MATCHER_MODE,
+        score=float(match.probability),
+        margin=float(match.margin),
+        ranked=ranked,
+        top_k=top_k,
+        action_type=action_type,
+        source_activity_name=source_activity_name,
+        target_activity_name=target_activity_name,
+    )
+
+
+def _mapped_result(
+    *,
+    source: UIGraph,
+    target: UIGraph,
+    source_node: UINode,
+    target_node: UINode,
+    offset: tuple[float, float],
+    mapping_mode: str,
+    score: float,
+    margin: float,
+    ranked: list[tuple[float, UINode]],
+    top_k: int,
+    action_type: str,
+    source_activity_name: str | None,
+    target_activity_name: str | None,
+) -> dict[str, Any]:
+    target_point = _project_offset(offset, target_node.bbox or (0.0, 0.0, 0.0, 0.0))
     return {
         "mapped": True,
-        "mapping_mode": "element_identity",
+        "mapping_mode": mapping_mode,
         "new_x": target_point[0],
         "new_y": target_point[1],
         "src_element": _node_dict(source_node),
-        "target_candidate_id": target_node.node_id,
+        "source_size": _graph_size(source),
+        "target_size": _graph_size(target),
+        "target_candidate_id": _public_node_id(target_node),
         "target_bbox": list(target_node.bbox),
         "target_center": list(_center(target_node.bbox)),
         "score": score,
-        "margin": score - (ranked[1][0] if len(ranked) > 1 else 0.0),
-        "top_candidates": candidates,
+        "margin": margin,
+        "top_candidates": _candidate_dicts(ranked, top_k),
         "action_type": action_type,
+        "source_activity_name": str(source_activity_name or ""),
+        "target_activity_name": str(target_activity_name or ""),
     }
+
+
+def _get_matcher() -> MutualGraphMatcher:
+    configured = str(os.environ.get("OMNITRANSFER_MATCHER_CHECKPOINT") or "").strip()
+    checkpoint = Path(configured).expanduser() if configured else _DEFAULT_MATCHER_CHECKPOINT
+    device = str(os.environ.get("OMNITRANSFER_MATCHER_DEVICE") or "cpu").strip()
+    numpy_checkpoint = checkpoint if checkpoint.suffix == ".npz" else checkpoint.with_suffix(".npz")
+    return _load_matcher(
+        str(checkpoint.resolve()),
+        str(numpy_checkpoint.resolve()),
+        device,
+    )
+
+
+@lru_cache(maxsize=4)
+def _load_matcher(
+    checkpoint: str,
+    numpy_checkpoint: str,
+    device: str,
+) -> MutualGraphMatcher | NumpyMutualGraphMatcher:
+    path = Path(checkpoint)
+    numpy_path = Path(numpy_checkpoint)
+    if path.suffix == ".npz":
+        return _load_numpy_matcher(path)
+    if path.is_file() and path == _DEFAULT_MATCHER_CHECKPOINT.resolve():
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest != _DEFAULT_MATCHER_SHA256:
+            raise ValueError("default mutual matcher checkpoint checksum mismatch")
+    if path.is_file():
+        try:
+            return MutualGraphMatcher.from_checkpoint(path, device=device)
+        except RuntimeError as error:
+            if "PyTorch" not in str(error):
+                raise
+    if numpy_path.is_file():
+        return _load_numpy_matcher(numpy_path)
+    raise FileNotFoundError(
+        f"mutual matcher checkpoints missing: {path}, {numpy_path}"
+    )
+
+
+def _load_numpy_matcher(path: Path) -> NumpyMutualGraphMatcher:
+    if path == _DEFAULT_NUMPY_MATCHER_CHECKPOINT.resolve():
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if not _DEFAULT_NUMPY_MATCHER_SHA256 or digest != _DEFAULT_NUMPY_MATCHER_SHA256:
+            raise ValueError("default NumPy mutual matcher checkpoint checksum mismatch")
+    return NumpyMutualGraphMatcher.from_checkpoint(path)
+
+
+def matcher_backend() -> str:
+    """Return the backend after loading the canonical matcher."""
+
+    matcher = _get_matcher()
+    return str(getattr(matcher, "backend", "pytorch"))
+
+
+def runtime_preflight() -> dict[str, Any]:
+    """Load the matcher and execute a deterministic end-to-end mapping."""
+
+    source_xml = (
+        '<hierarchy bounds="[0,0][100,100]">'
+        '<node resource-id="preflight:id/search" text="Search" '
+        'class="android.widget.Button" clickable="true" enabled="true" '
+        'bounds="[10,20][50,60]" />'
+        "</hierarchy>"
+    )
+    target_xml = (
+        '<hierarchy bounds="[0,0][200,400]">'
+        '<node resource-id="preflight:id/search" text="Search" '
+        'class="android.widget.Button" clickable="true" enabled="true" '
+        'bounds="[40,100][120,260]" />'
+        "</hierarchy>"
+    )
+    result = action_transfer(
+        source_xml=source_xml,
+        target_xml=target_xml,
+        source_point=(30.0, 40.0),
+    )
+    if not result.get("mapped"):
+        reason = str(result.get("reason") or "mapping_failed")
+        error = str(result.get("error") or "")
+        raise RuntimeError(f"omnitransfer_preflight_failed:{reason}:{error}".rstrip(":"))
+    return {
+        "ready": True,
+        "backend": matcher_backend(),
+    }
+
+
+def _matcher_threshold(name: str) -> float:
+    value = float(os.environ.get(name) or 0.0)
+    if not math.isfinite(value) or value < 0.0 or value > 1.0:
+        raise ValueError(f"{name} must be between 0 and 1")
+    return value
+
+
+def _learned_candidates(
+    graph: UIGraph,
+    scores: tuple[tuple[str, float], ...],
+) -> list[tuple[float, UINode]]:
+    nodes = {node.node_id: node for node in graph.nodes}
+    return sorted(
+        (
+            (float(score), nodes[node_id])
+            for node_id, score in scores
+            if node_id in nodes
+        ),
+        key=lambda item: (-item[0], item[1].node_id),
+    )
+
+
+def _equivalent_graph_target(
+    source: UIGraph,
+    target: UIGraph,
+    source_node: UINode,
+) -> UINode | None:
+    if source.width != target.width or source.height != target.height:
+        return None
+    if len(source.nodes) != len(target.nodes):
+        return None
+    if any(
+        _structural_identity(left) != _structural_identity(right)
+        for left, right in zip(source.nodes, target.nodes, strict=True)
+    ):
+        return None
+    target_by_id = {node.node_id: node for node in target.nodes}
+    target_node = target_by_id.get(source_node.node_id)
+    if target_node is None or target_node.bbox is None:
+        return None
+    source_subtree = _subtree(source, source_node.node_id)
+    target_subtree = _subtree(target, target_node.node_id)
+    if len(source_subtree) != len(target_subtree):
+        return None
+    if any(
+        _identity_key(left) != _identity_key(right)
+        for left, right in zip(source_subtree, target_subtree, strict=True)
+    ):
+        return None
+    has_semantic_anchor = any(
+        node.text or node.content_desc for node in source_subtree
+    )
+    has_unique_resource = bool(source_node.resource_id) and sum(
+        node.resource_id == source_node.resource_id for node in source.nodes
+    ) == 1
+    return target_node if has_semantic_anchor or has_unique_resource else None
+
+
+def _structural_identity(node: UINode) -> tuple[Any, ...]:
+    return (
+        node.node_id,
+        node.parent_id,
+        node.child_ids,
+        node.origin_id,
+        node.resource_id,
+        node.class_name,
+        node.bbox,
+        node.clickable,
+        node.editable,
+        node.scrollable,
+        node.enabled,
+    )
+
+
+def _subtree(graph: UIGraph, root_id: str) -> tuple[UINode, ...]:
+    by_id = {node.node_id: node for node in graph.nodes}
+    pending = [root_id]
+    nodes: list[UINode] = []
+    while pending:
+        node = by_id.get(pending.pop(0))
+        if node is None:
+            return ()
+        nodes.append(node)
+        pending.extend(node.child_ids)
+    return tuple(nodes)
+
+
+def describe_action_target(
+    *,
+    source_xml: str,
+    source_point: tuple[float, float],
+    related_point: tuple[float, float] | None = None,
+) -> dict[str, Any] | None:
+    """Return the compact semantic target for one recorded source point."""
+
+    source = graph_from_record({"xml": source_xml}, graph_id="source")
+    source_node = _source_node(source, source_point, None)
+    if source_node is None or source_node.bbox is None:
+        return None
+    descriptor = _node_dict(source_node)
+    occurrence_index, occurrence_count = _occurrence(source, source_node)
+    if not _has_stable_identity(source_node) and occurrence_count <= 1:
+        return None
+    offset = _offset(source_point, source_node.bbox)
+    descriptor["offset_x"], descriptor["offset_y"] = offset
+    if related_point is not None:
+        raw_end_offset = _unclamped_offset(related_point, source_node.bbox)
+        if not all(
+            math.isfinite(value)
+            and _MIN_ANCHOR_OFFSET <= value <= _MAX_ANCHOR_OFFSET
+            for value in raw_end_offset
+        ):
+            return None
+        end_offset = _offset(related_point, source_node.bbox)
+        descriptor["end_offset_x"], descriptor["end_offset_y"] = end_offset
+    if occurrence_count > 1:
+        descriptor["occurrence_index"] = occurrence_index
+        descriptor["occurrence_count"] = occurrence_count
+    descriptor.pop("bounds", None)
+    descriptor.pop("id", None)
+    return descriptor
 
 
 def _source_node(
@@ -98,60 +436,144 @@ def _source_node(
     return min(containing, key=lambda node: _area(node.bbox), default=None)
 
 
-def _score(source: UINode, target: UINode, action_type: str) -> float:
-    score = 0.0
-    stable_identity = False
-    if source.resource_id and source.resource_id == target.resource_id:
-        score += 8.0
-        stable_identity = True
-    elif _tail(source.resource_id) and _tail(source.resource_id) == _tail(target.resource_id):
-        score += 6.0
-        stable_identity = True
-    for source_value, target_value in (
-        (source.text, target.text),
-        (source.content_desc, target.content_desc),
-    ):
-        if source_value and _text(source_value) == _text(target_value):
-            score += 4.0
-            stable_identity = True
-    if not stable_identity:
-        root_scroll = action_type in {"swipe", "scroll"} and source.parent_id is None
-        if not root_scroll:
-            return 0.0
-    if source.class_name and _tail(source.class_name) == _tail(target.class_name):
-        score += 1.0
-    score += 0.5 * sum(
-        source_value == target_value
-        for source_value, target_value in (
-            (source.clickable, target.clickable),
-            (source.editable, target.editable),
-            (source.scrollable, target.scrollable),
-        )
+def _has_stable_identity(node: UINode) -> bool:
+    return bool(node.resource_id or node.text or node.content_desc)
+
+
+def _occurrence(graph: UIGraph, source: UINode) -> tuple[int, int]:
+    identity = _identity_key(source)
+    matches = sorted(
+        (
+            node
+            for node in graph.nodes
+            if node.bbox is not None
+            and node.enabled
+            and _identity_key(node) == identity
+        ),
+        key=lambda node: (node.bbox[1], node.bbox[0], node.node_id),
     )
-    return score
+    for index, node in enumerate(matches):
+        if node is source or node.node_id == source.node_id:
+            return index, len(matches)
+    return 0, len(matches)
 
 
-def _project(point: tuple[float, float], source: tuple[float, float, float, float], target: tuple[float, float, float, float]) -> tuple[float, float]:
-    source_width = max(1.0, source[2] - source[0])
-    source_height = max(1.0, source[3] - source[1])
-    relative_x = max(0.0, min(1.0, (point[0] - source[0]) / source_width))
-    relative_y = max(0.0, min(1.0, (point[1] - source[1]) / source_height))
+def _identity_key(node: UINode) -> tuple[Any, ...]:
     return (
-        target[0] + relative_x * (target[2] - target[0]),
-        target[1] + relative_y * (target[3] - target[1]),
+        _tail(node.resource_id),
+        _text(node.text),
+        _text(node.content_desc),
+        _tail(node.class_name),
+        node.clickable,
+        node.editable,
+        node.scrollable,
+    )
+
+
+def _source_offset(
+    source: UINode,
+    point: tuple[float, float] | None,
+    explicit: tuple[float, float] | None,
+) -> tuple[float, float] | None:
+    if explicit is not None:
+        try:
+            offset = float(explicit[0]), float(explicit[1])
+        except (IndexError, TypeError, ValueError):
+            return None
+        if not all(
+            math.isfinite(value)
+            and _MIN_ANCHOR_OFFSET <= value <= _MAX_ANCHOR_OFFSET
+            for value in offset
+        ):
+            return None
+        return offset
+    if point is not None and source.bbox is not None:
+        return _offset(point, source.bbox)
+    if source.bbox is not None:
+        return 0.5, 0.5
+    return None
+
+
+def _offset(
+    point: tuple[float, float],
+    bounds: tuple[float, float, float, float],
+) -> tuple[float, float]:
+    width = max(1.0, bounds[2] - bounds[0])
+    height = max(1.0, bounds[3] - bounds[1])
+    return (
+        _clamp((float(point[0]) - bounds[0]) / width),
+        _clamp((float(point[1]) - bounds[1]) / height),
+    )
+
+
+def _unclamped_offset(
+    point: tuple[float, float],
+    bounds: tuple[float, float, float, float],
+) -> tuple[float, float]:
+    width = max(1.0, bounds[2] - bounds[0])
+    height = max(1.0, bounds[3] - bounds[1])
+    return (
+        (float(point[0]) - bounds[0]) / width,
+        (float(point[1]) - bounds[1]) / height,
+    )
+
+
+def _clamp(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def _project_offset(
+    offset: tuple[float, float],
+    target: tuple[float, float, float, float],
+) -> tuple[float, float]:
+    return (
+        target[0] + offset[0] * (target[2] - target[0]),
+        target[1] + offset[1] * (target[3] - target[1]),
     )
 
 
 def _node_dict(node: UINode) -> dict[str, Any]:
     return {
-        "id": node.node_id,
+        "id": _public_node_id(node),
         "resource_id": node.resource_id,
+        "text": node.text,
+        "content_desc": node.content_desc,
         "class": node.class_name,
         "bounds": list(node.bbox or ()),
         "clickable": node.clickable,
         "editable": node.editable,
         "scrollable": node.scrollable,
     }
+
+
+def _candidate_dicts(
+    ranked: list[tuple[float, UINode]],
+    top_k: int,
+) -> list[dict[str, Any]]:
+    return [
+        {
+            "candidate_id": _public_node_id(candidate),
+            "resource_id": candidate.resource_id,
+            "text": candidate.text,
+            "content_desc": candidate.content_desc,
+            "class": candidate.class_name,
+            "bbox": list(candidate.bbox or ()),
+            "score": candidate_score,
+        }
+        for candidate_score, candidate in ranked[: max(1, int(top_k))]
+    ]
+
+
+def _public_node_id(node: UINode) -> str:
+    return str(node.resource_id or node.origin_id or node.node_id)
+
+
+def _graph_size(graph: UIGraph | None) -> list[float] | None:
+    if graph is None or graph.width is None or graph.height is None:
+        return None
+    if graph.width <= 0 or graph.height <= 0:
+        return None
+    return [graph.width, graph.height]
 
 
 def _center(bounds: tuple[float, float, float, float]) -> tuple[float, float]:
