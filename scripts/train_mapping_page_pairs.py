@@ -114,7 +114,11 @@ def main() -> None:
     )
     report = {
         "schema_version": "omnitransfer.mixed_mapping_experiment.v1",
-        "architecture": "local_relation_cross_attention_matcher",
+        "architecture": (
+            "local_relation_cross_attention_with_affinity_propagation"
+            if config.local_affinity_propagation
+            else "legacy_local_relation_cross_attention_matcher"
+        ),
         "objective": "symmetric_partial_assignment_with_bidirectional_consistency",
         "inputs": [str(path.resolve()) for path in args.input],
         "pretrained": str(args.pretrained.resolve()) if args.pretrained else None,

@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from functools import lru_cache
 import hashlib
 import math
-from pathlib import Path
 import re
-from typing import Any, Iterable
+from collections.abc import Iterable
+from dataclasses import asdict, dataclass
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
 
 from omnitransfer.ui_graph import BBox, UIGraph, UINode, local_context_graph
-
 
 # Keep the tensor width checkpoint-compatible with the deployed matcher.  Only
 # the first four action-state channels carry information; the remaining
@@ -36,6 +36,7 @@ class MatcherConfig:
     visual_canvas_size: int = 384
     source_context_nodes: int = 48
     target_context_nodes: int = 64
+    local_affinity_propagation: bool = True
 
 
 @dataclass(frozen=True)
@@ -150,7 +151,7 @@ def build_relation_aware_matcher(
             self.head_dim = cfg.hidden_dim // cfg.num_heads
             self.scale = self.head_dim**-0.5
 
-        def forward(self, states: Any, relations: Any) -> Any:
+        def forward(self, states: Any, relations: Any) -> tuple[Any, Any]:
             node_count = int(states.shape[0])
             qkv = self.qkv(states).reshape(
                 node_count,
@@ -168,7 +169,19 @@ def build_relation_aware_matcher(
             context = attention @ value
             context = context.transpose(0, 1).reshape(node_count, cfg.hidden_dim)
             states = self.norm_attention(states + self.dropout(self.output(context)))
-            return self.norm_output(states + self.dropout(self.feed_forward(states)))
+            states = self.norm_output(states + self.dropout(self.feed_forward(states)))
+            relation_attention = attention.mean(dim=0)
+            off_diagonal = 1.0 - torch.eye(
+                node_count,
+                dtype=relation_attention.dtype,
+                device=relation_attention.device,
+            )
+            relation_attention = relation_attention * off_diagonal
+            relation_attention = relation_attention / relation_attention.sum(
+                dim=-1,
+                keepdim=True,
+            ).clamp_min(torch.finfo(relation_attention.dtype).eps)
+            return states, relation_attention
 
     class MatcherLayer(nn.Module):
         def __init__(self) -> None:
@@ -196,9 +209,15 @@ def build_relation_aware_matcher(
             target_states: Any,
             source_relations: Any,
             target_relations: Any,
-        ) -> tuple[Any, Any]:
-            source_states = self.self_attention(source_states, source_relations)
-            target_states = self.self_attention(target_states, target_relations)
+        ) -> tuple[Any, Any, Any, Any]:
+            source_states, source_relation_attention = self.self_attention(
+                source_states,
+                source_relations,
+            )
+            target_states, target_relation_attention = self.self_attention(
+                target_states,
+                target_relations,
+            )
             source_context = self.cross_attention(
                 source_states.unsqueeze(0),
                 target_states.unsqueeze(0),
@@ -223,7 +242,12 @@ def build_relation_aware_matcher(
             target_states = self.output_norm(
                 target_states + self.dropout(self.cross_feed_forward(target_states))
             )
-            return source_states, target_states
+            return (
+                source_states,
+                target_states,
+                source_relation_attention,
+                target_relation_attention,
+            )
 
     class RelationAwareCrossAttentionMatcher(nn.Module):
         def __init__(self) -> None:
@@ -333,37 +357,89 @@ def build_relation_aware_matcher(
                 target_visual,
                 target_visual_mask,
             )
+            source_relation_attention = torch.eye(
+                source_states.shape[0],
+                dtype=source_states.dtype,
+                device=source_states.device,
+            )
+            target_relation_attention = torch.eye(
+                target_states.shape[0],
+                dtype=target_states.dtype,
+                device=target_states.device,
+            )
             for layer in self.layers:
-                source_states, target_states = layer(
+                (
+                    source_states,
+                    target_states,
+                    source_relation_attention,
+                    target_relation_attention,
+                ) = layer(
                     source_states,
                     target_states,
                     source_relations,
                     target_relations,
                 )
-            pair_logits = self._score_pairs(
+            base_affinity = self._score_pairs(
                 source_states,
                 target_states,
                 source_target_relations,
+            )
+            pair_logits = (
+                propagate_local_affinity(
+                    base_affinity,
+                    source_relation_attention,
+                    target_relation_attention,
+                )
+                if cfg.local_affinity_propagation
+                else base_affinity
             )
             reverse_relations = source_target_relations.transpose(0, 1).clone()
             reverse_relations[..., 9] = -reverse_relations[..., 9]
             reverse_relations[..., 10] = -reverse_relations[..., 10]
             reverse_relations[..., 13] = -reverse_relations[..., 13]
             reverse_relations[..., 14] = -reverse_relations[..., 14]
-            reverse_logits = self._score_pairs(
+            reverse_base_affinity = self._score_pairs(
                 target_states,
                 source_states,
                 reverse_relations,
+            )
+            reverse_logits = (
+                propagate_local_affinity(
+                    reverse_base_affinity,
+                    target_relation_attention,
+                    source_relation_attention,
+                )
+                if cfg.local_affinity_propagation
+                else reverse_base_affinity
             )
             return {
                 "logits_ab": pair_logits,
                 "logits_ba": reverse_logits,
                 "affinity": pair_logits,
+                "base_affinity": base_affinity,
+                "local_affinity_support": pair_logits - base_affinity,
+                "source_relation_attention": source_relation_attention,
+                "target_relation_attention": target_relation_attention,
                 "source_states": source_states,
                 "target_states": target_states,
             }
 
     return RelationAwareCrossAttentionMatcher()
+
+
+def propagate_local_affinity(
+    base_affinity: Any,
+    source_relation_attention: Any,
+    target_relation_attention: Any,
+) -> Any:
+    """Propagate matched-neighbor evidence back to each candidate node pair."""
+
+    local_support = (
+        source_relation_attention
+        @ base_affinity
+        @ target_relation_attention.transpose(-1, -2)
+    )
+    return base_affinity + local_support
 
 
 def matcher_inputs(
@@ -465,10 +541,13 @@ class LearnedGraphMatcher:
         path: str | Path,
         *,
         device: str = "cpu",
-    ) -> "LearnedGraphMatcher":
+    ) -> LearnedGraphMatcher:
         torch = _require_torch()
         payload = torch.load(Path(path), map_location=device)
-        config = MatcherConfig(**dict(payload["matcher_config"]))
+        config_values = dict(payload["matcher_config"])
+        if payload.get("schema_version") != "omnitransfer_relation_matcher_v3":
+            config_values.setdefault("local_affinity_propagation", False)
+        config = MatcherConfig(**config_values)
         model = build_relation_aware_matcher(config)
         model.load_state_dict(payload["state_dict"])
         return cls(model, config=config, device=device)
@@ -490,7 +569,7 @@ class LearnedGraphMatcher:
         )
         if source_node is None:
             return LearnedMatch(None, 0.0, 0.0, "source_node_missing", ())
-        if not _is_actionable(source_node):
+        if not is_actionable(source_node):
             return LearnedMatch(None, 0.0, 0.0, "source_node_not_actionable", ())
         if len(source.nodes) > self.config.source_context_nodes:
             source = local_context_graph(
@@ -512,7 +591,7 @@ class LearnedGraphMatcher:
         candidate_indices = [
             index
             for index, node in enumerate(target.nodes)
-            if node.node_id in allowed and _is_actionable(node)
+            if node.node_id in allowed and is_actionable(node)
         ]
         if not candidate_indices:
             return LearnedMatch(None, 0.0, 0.0, "target_candidates_missing", ())
@@ -558,7 +637,9 @@ class LearnedGraphMatcher:
         )
 
 
-def _is_actionable(node: UINode) -> bool:
+def is_actionable(node: UINode) -> bool:
+    """Whether a node is an enabled target for an interaction."""
+
     return bool(node.enabled and (node.clickable or node.editable or node.scrollable))
 
 
@@ -576,7 +657,7 @@ def save_matcher_checkpoint(
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "schema_version": "omnitransfer_relation_matcher_v2",
+            "schema_version": "omnitransfer_relation_matcher_v3",
             "matcher_config": asdict(config),
             "state_dict": model.state_dict(),
             "metadata": dict(metadata or {}),

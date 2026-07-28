@@ -22,6 +22,11 @@ The standalone repo keeps canonical data, training, and evaluation entrypoints.
   - Build self-supervised MobileViews training pairs or an unreviewed
     diagnostic pool from a frozen App allowlist; offline identity fields remain
     label-only.
+- `PYTHONPATH=src python scripts/build_hard_mapping_acceptance_set.py --input ... --checkpoint ... --output-dir ...`
+  - Rank strict actionable-node MobileViews mappings by learned-matcher errors,
+    uncertainty, and selector disagreement, then render an App-balanced queue
+    through the canonical review workbench. Proposals remain unreviewed until
+    a human accepts or corrects them.
 - `PYTHONPATH=src python scripts/import_openmobile.py --input ... --output ...`
   - Import Uni-GUI-OpenMobile trajectories with per-screen UI elements into deduplicated, package-disjoint UIGraph JSONL files.
 - `PYTHONPATH=src python scripts/download_hf_lfs_files.py --repository ... --path ...`
