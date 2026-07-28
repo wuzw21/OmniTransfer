@@ -143,7 +143,9 @@ def test_query_graph_adapter_binds_ios_scale_and_target_xml_topology(tmp_path) -
 
     source, target, source_node_id = query_graphs(query)
 
-    source_anchor = next(node for node in source.nodes if node.node_id == source_node_id)
+    source_anchor = next(
+        node for node in source.nodes if node.node_id == source_node_id
+    )
     target_by_id = {node.node_id: node for node in target.nodes}
     assert source_node_id != "__source__"
     assert source_anchor.bbox == (30.0, 60.0, 90.0, 90.0)
@@ -186,7 +188,9 @@ def test_declared_benchmark_split_is_used_without_rehashing() -> None:
 
     splits = partition_queries_by_declared_split(queries)
 
-    assert {name: [row.query_id for row in values] for name, values in splits.items()} == {
+    assert {
+        name: [row.query_id for row in values] for name, values in splits.items()
+    } == {
         "train": ["q-train"],
         "dev": ["q-dev"],
         "test": ["q-test"],
@@ -231,6 +235,7 @@ def test_fine_tune_can_mix_self_supervised_null_examples() -> None:
                 origin_id=f"node-{index}",
                 text=f"item {index}",
                 bbox=(index * 10, 0, index * 10 + 8, 8),
+                clickable=True,
             )
             for index in range(5)
         ),
@@ -259,8 +264,18 @@ def test_fine_tune_interleaves_gold_queries_and_weak_correspondence_pairs() -> N
         width=100,
         height=100,
         nodes=(
-            UINode(node_id="source-target", origin_id="source-target", bbox=(5, 5, 25, 25)),
-            UINode(node_id="source-null", origin_id="source-null", bbox=(60, 60, 80, 80)),
+            UINode(
+                node_id="source-target",
+                origin_id="source-target",
+                bbox=(5, 5, 25, 25),
+                clickable=True,
+            ),
+            UINode(
+                node_id="source-null",
+                origin_id="source-null",
+                bbox=(60, 60, 80, 80),
+                clickable=True,
+            ),
         ),
     )
     target = UIGraph(
@@ -268,8 +283,18 @@ def test_fine_tune_interleaves_gold_queries_and_weak_correspondence_pairs() -> N
         width=200,
         height=100,
         nodes=(
-            UINode(node_id="target-target", origin_id="target-target", bbox=(10, 5, 50, 25)),
-            UINode(node_id="target-null", origin_id="target-null", bbox=(120, 60, 160, 80)),
+            UINode(
+                node_id="target-target",
+                origin_id="target-target",
+                bbox=(10, 5, 50, 25),
+                clickable=True,
+            ),
+            UINode(
+                node_id="target-null",
+                origin_id="target-null",
+                bbox=(120, 60, 160, 80),
+                clickable=True,
+            ),
         ),
     )
     config = MatcherConfig(hidden_dim=32, num_heads=4, num_layers=1, dropout=0.0)

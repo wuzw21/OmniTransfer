@@ -15,7 +15,7 @@ from omnitransfer.learned_matcher import (
     encode_graph,
     matcher_inputs,
 )
-from omnitransfer.ui_graph import BBox, UIGraph, UINode, local_context_graph
+from omnitransfer.ui_graph import BBox, UIGraph, UINode, multi_anchor_context_graph
 
 
 FEATURE_DIM = NUMERIC_FEATURE_DIM
@@ -27,7 +27,6 @@ class AugmentConfig:
 
     mask_text_prob: float = 0.35
     mask_content_desc_prob: float = 0.35
-    mask_resource_id_prob: float = 0.50
     mask_class_prob: float = 0.10
     drop_node_prob: float = 0.15
     edge_dropout_prob: float = 0.10
@@ -45,7 +44,7 @@ class AugmentConfig:
 
 @dataclass(frozen=True)
 class TrainingPair:
-    """Two related graph views with positive, hard-negative, and NULL labels."""
+    """Two related graph views with known correspondences and ignored rows."""
 
     graph_a: UIGraph
     graph_b: UIGraph
@@ -99,6 +98,11 @@ def make_correspondence_training_pair(
             raise ValueError(f"target correspondence node is absent: {target_id}")
         source_index = index_a[source_id]
         target_index = index_b[target_id]
+        if not (
+            _is_actionable(graph_a.nodes[source_index])
+            and _is_actionable(graph_b.nodes[target_index])
+        ):
+            raise ValueError("correspondences must be actionable-to-actionable")
         if targets_a_to_b[source_index] >= 0 or targets_b_to_a[target_index] >= 0:
             raise ValueError("correspondences must be one-to-one")
         targets_a_to_b[source_index] = target_index
@@ -197,27 +201,32 @@ def make_training_pair(
     config: AugmentConfig | None = None,
     matcher_config: MatcherConfig | None = None,
 ) -> TrainingPair | None:
-    """Construct labels from known view transformations, including NULL targets."""
+    """Construct identity correspondences between two augmented graph views."""
 
     cfg = config or AugmentConfig()
     model_cfg = matcher_config or MatcherConfig()
     if len(graph.nodes) > model_cfg.source_context_nodes:
-        graph = local_context_graph(
+        actionable_ids = tuple(
+            node.node_id for node in graph.nodes if _is_actionable(node)
+        )
+        if len(actionable_ids) < 2:
+            return None
+        graph = multi_anchor_context_graph(
             graph,
-            anchor_node_id=rng.choice(graph.nodes).node_id,
-            max_nodes=model_cfg.source_context_nodes,
+            anchor_node_ids=actionable_ids,
+            max_nodes=max(model_cfg.source_context_nodes, len(actionable_ids)),
         )
     graph_a = augment_graph(graph, rng=rng, config=cfg, view_id="a")
     graph_b = augment_graph(graph, rng=rng, config=cfg, view_id="b")
     index_a = {
         node.origin_id: index
         for index, node in enumerate(graph_a.nodes)
-        if not node.origin_id.startswith("__distractor__:")
+        if not node.origin_id.startswith("__distractor__:") and _is_actionable(node)
     }
     index_b = {
         node.origin_id: index
         for index, node in enumerate(graph_b.nodes)
-        if not node.origin_id.startswith("__distractor__:")
+        if not node.origin_id.startswith("__distractor__:") and _is_actionable(node)
     }
     common = tuple(sorted(set(index_a).intersection(index_b)))
     if len(common) < 2:
@@ -237,10 +246,14 @@ def make_training_pair(
     )
 
 
+def _is_actionable(node: UINode) -> bool:
+    return bool(node.enabled and (node.clickable or node.editable or node.scrollable))
+
+
 def build_lightglue_style_matcher(
     *,
     input_dim: int = FEATURE_DIM,
-    hidden_dim: int = 96,
+    hidden_dim: int = 64,
     num_heads: int = 4,
     num_layers: int = 2,
 ) -> Any:
@@ -265,7 +278,7 @@ def matching_loss(
     matcher_config: MatcherConfig | None = None,
     cycle_weight: float = 0.05,
 ) -> Any:
-    """Compute symmetric partial-assignment loss with a learned NULL target."""
+    """Compute symmetric partial-assignment loss on known correspondences."""
 
     torch = _require_torch()
     inputs = matcher_inputs(
@@ -277,32 +290,46 @@ def matching_loss(
     output = model(*inputs)
     logits_ab = output["logits_ab"]
     logits_ba = output["logits_ba"]
+    actionable_a = _actionable_indices(pair.graph_a.nodes)
+    actionable_b = _actionable_indices(pair.graph_b.nodes)
     loss_ab = _partial_assignment_loss(
         logits_ab,
         pair.targets_a_to_b,
-        null_index=len(pair.graph_b.nodes),
+        candidate_indices=actionable_b,
         torch=torch,
         device=device,
     )
     loss_ba = _partial_assignment_loss(
         logits_ba,
         pair.targets_b_to_a,
-        null_index=len(pair.graph_a.nodes),
+        candidate_indices=actionable_a,
         torch=torch,
         device=device,
     )
     loss = 0.5 * (loss_ab + loss_ba)
     if cycle_weight > 0.0 and pair.source_indices:
-        probabilities_ab = torch.softmax(logits_ab, dim=1)
-        probabilities_ba = torch.softmax(logits_ba, dim=1)
         source_indices = torch.tensor(
             pair.source_indices, dtype=torch.long, device=device
         )
         target_indices = torch.tensor(
             pair.target_indices, dtype=torch.long, device=device
         )
-        forward = probabilities_ab[source_indices, target_indices]
-        reverse = probabilities_ba[target_indices, source_indices]
+        positions_a = {index: position for position, index in enumerate(actionable_a)}
+        positions_b = {index: position for position, index in enumerate(actionable_b)}
+        probabilities_ab = torch.softmax(logits_ab[:, actionable_b], dim=1)
+        probabilities_ba = torch.softmax(logits_ba[:, actionable_a], dim=1)
+        forward_positions = torch.tensor(
+            [positions_b[index] for index in pair.target_indices],
+            dtype=torch.long,
+            device=device,
+        )
+        reverse_positions = torch.tensor(
+            [positions_a[index] for index in pair.source_indices],
+            dtype=torch.long,
+            device=device,
+        )
+        forward = probabilities_ab[source_indices, forward_positions]
+        reverse = probabilities_ba[target_indices, reverse_positions]
         cycle_loss = torch.mean(torch.abs(forward - reverse))
         loss = loss + float(cycle_weight) * cycle_loss
     return loss
@@ -317,7 +344,7 @@ def evaluate_correspondence_pairs(
     ks: tuple[int, ...] = (1, 3, 5),
     latency_repeats: int = 2,
 ) -> dict[str, Any]:
-    """Evaluate bidirectional positive, NULL, and warmed model performance."""
+    """Evaluate bidirectional correspondences and warmed model performance."""
 
     if latency_repeats < 0:
         raise ValueError("latency_repeats must be non-negative")
@@ -332,6 +359,8 @@ def evaluate_correspondence_pairs(
     null_correct = 0
     recall_hits = {value: 0 for value in ks if value > 0}
     model_latencies: list[float] = []
+    input_latencies: list[float] = []
+    end_to_end_latencies: list[float] = []
     with torch.no_grad():
         for pair in pair_list:
             inputs = matcher_inputs(
@@ -344,27 +373,42 @@ def evaluate_correspondence_pairs(
             _synchronize(device, torch)
             for _ in range(latency_repeats):
                 _synchronize(device, torch)
-                started = time.perf_counter()
+                total_started = time.perf_counter()
+                input_started = time.perf_counter()
+                inputs = matcher_inputs(
+                    pair.graph_a,
+                    pair.graph_b,
+                    config=config,
+                    device=device,
+                )
+                _synchronize(device, torch)
+                input_latencies.append((time.perf_counter() - input_started) * 1000.0)
+                model_started = time.perf_counter()
                 output = model(*inputs)
                 _synchronize(device, torch)
-                model_latencies.append((time.perf_counter() - started) * 1000.0)
-            for logits, targets in (
-                (output["logits_ab"], pair.targets_a_to_b),
-                (output["logits_ba"], pair.targets_b_to_a),
+                model_latencies.append((time.perf_counter() - model_started) * 1000.0)
+                end_to_end_latencies.append(
+                    (time.perf_counter() - total_started) * 1000.0
+                )
+            for logits, targets, candidate_nodes in (
+                (output["logits_ab"], pair.targets_a_to_b, pair.graph_b.nodes),
+                (output["logits_ba"], pair.targets_b_to_a, pair.graph_a.nodes),
             ):
-                null_index = int(logits.shape[1]) - 1
+                candidate_indices = _actionable_indices(candidate_nodes)
                 for row_index, target_index in enumerate(targets):
                     if target_index == -2:
                         continue
-                    ranked = torch.argsort(logits[row_index], descending=True).tolist()
+                    ranked_positions = torch.argsort(
+                        logits[row_index, candidate_indices], descending=True
+                    ).tolist()
+                    ranked = [
+                        candidate_indices[position] for position in ranked_positions
+                    ]
                     if target_index >= 0:
                         positive_total += 1
                         positive_correct += int(ranked[0] == target_index)
                         for value in recall_hits:
                             recall_hits[value] += int(target_index in ranked[:value])
-                    else:
-                        null_total += 1
-                        null_correct += int(ranked[0] == null_index)
     return {
         "schema_version": "omnitransfer_correspondence_metrics_v1",
         "pair_count": len(pair_list),
@@ -377,9 +421,7 @@ def evaluate_correspondence_pairs(
             for value in recall_hits
         },
         "null_accuracy": null_correct / null_total if null_total else 0.0,
-        "false_positive_rate": (
-            1.0 - null_correct / null_total if null_total else 0.0
-        ),
+        "false_positive_rate": (1.0 - null_correct / null_total if null_total else 0.0),
         "warm_model_latency_ms": {
             "samples": len(model_latencies),
             "p50": _percentile(model_latencies, 50.0),
@@ -388,6 +430,24 @@ def evaluate_correspondence_pairs(
             "under_50ms_rate": (
                 sum(value < 50.0 for value in model_latencies) / len(model_latencies)
                 if model_latencies
+                else 0.0
+            ),
+        },
+        "warm_input_latency_ms": {
+            "samples": len(input_latencies),
+            "p50": _percentile(input_latencies, 50.0),
+            "p95": _percentile(input_latencies, 95.0),
+            "max": max(input_latencies, default=0.0),
+        },
+        "warm_end_to_end_latency_ms": {
+            "samples": len(end_to_end_latencies),
+            "p50": _percentile(end_to_end_latencies, 50.0),
+            "p95": _percentile(end_to_end_latencies, 95.0),
+            "max": max(end_to_end_latencies, default=0.0),
+            "under_50ms_rate": (
+                sum(value < 50.0 for value in end_to_end_latencies)
+                / len(end_to_end_latencies)
+                if end_to_end_latencies
                 else 0.0
             ),
         },
@@ -406,6 +466,7 @@ def evaluate_self_supervised_matcher(
     """Evaluate positive Top1 and NULL recall on deterministic held-out views."""
 
     torch = _require_torch()
+    torch.manual_seed(seed)
     rng = random.Random(seed)
     cfg = augment_config or AugmentConfig()
     model_cfg = matcher_config or MatcherConfig()
@@ -458,13 +519,115 @@ def evaluate_self_supervised_matcher(
     }
 
 
+def train_mapping_matcher(
+    graphs: Iterable[UIGraph],
+    correspondence_pairs: Iterable[TrainingPair],
+    *,
+    model: Any | None = None,
+    epochs: int = 1,
+    learning_rate: float = 3e-4,
+    weight_decay: float = 1e-4,
+    seed: int = 17,
+    device: str = "cpu",
+    augment_config: AugmentConfig | None = None,
+    matcher_config: MatcherConfig | None = None,
+    cycle_weight: float = 0.05,
+    progress_callback: Callable[[dict[str, float]], None] | None = None,
+    progress_interval: int = 1000,
+) -> tuple[Any, list[dict[str, float]]]:
+    """Train one matcher on mixed augmented-view and cross-page pairs."""
+
+    if progress_interval <= 0:
+        raise ValueError("progress_interval must be positive")
+    graph_list = list(graphs)
+    cross_page_pairs = list(correspondence_pairs)
+    if not cross_page_pairs:
+        raise ValueError("at least one cross-page correspondence pair is required")
+    torch = _require_torch()
+    torch.manual_seed(seed)
+    rng = random.Random(seed)
+    config = matcher_config or MatcherConfig()
+    augmentation = augment_config or AugmentConfig()
+    matcher = (model or build_relation_aware_matcher(config)).to(device)
+    optimizer = torch.optim.AdamW(
+        matcher.parameters(),
+        lr=learning_rate,
+        weight_decay=weight_decay,
+    )
+    history: list[dict[str, float]] = []
+    for epoch in range(max(1, int(epochs))):
+        training_items: list[tuple[str, TrainingPair | UIGraph]] = [
+            ("cross_page", pair) for pair in cross_page_pairs
+        ]
+        training_items.extend(("self_supervised", graph) for graph in graph_list)
+        rng.shuffle(training_items)
+        matcher.train()
+        losses: list[float] = []
+        self_supervised_pairs = 0
+        aligned_cross_page_pairs = 0
+        positive_labels = 0
+        for pair_kind, item in training_items:
+            if pair_kind == "self_supervised":
+                pair = make_training_pair(
+                    item,
+                    rng=rng,
+                    config=augmentation,
+                    matcher_config=config,
+                )
+                if pair is None:
+                    continue
+            else:
+                pair = item
+            optimizer.zero_grad(set_to_none=True)
+            loss = matching_loss(
+                matcher,
+                pair,
+                device=device,
+                matcher_config=config,
+                cycle_weight=cycle_weight,
+            )
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(matcher.parameters(), max_norm=1.0)
+            optimizer.step()
+            losses.append(float(loss.detach().cpu()))
+            self_supervised_pairs += int(pair_kind == "self_supervised")
+            aligned_cross_page_pairs += int(pair_kind == "cross_page")
+            positive_labels += sum(
+                target >= 0 for target in (*pair.targets_a_to_b, *pair.targets_b_to_a)
+            )
+            if progress_callback is not None and len(losses) % progress_interval == 0:
+                window = losses[-progress_interval:]
+                progress_callback(
+                    {
+                        "epoch": float(epoch + 1),
+                        "pairs": float(len(losses)),
+                        "running_loss": sum(window) / len(window),
+                        "self_supervised_pairs": float(self_supervised_pairs),
+                        "cross_page_pairs": float(aligned_cross_page_pairs),
+                        "positive_labels": float(positive_labels),
+                    }
+                )
+        history.append(
+            {
+                "epoch": float(epoch + 1),
+                "loss": sum(losses) / len(losses),
+                "pairs": float(len(losses)),
+                "self_supervised_pairs": float(self_supervised_pairs),
+                "cross_page_pairs": float(aligned_cross_page_pairs),
+                "positive_labels": float(positive_labels),
+            }
+        )
+    matcher.eval()
+    return matcher, history
+
+
 def train_self_supervised_matcher(
     graphs: list[UIGraph],
     *,
     model: Any | None = None,
     epochs: int = 1,
     learning_rate: float = 1e-3,
-    hidden_dim: int = 96,
+    hidden_dim: int = 64,
     num_heads: int = 4,
     num_layers: int = 2,
     seed: int = 13,
@@ -477,6 +640,7 @@ def train_self_supervised_matcher(
     """Train the relation-aware matcher on unlabeled UI graphs."""
 
     torch = _require_torch()
+    torch.manual_seed(seed)
     rng = random.Random(seed)
     cfg = augment_config or AugmentConfig()
     model_cfg = matcher_config or MatcherConfig(
@@ -544,6 +708,81 @@ def train_self_supervised_matcher(
     return model, history
 
 
+def train_correspondence_matcher(
+    pairs: Iterable[TrainingPair],
+    *,
+    model: Any | None = None,
+    epochs: int = 1,
+    learning_rate: float = 3e-4,
+    weight_decay: float = 1e-4,
+    seed: int = 17,
+    device: str = "cpu",
+    matcher_config: MatcherConfig | None = None,
+    cycle_weight: float = 0.05,
+    progress_callback: Callable[[dict[str, float]], None] | None = None,
+    progress_interval: int = 1000,
+) -> tuple[Any, list[dict[str, float]]]:
+    """Train the same matcher directly on aligned cross-page graph pairs."""
+
+    if progress_interval <= 0:
+        raise ValueError("progress_interval must be positive")
+    pair_list = list(pairs)
+    if not pair_list:
+        raise ValueError("at least one correspondence pair is required")
+    torch = _require_torch()
+    config = matcher_config or MatcherConfig()
+    torch.manual_seed(seed)
+    rng = random.Random(seed)
+    matcher = (model or build_relation_aware_matcher(config)).to(device)
+    optimizer = torch.optim.AdamW(
+        matcher.parameters(),
+        lr=learning_rate,
+        weight_decay=weight_decay,
+    )
+    history: list[dict[str, float]] = []
+    for epoch in range(max(1, int(epochs))):
+        matcher.train()
+        rng.shuffle(pair_list)
+        losses: list[float] = []
+        positive_labels = 0
+        for pair in pair_list:
+            optimizer.zero_grad(set_to_none=True)
+            loss = matching_loss(
+                matcher,
+                pair,
+                device=device,
+                matcher_config=config,
+                cycle_weight=cycle_weight,
+            )
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(matcher.parameters(), max_norm=1.0)
+            optimizer.step()
+            losses.append(float(loss.detach().cpu()))
+            positive_labels += sum(
+                target >= 0 for target in (*pair.targets_a_to_b, *pair.targets_b_to_a)
+            )
+            if progress_callback is not None and len(losses) % progress_interval == 0:
+                window = losses[-progress_interval:]
+                progress_callback(
+                    {
+                        "epoch": float(epoch + 1),
+                        "pairs": float(len(losses)),
+                        "running_loss": sum(window) / len(window),
+                        "positive_labels": float(positive_labels),
+                    }
+                )
+        history.append(
+            {
+                "epoch": float(epoch + 1),
+                "loss": sum(losses) / len(losses),
+                "pairs": float(len(losses)),
+                "positive_labels": float(positive_labels),
+            }
+        )
+    matcher.eval()
+    return matcher, history
+
+
 def _select_kept_nodes(
     nodes: tuple[UINode, ...],
     *,
@@ -593,9 +832,7 @@ def _augment_node(
         content_desc=(
             "" if rng.random() < config.mask_content_desc_prob else node.content_desc
         ),
-        resource_id=(
-            "" if rng.random() < config.mask_resource_id_prob else node.resource_id
-        ),
+        resource_id=node.resource_id,
         class_name="" if rng.random() < config.mask_class_prob else node.class_name,
         bbox=_transform_bbox(
             node.bbox,
@@ -719,20 +956,40 @@ def _partial_assignment_loss(
     logits: Any,
     targets: tuple[int, ...],
     *,
-    null_index: int,
+    candidate_indices: tuple[int, ...],
     torch: Any,
     device: str,
 ) -> Any:
-    supervised_rows = [index for index, target in enumerate(targets) if target != -2]
+    supervised_rows = [index for index, target in enumerate(targets) if target >= 0]
     if not supervised_rows:
         raise ValueError("partial assignment has no supervised rows")
+    if not candidate_indices:
+        raise ValueError("partial assignment has no actionable target candidates")
+    candidate_positions = {
+        index: position for position, index in enumerate(candidate_indices)
+    }
+    missing = [
+        targets[index]
+        for index in supervised_rows
+        if targets[index] not in candidate_positions
+    ]
+    if missing:
+        raise ValueError("supervised targets must be actionable")
     row_indices = torch.tensor(supervised_rows, dtype=torch.long, device=device)
+    column_indices = torch.tensor(candidate_indices, dtype=torch.long, device=device)
     labels = torch.tensor(
-        [targets[index] if targets[index] >= 0 else null_index for index in supervised_rows],
+        [candidate_positions[targets[index]] for index in supervised_rows],
         dtype=torch.long,
         device=device,
     )
-    return torch.nn.functional.cross_entropy(logits[row_indices], labels)
+    return torch.nn.functional.cross_entropy(
+        logits[row_indices][:, column_indices],
+        labels,
+    )
+
+
+def _actionable_indices(nodes: Iterable[UINode]) -> tuple[int, ...]:
+    return tuple(index for index, node in enumerate(nodes) if _is_actionable(node))
 
 
 def _synchronize(device: str, torch: Any) -> None:

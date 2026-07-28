@@ -14,6 +14,14 @@ The standalone repo keeps canonical data, training, and evaluation entrypoints.
     and freeze app-disjoint train/dev/test rows with a strict contamination audit.
 - `PYTHONPATH=src python scripts/import_mobileviews.py --input ... --output ...`
   - Stream official `image_content/json_content` parquet rows into lossless 384px images and package-disjoint UIGraph JSONL files.
+- `PYTHONPATH=src python scripts/freeze_mobileviews_app_split.py --traces-root ... --frozen-test-apps ... --output-dir ...`
+  - Index all extracted complete-trace batches, reject duplicate App identities,
+    scan strict pair capacity, and freeze App-disjoint train/dev-candidate/test
+    allowlists without GUIOdyssey data.
+- `PYTHONPATH=src python scripts/build_mobileviews_allowlist_pair_pool.py --traces-root ... --app-allowlist ... --output-dir ...`
+  - Build self-supervised MobileViews training pairs or an unreviewed
+    diagnostic pool from a frozen App allowlist; offline identity fields remain
+    label-only.
 - `PYTHONPATH=src python scripts/import_openmobile.py --input ... --output ...`
   - Import Uni-GUI-OpenMobile trajectories with per-screen UI elements into deduplicated, package-disjoint UIGraph JSONL files.
 - `PYTHONPATH=src python scripts/download_hf_lfs_files.py --repository ... --path ...`
@@ -36,8 +44,10 @@ The standalone repo keeps canonical data, training, and evaluation entrypoints.
   - Import WebUI screenshots and visible semantic element boxes into the same Unified UIGraph matcher path.
 - `PYTHONPATH=src python scripts/pretrain_ui_graph_matcher.py --input ... --output ...`
   - Self-supervise the relation-aware matcher on one or more UI graph streams; `--pretrained` continues the same encoder and matcher checkpoint.
+- `PYTHONPATH=src python scripts/train_mapping_page_pairs.py --input ... --pretrained ... --output ... --allow-unreviewed-pseudo`
+  - Mix dual augmented views and strict cross-page correspondences in one optimizer loop with one matcher and one symmetric objective. Unreviewed automatic labels require explicit opt-in; ambiguous and target-collision rows are filtered.
 - `PYTHONPATH=src:. python scripts/evaluate_ui_graph_matcher.py --input ... --checkpoint ... --output ...`
-  - Evaluate positive Top1 and learned-NULL recall on immutable UI graph files without updating the checkpoint.
+  - Evaluate positive Top1 and Recall@K on immutable UI graph files without updating the checkpoint.
 - `PYTHONPATH=src python scripts/train_learned_matcher.py --input ... --pretrained ... --output ...`
 - `PYTHONPATH=src python scripts/evaluate_learned_matcher.py --input ... --checkpoint ... --eval-split test --report ... --predictions ...`
   - Jointly fine-tune the encoder and matcher with set-valued/NULL labels and optional verified outcome preferences.

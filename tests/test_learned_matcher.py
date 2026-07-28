@@ -9,12 +9,17 @@ from omnitransfer.learned_matcher import (
     NUMERIC_FEATURE_DIM,
     RELATION_FEATURE_DIM,
     build_relation_aware_matcher,
+    cross_relation_features,
     encode_graph,
     matcher_inputs,
     parameter_count,
     save_matcher_checkpoint,
 )
-from omnitransfer.self_supervised import AugmentConfig, make_training_pair, matching_loss
+from omnitransfer.self_supervised import (
+    AugmentConfig,
+    make_training_pair,
+    matching_loss,
+)
 from omnitransfer.ui_graph import UIGraph, UINode, graph_from_record
 
 
@@ -67,6 +72,54 @@ def test_graph_encoder_exposes_learned_tokens_and_relations() -> None:
     assert encoded.relation_features[1][2][7] == 0.0
 
 
+def test_node_encoding_ignores_resource_id_and_absolute_position() -> None:
+    source = graph_from_record(
+        {
+            "screen_id": "source",
+            "width": 100,
+            "height": 100,
+            "nodes": [
+                {
+                    "node_id": "action",
+                    "text": "Search",
+                    "content-desc": "Find items",
+                    "resource-id": "source:id/search",
+                    "class": "EditText",
+                    "clickable": True,
+                    "editable": True,
+                    "bounds": [0, 0, 40, 20],
+                }
+            ],
+        }
+    )
+    target = graph_from_record(
+        {
+            "screen_id": "target",
+            "width": 100,
+            "height": 100,
+            "nodes": [
+                {
+                    "node_id": "action",
+                    "text": "Search",
+                    "content-desc": "Find items",
+                    "resource-id": "target:id/completely_different",
+                    "class": "EditText",
+                    "clickable": True,
+                    "editable": True,
+                    "bounds": [55, 70, 95, 90],
+                }
+            ],
+        }
+    )
+
+    encoded_source = encode_graph(source)
+    encoded_target = encode_graph(target)
+
+    assert encoded_source.token_ids == encoded_target.token_ids
+    assert encoded_source.numeric_features == encoded_target.numeric_features
+    assert not cross_relation_features(source, target).any()
+
+
 def test_relation_matcher_forward_and_partial_assignment_loss() -> None:
     torch = pytest.importorskip("torch")
     config = MatcherConfig(hidden_dim=64, num_heads=4, num_layers=1, dropout=0.0)
@@ -92,36 +145,72 @@ def test_relation_matcher_forward_and_partial_assignment_loss() -> None:
 
     assert output["logits_ab"].shape == (
         len(pair.graph_a.nodes),
-        len(pair.graph_b.nodes) + 1,
+        len(pair.graph_b.nodes),
     )
     assert output["logits_ba"].shape == (
         len(pair.graph_b.nodes),
-        len(pair.graph_a.nodes) + 1,
+        len(pair.graph_a.nodes),
     )
     assert math.isfinite(float(loss.detach()))
     loss.backward()
     assert any(parameter.grad is not None for parameter in model.parameters())
     assert parameter_count(model) < 1_500_000
-    assert any(isinstance(module, torch.nn.MultiheadAttention) for module in model.modules())
+    assert any(
+        isinstance(module, torch.nn.MultiheadAttention) for module in model.modules()
+    )
 
 
-def test_inference_adapter_ignores_null_logit() -> None:
+def test_inference_adapter_rejects_low_pair_confidence() -> None:
     torch = pytest.importorskip("torch")
     source = _graph("source")
     target = _graph("target", delete_y=60)
 
-    class NullModel(torch.nn.Module):
+    class LowConfidenceModel(torch.nn.Module):
         def forward(self, *inputs):
             source_count = inputs[0].shape[0]
             target_count = inputs[3].shape[0]
-            logits_ab = torch.zeros((source_count, target_count + 1))
+            logits_ab = torch.zeros((source_count, target_count))
             logits_ab[:, 1] = 2.0
-            logits_ab[:, -1] = 10.0
-            logits_ba = torch.zeros((target_count, source_count + 1))
-            logits_ba[:, -1] = 10.0
-            return {"logits_ab": logits_ab, "logits_ba": logits_ba}
+            logits_ba = torch.zeros((target_count, source_count))
+            affinity = torch.full((source_count, target_count), -10.0)
+            return {
+                "logits_ab": logits_ab,
+                "logits_ba": logits_ba,
+                "affinity": affinity,
+            }
 
-    result = LearnedGraphMatcher(NullModel()).predict(
+    result = LearnedGraphMatcher(LowConfidenceModel()).predict(
+        source,
+        target,
+        source_node_id="delete",
+        min_probability=0.5,
+    )
+
+    assert result.target_node is None
+    assert result.reason == "learned_low_confidence"
+    assert result.probability < 0.5
+
+
+def test_inference_ranks_only_actionable_target_nodes() -> None:
+    torch = pytest.importorskip("torch")
+    source = _graph("source")
+    target = _graph("target")
+
+    class ContextBiasedModel(torch.nn.Module):
+        def forward(self, *inputs):
+            source_count = inputs[0].shape[0]
+            target_count = inputs[3].shape[0]
+            logits_ab = torch.zeros((source_count, target_count))
+            logits_ab[:, 3] = 100.0
+            logits_ab[:, 1] = 10.0
+            logits_ba = torch.zeros((target_count, source_count))
+            return {
+                "logits_ab": logits_ab,
+                "logits_ba": logits_ba,
+                "affinity": logits_ab,
+            }
+
+    result = LearnedGraphMatcher(ContextBiasedModel()).predict(
         source,
         target,
         source_node_id="delete",
@@ -129,8 +218,6 @@ def test_inference_adapter_ignores_null_logit() -> None:
 
     assert result.target_node is not None
     assert result.target_node.node_id == "delete"
-    assert result.reason == "learned_match"
-    assert all(candidate_id != "__NULL__" for candidate_id, _ in result.scores)
 
 
 def test_visual_encoder_is_jointly_trained_when_screenshots_exist(tmp_path) -> None:
@@ -165,7 +252,9 @@ def test_visual_encoder_is_jointly_trained_when_screenshots_exist(tmp_path) -> N
     assert model.visual_encoder[0].weight.grad is not None
 
 
-def test_visual_crop_follows_element_identity_during_layout_augmentation(tmp_path) -> None:
+def test_visual_crop_follows_element_identity_during_layout_augmentation(
+    tmp_path,
+) -> None:
     torch = pytest.importorskip("torch")
     image_module = pytest.importorskip("PIL.Image")
     screenshot = tmp_path / "screen.png"

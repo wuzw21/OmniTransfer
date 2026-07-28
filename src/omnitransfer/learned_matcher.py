@@ -13,6 +13,9 @@ from typing import Any, Iterable
 from omnitransfer.ui_graph import BBox, UIGraph, UINode, local_context_graph
 
 
+# Keep the tensor width checkpoint-compatible with the deployed matcher.  Only
+# the first four action-state channels carry information; the remaining
+# channels are reserved zeros and contain no geometry.
 NUMERIC_FEATURE_DIM = 18
 RELATION_FEATURE_DIM = 18
 
@@ -24,7 +27,7 @@ class MatcherConfig:
     vocab_size: int = 8192
     max_tokens: int = 48
     token_dim: int = 48
-    hidden_dim: int = 96
+    hidden_dim: int = 64
     relation_hidden_dim: int = 24
     num_heads: int = 4
     num_layers: int = 2
@@ -83,7 +86,9 @@ def encode_graph(
         node_ids=tuple(node.node_id for node in graph.nodes),
         origin_ids=tuple(node.origin_id for node in graph.nodes),
         token_ids=tuple(_node_token_ids(node, config=cfg) for node in graph.nodes),
-        numeric_features=tuple(_node_numeric_features(node, graph) for node in graph.nodes),
+        numeric_features=tuple(
+            _node_numeric_features(node, graph) for node in graph.nodes
+        ),
         relation_features=_relation_features(graph),
     )
 
@@ -92,15 +97,17 @@ def cross_relation_features(
     source: UIGraph,
     target: UIGraph,
 ) -> Any:
-    """Return source-target geometric inputs for a learned pair head."""
+    """Return a geometry-free source-target relation tensor.
 
-    source_context = _relation_context(source)
-    target_context = _relation_context(target)
-    same_graph = source is target or source.graph_id == target.graph_id
-    return _relation_matrix(
-        source_context,
-        target_context,
-        same_graph=same_graph,
+    Layout enters the matcher only as relations among nodes on the same page.
+    Cross-page absolute position and size are deliberately unavailable to the
+    pair head so they cannot become transfer shortcuts.
+    """
+
+    np = _require_numpy()
+    return np.zeros(
+        (len(source.nodes), len(target.nodes), RELATION_FEATURE_DIM),
+        dtype=np.float32,
     )
 
 
@@ -204,8 +211,12 @@ def build_relation_aware_matcher(
                 source_states.unsqueeze(0),
                 need_weights=False,
             )[0].squeeze(0)
-            source_states = self.cross_norm(source_states + self.dropout(source_context))
-            target_states = self.cross_norm(target_states + self.dropout(target_context))
+            source_states = self.cross_norm(
+                source_states + self.dropout(source_context)
+            )
+            target_states = self.cross_norm(
+                target_states + self.dropout(target_context)
+            )
             source_states = self.output_norm(
                 source_states + self.dropout(self.cross_feed_forward(source_states))
             )
@@ -255,13 +266,6 @@ def build_relation_aware_matcher(
                 nn.Linear(cfg.hidden_dim, 1),
             )
             self.matchability = nn.Linear(cfg.hidden_dim, 1)
-            null_dim = cfg.hidden_dim * 4
-            self.null_head = nn.Sequential(
-                nn.LayerNorm(null_dim),
-                nn.Linear(null_dim, cfg.hidden_dim),
-                nn.GELU(),
-                nn.Linear(cfg.hidden_dim, 1),
-            )
 
         def _encode_nodes(
             self,
@@ -277,7 +281,9 @@ def build_relation_aware_matcher(
             token_states = self.token_projection(token_sum / token_count)
             numeric_states = self.numeric_projection(numeric_features)
             visual_states = self.visual_encoder(visual_patches)
-            missing = self.missing_visual.unsqueeze(0).expand(visual_states.shape[0], -1)
+            missing = self.missing_visual.unsqueeze(0).expand(
+                visual_states.shape[0], -1
+            )
             visual_states = visual_mask * visual_states + (1.0 - visual_mask) * missing
             return self.input_norm(token_states + numeric_states + visual_states)
 
@@ -295,15 +301,11 @@ def build_relation_aware_matcher(
                 dim=-1,
             )
             logits = self.pair_head(pair).squeeze(-1)
-            return logits + self.matchability(source_states) + self.matchability(target_states).T
-
-        def _null_logits(self, states: Any, other_states: Any) -> Any:
-            pooled = other_states.mean(dim=0, keepdim=True).expand(states.shape[0], -1)
-            features = torch.cat(
-                [states, pooled, torch.abs(states - pooled), states * pooled],
-                dim=-1,
+            return (
+                logits
+                + self.matchability(source_states)
+                + self.matchability(target_states).T
             )
-            return self.null_head(features)
 
         def forward(
             self,
@@ -353,17 +355,10 @@ def build_relation_aware_matcher(
                 source_states,
                 reverse_relations,
             )
-            logits_ab = torch.cat(
-                [pair_logits, self._null_logits(source_states, target_states)],
-                dim=1,
-            )
-            logits_ba = torch.cat(
-                [reverse_logits, self._null_logits(target_states, source_states)],
-                dim=1,
-            )
             return {
-                "logits_ab": logits_ab,
-                "logits_ba": logits_ba,
+                "logits_ab": pair_logits,
+                "logits_ba": reverse_logits,
+                "affinity": pair_logits,
                 "source_states": source_states,
                 "target_states": target_states,
             }
@@ -489,8 +484,14 @@ class LearnedGraphMatcher:
         min_margin: float = 0.0,
     ) -> LearnedMatch:
         torch = _require_torch()
-        if not any(node.node_id == source_node_id for node in source.nodes):
+        source_node = next(
+            (node for node in source.nodes if node.node_id == source_node_id),
+            None,
+        )
+        if source_node is None:
             return LearnedMatch(None, 0.0, 0.0, "source_node_missing", ())
+        if not _is_actionable(source_node):
+            return LearnedMatch(None, 0.0, 0.0, "source_node_not_actionable", ())
         if len(source.nodes) > self.config.source_context_nodes:
             source = local_context_graph(
                 source,
@@ -498,14 +499,20 @@ class LearnedGraphMatcher:
                 max_nodes=self.config.source_context_nodes,
             )
         source_index = next(
-            (index for index, node in enumerate(source.nodes) if node.node_id == source_node_id),
+            (
+                index
+                for index, node in enumerate(source.nodes)
+                if node.node_id == source_node_id
+            ),
             None,
         )
         if source_index is None:
             raise AssertionError("source context dropped its anchor node")
         allowed = set(candidate_node_ids or (node.node_id for node in target.nodes))
         candidate_indices = [
-            index for index, node in enumerate(target.nodes) if node.node_id in allowed
+            index
+            for index, node in enumerate(target.nodes)
+            if node.node_id in allowed and _is_actionable(node)
         ]
         if not candidate_indices:
             return LearnedMatch(None, 0.0, 0.0, "target_candidates_missing", ())
@@ -516,27 +523,43 @@ class LearnedGraphMatcher:
             device=self.device,
         )
         with torch.no_grad():
-            logits = self.model(*inputs)["logits_ab"][source_index]
-            selected_logits = logits[candidate_indices]
-            probabilities = torch.softmax(selected_logits, dim=0)
+            output = self.model(*inputs)
+            selected_logits = output["logits_ab"][source_index][candidate_indices]
+            selected_affinity = output["affinity"][source_index][candidate_indices]
+            rank_probabilities = torch.softmax(selected_logits, dim=0)
+            match_probabilities = torch.sigmoid(selected_affinity)
         ranked = sorted(
             (
-                (target.nodes[index].node_id, float(probabilities[position]))
+                (target.nodes[index].node_id, float(rank_probabilities[position]))
                 for position, index in enumerate(candidate_indices)
             ),
             key=lambda item: (-item[1], item[0]),
         )
         best_id, best_probability = ranked[0]
+        best_position = next(
+            position
+            for position, index in enumerate(candidate_indices)
+            if target.nodes[index].node_id == best_id
+        )
+        match_probability = float(match_probabilities[best_position])
         second_probability = max(
             (score for _, score in ranked[1:]),
             default=0.0,
         )
         margin = best_probability - second_probability
         scores = tuple(ranked)
-        if best_probability < min_probability or margin < min_margin:
-            return LearnedMatch(None, best_probability, margin, "learned_low_confidence", scores)
+        if match_probability < min_probability or margin < min_margin:
+            return LearnedMatch(
+                None, match_probability, margin, "learned_low_confidence", scores
+            )
         target_node = next(node for node in target.nodes if node.node_id == best_id)
-        return LearnedMatch(target_node, best_probability, margin, "learned_match", scores)
+        return LearnedMatch(
+            target_node, match_probability, margin, "learned_match", scores
+        )
+
+
+def _is_actionable(node: UINode) -> bool:
+    return bool(node.enabled and (node.clickable or node.editable or node.scrollable))
 
 
 def save_matcher_checkpoint(
@@ -565,7 +588,11 @@ def save_matcher_checkpoint(
 def parameter_count(model: Any) -> int:
     """Return trainable parameter count for experiment reporting."""
 
-    return sum(int(parameter.numel()) for parameter in model.parameters() if parameter.requires_grad)
+    return sum(
+        int(parameter.numel())
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
 
 
 def prepare_visual_asset(
@@ -630,12 +657,14 @@ def _visual_inputs(
         device=device,
     )
     offsets = torch.linspace(0.0, 1.0, patch_size, device=device)
-    grid_x = boxes[:, 0, None, None] + (
-        boxes[:, 2] - boxes[:, 0]
-    )[:, None, None] * offsets[None, None, :]
-    grid_y = boxes[:, 1, None, None] + (
-        boxes[:, 3] - boxes[:, 1]
-    )[:, None, None] * offsets[None, :, None]
+    grid_x = (
+        boxes[:, 0, None, None]
+        + (boxes[:, 2] - boxes[:, 0])[:, None, None] * offsets[None, None, :]
+    )
+    grid_y = (
+        boxes[:, 1, None, None]
+        + (boxes[:, 3] - boxes[:, 1])[:, None, None] * offsets[None, :, None]
+    )
     grid_x = grid_x.expand(-1, patch_size, -1)
     grid_y = grid_y.expand(-1, -1, patch_size)
     grid = torch.stack((grid_x, grid_y), dim=-1)
@@ -720,17 +749,8 @@ def _node_token_ids(node: UINode, *, config: MatcherConfig) -> tuple[int, ...]:
     fields: list[tuple[str, str]] = [
         ("text", node.text),
         ("desc", node.content_desc),
-        ("resource", node.resource_id),
         ("class", node.class_name),
     ]
-    metadata = node.metadata or {}
-    for field_name in ("action_type", "parent_text", "screen_region"):
-        fields.append((field_name, str(metadata.get(field_name) or "")))
-    for field_name in ("sibling_texts", "nearby_texts"):
-        values = metadata.get(field_name) or ()
-        if isinstance(values, str):
-            values = (values,)
-        fields.append((field_name, " ".join(str(value) for value in values)))
     for field_name, value in fields:
         normalized = _normalize_text(value)
         if not normalized:
@@ -742,7 +762,7 @@ def _node_token_ids(node: UINode, *, config: MatcherConfig) -> tuple[int, ...]:
             if len(word) >= 3:
                 padded = f"^{word}$"
                 pieces.extend(
-                    f"{field_name}:ngram:{padded[index:index + 3]}"
+                    f"{field_name}:ngram:{padded[index : index + 3]}"
                     for index in range(len(padded) - 2)
                 )
     token_ids: list[int] = []
@@ -759,38 +779,13 @@ def _node_token_ids(node: UINode, *, config: MatcherConfig) -> tuple[int, ...]:
 
 
 def _node_numeric_features(node: UINode, graph: UIGraph) -> tuple[float, ...]:
-    bbox = _normalized_bbox(node.bbox, graph)
-    if bbox is None:
-        x1 = y1 = x2 = y2 = center_x = center_y = width = height = area = aspect = 0.0
-        has_bbox = 0.0
-    else:
-        x1, y1, x2, y2 = bbox
-        width = max(0.0, x2 - x1)
-        height = max(0.0, y2 - y1)
-        center_x = x1 + width / 2.0
-        center_y = y1 + height / 2.0
-        area = width * height
-        aspect = _clip(math.log(max(width, 1e-6) / max(height, 1e-6)) / 4.0, -1.0, 1.0)
-        has_bbox = 1.0
+    del graph
     values = (
         float(node.clickable),
         float(node.editable),
         float(node.scrollable),
         float(node.enabled),
-        has_bbox,
-        x1,
-        y1,
-        x2,
-        y2,
-        center_x,
-        center_y,
-        width,
-        height,
-        area,
-        aspect,
-        min(float(node.depth) / 32.0, 1.0),
-        min(float(len(node.child_ids)) / 16.0, 1.0),
-        float(node.parent_id is not None),
+        *(0.0 for _ in range(NUMERIC_FEATURE_DIM - 4)),
     )
     if len(values) != NUMERIC_FEATURE_DIM:
         raise AssertionError("unexpected numeric feature dimension")
@@ -810,14 +805,20 @@ def _node_relation(
     source_graph: UIGraph,
     target_graph: UIGraph,
 ) -> tuple[float, ...]:
-    same_graph = source_graph is target_graph or source_graph.graph_id == target_graph.graph_id
+    same_graph = (
+        source_graph is target_graph or source_graph.graph_id == target_graph.graph_id
+    )
     source_context = _relation_context(source_graph)
     target_context = _relation_context(target_graph)
     source_index = next(
-        index for index, node in enumerate(source_graph.nodes) if node.node_id == source.node_id
+        index
+        for index, node in enumerate(source_graph.nodes)
+        if node.node_id == source.node_id
     )
     target_index = next(
-        index for index, node in enumerate(target_graph.nodes) if node.node_id == target.node_id
+        index
+        for index, node in enumerate(target_graph.nodes)
+        if node.node_id == target.node_id
     )
     return _contextual_node_relation(
         source_index,
@@ -874,6 +875,8 @@ def _relation_matrix(
         (source_count, target_count, RELATION_FEATURE_DIM),
         dtype=np.float32,
     )
+    if not same_graph:
+        return values
     source_centers = np.asarray(source_context.centers, dtype=np.float32)
     target_centers = np.asarray(target_context.centers, dtype=np.float32)
     source_sizes = np.asarray(source_context.sizes, dtype=np.float32)
@@ -884,14 +887,22 @@ def _relation_matrix(
     source_height = source_sizes[:, None, 1]
     target_width = target_sizes[None, :, 0]
     target_height = target_sizes[None, :, 1]
-    same_row = np.abs(delta_y) <= np.maximum(
-        np.maximum(source_height, target_height),
-        0.02,
-    ) * 0.5
-    same_column = np.abs(delta_x) <= np.maximum(
-        np.maximum(source_width, target_width),
-        0.02,
-    ) * 0.5
+    same_row = (
+        np.abs(delta_y)
+        <= np.maximum(
+            np.maximum(source_height, target_height),
+            0.02,
+        )
+        * 0.5
+    )
+    same_column = (
+        np.abs(delta_x)
+        <= np.maximum(
+            np.maximum(source_width, target_width),
+            0.02,
+        )
+        * 0.5
+    )
     overlap = _pairwise_iou(source_context.bboxes, target_context.bboxes, np=np)
     parent = np.zeros((source_count, target_count), dtype=bool)
     child = np.zeros_like(parent)
@@ -926,12 +937,16 @@ def _relation_matrix(
             & ~identity
         )
         for target_index, target_node in enumerate(target_context.graph.nodes):
-            for ancestor_id in target_context.ancestor_sets.get(target_node.node_id, ()):
+            for ancestor_id in target_context.ancestor_sets.get(
+                target_node.node_id, ()
+            ):
                 source_index = source_context.node_indices.get(ancestor_id)
                 if source_index is not None:
                     ancestor[source_index, target_index] = True
         for source_index, source_node in enumerate(source_context.graph.nodes):
-            for ancestor_id in source_context.ancestor_sets.get(source_node.node_id, ()):
+            for ancestor_id in source_context.ancestor_sets.get(
+                source_node.node_id, ()
+            ):
                 target_index = target_context.node_indices.get(ancestor_id)
                 if target_index is not None:
                     descendant[source_index, target_index] = True
@@ -966,12 +981,7 @@ def _relation_matrix(
     )
     values[..., 15] = overlap
     values[..., 16] = np.minimum(tree_distance / 16.0, 1.0)
-    values[..., 17] = (
-        sibling
-        | parent
-        | child
-        | (np.hypot(delta_x, delta_y) <= 0.25)
-    )
+    values[..., 17] = sibling | parent | child | (np.hypot(delta_x, delta_y) <= 0.25)
     return values
 
 
@@ -1048,11 +1058,15 @@ def _contextual_node_relation(
     same_row = abs(delta_y) <= max(source_height, target_height, 0.02) * 0.5
     same_column = abs(delta_x) <= max(source_width, target_width, 0.02) * 0.5
     overlap = _iou(source_bbox, target_bbox)
-    tree_distance = _context_tree_distance(
-        source.node_id,
-        target.node_id,
-        source_context,
-    ) if same_graph else 16
+    tree_distance = (
+        _context_tree_distance(
+            source.node_id,
+            target.node_id,
+            source_context,
+        )
+        if same_graph
+        else 16
+    )
     values = (
         float(same_graph and source.node_id == target.node_id),
         float(parent),
@@ -1067,8 +1081,14 @@ def _contextual_node_relation(
         _clip(delta_y, -1.0, 1.0),
         min(abs(delta_x), 1.0),
         min(abs(delta_y), 1.0),
-        _clip(math.log(max(target_width, 1e-6) / max(source_width, 1e-6)) / 4.0, -1.0, 1.0),
-        _clip(math.log(max(target_height, 1e-6) / max(source_height, 1e-6)) / 4.0, -1.0, 1.0),
+        _clip(
+            math.log(max(target_width, 1e-6) / max(source_width, 1e-6)) / 4.0, -1.0, 1.0
+        ),
+        _clip(
+            math.log(max(target_height, 1e-6) / max(source_height, 1e-6)) / 4.0,
+            -1.0,
+            1.0,
+        ),
         overlap,
         min(float(tree_distance) / 16.0, 1.0),
         float(sibling or parent or child or math.hypot(delta_x, delta_y) <= 0.25),
@@ -1098,8 +1118,14 @@ def _context_tree_distance(
 def _normalized_bbox(bbox: BBox | None, graph: UIGraph) -> BBox | None:
     if bbox is None:
         return None
-    width = float(graph.width or max((node.bbox or (0.0, 0.0, 1.0, 1.0))[2] for node in graph.nodes))
-    height = float(graph.height or max((node.bbox or (0.0, 0.0, 1.0, 1.0))[3] for node in graph.nodes))
+    width = float(
+        graph.width
+        or max((node.bbox or (0.0, 0.0, 1.0, 1.0))[2] for node in graph.nodes)
+    )
+    height = float(
+        graph.height
+        or max((node.bbox or (0.0, 0.0, 1.0, 1.0))[3] for node in graph.nodes)
+    )
     if width <= 0.0 or height <= 0.0:
         return None
     return (
@@ -1140,7 +1166,9 @@ def _is_ancestor(ancestor_id: str, node_id: str, graph: UIGraph) -> bool:
     nodes = {node.node_id: node for node in graph.nodes}
     current = nodes.get(node_id)
     visited: set[str] = set()
-    while current is not None and current.parent_id and current.parent_id not in visited:
+    while (
+        current is not None and current.parent_id and current.parent_id not in visited
+    ):
         if current.parent_id == ancestor_id:
             return True
         visited.add(current.parent_id)
@@ -1167,7 +1195,9 @@ def _ancestor_path(node_id: str, graph: UIGraph) -> list[str]:
     path = [node_id]
     current = nodes.get(node_id)
     visited = {node_id}
-    while current is not None and current.parent_id and current.parent_id not in visited:
+    while (
+        current is not None and current.parent_id and current.parent_id not in visited
+    ):
         path.append(current.parent_id)
         visited.add(current.parent_id)
         current = nodes.get(current.parent_id)

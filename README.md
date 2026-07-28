@@ -162,7 +162,7 @@ training pairs without manual source-target widget labels:
 raw UI graph G
   -> topology/layout/attribute view G_a
   -> independently perturbed view G_b with hard distractors
-  -> bidirectional candidate assignment with a learnable NULL
+  -> bidirectional actionable-node ranking
 ```
 
 The transformation is known because the augmentation function creates both
@@ -170,8 +170,8 @@ views and preserves latent `origin_id` only for label construction. The matcher
 does not receive `origin_id`. It learns from structured UI fields and relations:
 
 ```text
-mask text/content-desc/resource-id/class
-drop nodes and graph edges with NULL supervision
+mask text/content-desc/class
+drop nodes and graph edges while ignoring unmatched rows
 global and local layout perturbation
 shuffle node order
 inject duplicate-looking same-screen hard negatives
@@ -179,6 +179,11 @@ jointly train the lightweight screenshot crop encoder
 learn tree/local/relative-position attention bias
 apply bidirectional source-target cross-attention
 ```
+
+The 64D node state uses only text/content description, class/action state, and
+the visual crop. Raw resource id and absolute position/size are not model
+inputs. All retained nodes participate in attention, but labels and ranking
+candidates are strictly actionable-node to actionable-node.
 
 Materialize an official MobileViews parquet shard once. The importer reads only
 `image_content/json_content`, pre-resizes screenshots losslessly to the same
@@ -215,6 +220,23 @@ PYTHONPATH=src python scripts/pretrain_ui_graph_matcher.py \
   --device cuda \
   --output runtime/models/mobileviews_ui_graph_matcher.pt
 ```
+
+Aligned MobileViews/Mind2Web page pairs can update the same model without a
+second scoring path. Automatic diagnostic labels require explicit opt-in and
+only globally one-to-one rows enter the cross-page loss:
+
+```bash
+PYTHONPATH=src python scripts/train_mapping_page_pairs.py \
+  --input runtime/datasets/mobileviews/diagnostic.jsonl \
+  --allow-unreviewed-pseudo \
+  --device cuda \
+  --output runtime/models/mapping_self_supervised.pt
+```
+
+Each epoch mixes dual augmented views and aligned cross-page pairs in one
+optimizer loop. Both pair sources use the same encoder, cross-attention matcher,
+and symmetric correspondence objective. Stable dataset IDs are used only to
+construct offline labels.
 
 The official first shard contains 150,001 globally deduplicated screens. Its
 expected size is 25,922,626,062 bytes and SHA-256 is
@@ -303,7 +325,7 @@ PYTHONPATH=src python scripts/import_webui.py \
 Continue training the same encoder and matcher across multiple graph streams;
 `--pretrained` resumes the checkpoint instead of creating a new model. Mix a
 rehearsal sample from every earlier domain in each run; sequential single-domain
-fine-tuning is not used because it measurably forgets prior NULL calibration:
+fine-tuning is not used because it measurably forgets prior pair-confidence calibration:
 
 ```bash
 PYTHONPATH=src python scripts/pretrain_ui_graph_matcher.py \

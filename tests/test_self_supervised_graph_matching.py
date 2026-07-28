@@ -1,14 +1,24 @@
 import random
 
+import pytest
+
 from omnitransfer.self_supervised import (
     AugmentConfig,
     FEATURE_DIM,
     evaluate_correspondence_pairs,
     make_correspondence_training_pair,
     make_training_pair,
+    matching_loss,
+    train_mapping_matcher,
+    train_self_supervised_matcher,
 )
 from omnitransfer.learned_matcher import MatcherConfig, RELATION_FEATURE_DIM
-from omnitransfer.ui_graph import UIGraph, UINode, graph_from_record, local_context_graph
+from omnitransfer.ui_graph import (
+    UIGraph,
+    UINode,
+    graph_from_record,
+    local_context_graph,
+)
 
 
 def test_graph_from_nested_record_parses_nodes_and_bounds() -> None:
@@ -85,7 +95,6 @@ def test_augmented_views_keep_origin_correspondence() -> None:
         config=AugmentConfig(
             mask_text_prob=1.0,
             mask_content_desc_prob=1.0,
-            mask_resource_id_prob=1.0,
             mask_class_prob=0.0,
             drop_node_prob=0.0,
             edge_dropout_prob=0.0,
@@ -94,12 +103,15 @@ def test_augmented_views_keep_origin_correspondence() -> None:
     )
 
     assert pair is not None
-    assert len(pair.origin_ids) == 4
+    assert pair.origin_ids == ("cancel", "search")
     assert len(pair.features_a[0]) == FEATURE_DIM
     assert len(pair.encoded_a.relation_features[0][0]) == RELATION_FEATURE_DIM
     assert pair.graph_a.nodes[pair.source_indices[0]].origin_id == pair.origin_ids[0]
     assert pair.graph_b.nodes[pair.target_indices[0]].origin_id == pair.origin_ids[0]
-    assert pair.graph_a.metadata["visual_transform"] != pair.graph_b.metadata["visual_transform"]
+    assert (
+        pair.graph_a.metadata["visual_transform"]
+        != pair.graph_b.metadata["visual_transform"]
+    )
     original_boxes = {node.origin_id: node.bbox for node in graph.nodes}
     assert all(
         node.metadata["visual_bbox"] == original_boxes[node.origin_id]
@@ -108,7 +120,7 @@ def test_augmented_views_keep_origin_correspondence() -> None:
     )
 
 
-def test_augmented_views_include_hard_distractors_and_null_labels() -> None:
+def test_augmented_views_include_hard_distractors_as_ignored_context() -> None:
     graph = graph_from_record(
         {
             "screen_id": "screen-hard-negatives",
@@ -156,9 +168,236 @@ def test_augmented_views_include_hard_distractors_and_null_labels() -> None:
     )
 
     assert pair is not None
-    assert sum(target < 0 for target in pair.targets_a_to_b) == 2
-    assert sum(target < 0 for target in pair.targets_b_to_a) == 2
+    assert sum(target < 0 for target in pair.targets_a_to_b) == 4
+    assert sum(target < 0 for target in pair.targets_b_to_a) == 4
     assert any(node.metadata.get("hard_negative") for node in pair.graph_a.nodes)
+
+
+def test_same_page_supervision_keeps_context_but_labels_only_actionable_nodes() -> None:
+    graph = graph_from_record(
+        {
+            "screen_id": "actionable-only",
+            "width": 100,
+            "height": 100,
+            "nodes": [
+                {"node_id": "root", "class": "Root", "bounds": [0, 0, 100, 100]},
+                {
+                    "node_id": "search",
+                    "parent_id": "root",
+                    "text": "Search",
+                    "class": "EditText",
+                    "clickable": True,
+                    "editable": True,
+                    "bounds": [5, 5, 95, 25],
+                },
+                {
+                    "node_id": "settings",
+                    "parent_id": "root",
+                    "content-desc": "Settings",
+                    "class": "ImageButton",
+                    "clickable": True,
+                    "bounds": [70, 70, 95, 95],
+                },
+                {
+                    "node_id": "title",
+                    "parent_id": "root",
+                    "text": "Results",
+                    "class": "TextView",
+                    "bounds": [5, 35, 95, 55],
+                },
+            ],
+        }
+    )
+
+    pair = make_training_pair(
+        graph,
+        rng=random.Random(11),
+        config=AugmentConfig(
+            drop_node_prob=0.0,
+            distractor_prob=0.0,
+            bbox_jitter=0.0,
+            global_translation=0.0,
+            global_scale=0.0,
+        ),
+    )
+
+    assert pair is not None
+    assert pair.origin_ids == ("search", "settings")
+    assert {node.origin_id for node in pair.graph_a.nodes} == {
+        "root",
+        "search",
+        "settings",
+        "title",
+    }
+    assert sum(target >= 0 for target in pair.targets_a_to_b) == 2
+
+
+def test_matching_loss_ranks_only_actionable_target_candidates() -> None:
+    torch = __import__("pytest").importorskip("torch")
+    source = UIGraph(
+        graph_id="source",
+        nodes=(
+            UINode(node_id="source-action", origin_id="source-action", clickable=True),
+            UINode(node_id="source-context", origin_id="source-context", text="Title"),
+        ),
+    )
+    target = UIGraph(
+        graph_id="target",
+        nodes=(
+            UINode(node_id="target-action", origin_id="target-action", clickable=True),
+            UINode(node_id="target-context", origin_id="target-context", text="Title"),
+        ),
+    )
+    pair = make_correspondence_training_pair(
+        source,
+        target,
+        (("source-action", "target-action"),),
+    )
+
+    class ContextDistractedMatcher(torch.nn.Module):
+        def forward(self, *inputs):
+            logits_ab = torch.tensor([[0.0, 100.0], [0.0, 0.0]])
+            logits_ba = torch.tensor([[0.0, 100.0], [0.0, 0.0]])
+            return {"logits_ab": logits_ab, "logits_ba": logits_ba}
+
+    loss = matching_loss(ContextDistractedMatcher(), pair, cycle_weight=0.0)
+
+    assert float(loss) < 0.01
+
+
+def test_self_supervised_seed_controls_model_initialization() -> None:
+    torch = __import__("pytest").importorskip("torch")
+    graph = graph_from_record(
+        {
+            "screen_id": "seeded-training",
+            "width": 100,
+            "height": 100,
+            "nodes": [
+                {"node_id": "root", "class": "Root", "bounds": [0, 0, 100, 100]},
+                {
+                    "node_id": "action",
+                    "parent_id": "root",
+                    "text": "Continue",
+                    "class": "Button",
+                    "clickable": True,
+                    "bounds": [10, 20, 90, 50],
+                },
+            ],
+        }
+    )
+    config = MatcherConfig(hidden_dim=32, num_heads=4, num_layers=1, dropout=0.0)
+    augment = AugmentConfig(drop_node_prob=0.0, distractor_prob=0.0)
+
+    model_a, history_a = train_self_supervised_matcher(
+        [graph],
+        seed=23,
+        matcher_config=config,
+        augment_config=augment,
+    )
+    model_b, history_b = train_self_supervised_matcher(
+        [graph],
+        seed=23,
+        matcher_config=config,
+        augment_config=augment,
+    )
+
+    assert history_a == history_b
+    assert model_a.state_dict().keys() == model_b.state_dict().keys()
+    assert all(
+        torch.equal(model_a.state_dict()[key], model_b.state_dict()[key])
+        for key in model_a.state_dict()
+    )
+
+
+def test_mapping_training_mixes_augmented_and_cross_page_pairs() -> None:
+    __import__("pytest").importorskip("torch", exc_type=ImportError)
+    source = graph_from_record(
+        {
+            "screen_id": "mixed-source",
+            "width": 100,
+            "height": 100,
+            "nodes": [
+                {"node_id": "root", "class": "Root", "bounds": [0, 0, 100, 100]},
+                {
+                    "node_id": "a",
+                    "text": "Alpha",
+                    "class": "Button",
+                    "clickable": True,
+                    "bounds": [5, 10, 45, 30],
+                },
+                {
+                    "node_id": "b",
+                    "text": "Beta",
+                    "class": "Button",
+                    "clickable": True,
+                    "bounds": [55, 10, 95, 30],
+                },
+                {
+                    "node_id": "label",
+                    "text": "Title",
+                    "class": "TextView",
+                    "bounds": [5, 40, 95, 60],
+                },
+            ],
+        }
+    )
+    target = graph_from_record(
+        {
+            "screen_id": "mixed-target",
+            "width": 120,
+            "height": 100,
+            "nodes": [
+                {"node_id": "root-t", "class": "Root", "bounds": [0, 0, 120, 100]},
+                {
+                    "node_id": "x",
+                    "text": "Alpha",
+                    "class": "Button",
+                    "clickable": True,
+                    "bounds": [10, 15, 50, 35],
+                },
+                {
+                    "node_id": "y",
+                    "text": "Beta",
+                    "class": "Button",
+                    "clickable": True,
+                    "bounds": [60, 15, 110, 35],
+                },
+                {
+                    "node_id": "label-t",
+                    "text": "Title",
+                    "class": "TextView",
+                    "bounds": [10, 45, 110, 65],
+                },
+            ],
+        }
+    )
+    config = MatcherConfig(hidden_dim=32, num_heads=4, num_layers=1, dropout=0.0)
+    cross_page_pair = make_correspondence_training_pair(
+        source,
+        target,
+        [("a", "x"), ("b", "y")],
+        matcher_config=config,
+    )
+
+    _, history = train_mapping_matcher(
+        [source, target],
+        [cross_page_pair],
+        epochs=1,
+        seed=29,
+        matcher_config=config,
+        augment_config=AugmentConfig(drop_node_prob=0.0, distractor_prob=0.0),
+    )
+
+    assert history == [
+        {
+            "epoch": 1.0,
+            "loss": history[0]["loss"],
+            "pairs": 3.0,
+            "self_supervised_pairs": 2.0,
+            "cross_page_pairs": 1.0,
+            "positive_labels": 12.0,
+        }
+    ]
 
 
 def test_local_context_graph_keeps_anchor_and_bounds_source_cost() -> None:
@@ -192,7 +431,12 @@ def test_correspondence_evaluation_reports_positive_null_and_warm_latency() -> N
         width=100,
         height=100,
         nodes=(
-            UINode(node_id="positive-a", origin_id="positive-a", bbox=(0, 0, 20, 20)),
+            UINode(
+                node_id="positive-a",
+                origin_id="positive-a",
+                bbox=(0, 0, 20, 20),
+                clickable=True,
+            ),
             UINode(node_id="null-a", origin_id="null-a", bbox=(60, 60, 80, 80)),
         ),
     )
@@ -201,7 +445,12 @@ def test_correspondence_evaluation_reports_positive_null_and_warm_latency() -> N
         width=100,
         height=100,
         nodes=(
-            UINode(node_id="positive-b", origin_id="positive-b", bbox=(0, 0, 20, 20)),
+            UINode(
+                node_id="positive-b",
+                origin_id="positive-b",
+                bbox=(0, 0, 20, 20),
+                clickable=True,
+            ),
             UINode(node_id="null-b", origin_id="null-b", bbox=(60, 60, 80, 80)),
         ),
     )
@@ -218,12 +467,10 @@ def test_correspondence_evaluation_reports_positive_null_and_warm_latency() -> N
         def forward(self, *inputs):
             source_count = inputs[0].shape[0]
             target_count = inputs[3].shape[0]
-            logits_ab = torch.full((source_count, target_count + 1), -10.0)
-            logits_ba = torch.full((target_count, source_count + 1), -10.0)
+            logits_ab = torch.full((source_count, target_count), -10.0)
+            logits_ba = torch.full((target_count, source_count), -10.0)
             logits_ab[0, 0] = 10.0
-            logits_ab[1, -1] = 10.0
             logits_ba[0, 0] = 10.0
-            logits_ba[1, -1] = 10.0
             return {"logits_ab": logits_ab, "logits_ba": logits_ba}
 
     metrics = evaluate_correspondence_pairs(
@@ -233,11 +480,13 @@ def test_correspondence_evaluation_reports_positive_null_and_warm_latency() -> N
     )
 
     assert metrics["positive_total"] == 2
-    assert metrics["null_total"] == 2
+    assert metrics["null_total"] == 0
     assert metrics["top1_accuracy"] == 1.0
     assert metrics["recall_at_k"] == {1: 1.0, 3: 1.0, 5: 1.0}
-    assert metrics["null_accuracy"] == 1.0
+    assert metrics["null_accuracy"] == 0.0
     assert metrics["warm_model_latency_ms"]["samples"] == 2
+    assert metrics["warm_input_latency_ms"]["samples"] == 2
+    assert metrics["warm_end_to_end_latency_ms"]["samples"] == 2
 
 
 def test_explicit_no_correspondence_pair_labels_every_node_as_null() -> None:
@@ -264,20 +513,45 @@ def test_explicit_no_correspondence_pair_labels_every_node_as_null() -> None:
     assert pair.target_indices == ()
 
 
+def test_explicit_correspondence_requires_actionable_nodes_on_both_pages() -> None:
+    source = UIGraph(
+        graph_id="source",
+        nodes=(UINode(node_id="text", origin_id="text", text="Continue"),),
+    )
+    target = UIGraph(
+        graph_id="target",
+        nodes=(
+            UINode(
+                node_id="button",
+                origin_id="button",
+                text="Continue",
+                clickable=True,
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="actionable-to-actionable"):
+        make_correspondence_training_pair(
+            source,
+            target,
+            (("text", "button"),),
+        )
+
+
 def test_partial_correspondence_evaluation_ignores_unannotated_nodes() -> None:
     torch = __import__("pytest").importorskip("torch")
     source = UIGraph(
         graph_id="partial-source",
         nodes=(
-            UINode(node_id="matched-a", origin_id="matched-a"),
-            UINode(node_id="unknown-a", origin_id="unknown-a"),
+            UINode(node_id="matched-a", origin_id="matched-a", clickable=True),
+            UINode(node_id="unknown-a", origin_id="unknown-a", clickable=True),
         ),
     )
     target = UIGraph(
         graph_id="partial-target",
         nodes=(
-            UINode(node_id="matched-b", origin_id="matched-b"),
-            UINode(node_id="unknown-b", origin_id="unknown-b"),
+            UINode(node_id="matched-b", origin_id="matched-b", clickable=True),
+            UINode(node_id="unknown-b", origin_id="unknown-b", clickable=True),
         ),
     )
     pair = make_correspondence_training_pair(
@@ -288,7 +562,7 @@ def test_partial_correspondence_evaluation_ignores_unannotated_nodes() -> None:
 
     class Matcher(torch.nn.Module):
         def forward(self, *inputs):
-            logits_ab = torch.tensor([[10.0, -10.0, -10.0], [-10.0, 10.0, -10.0]])
+            logits_ab = torch.tensor([[10.0, -10.0], [-10.0, 10.0]])
             logits_ba = logits_ab.clone()
             return {"logits_ab": logits_ab, "logits_ba": logits_ba}
 
