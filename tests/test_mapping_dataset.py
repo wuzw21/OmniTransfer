@@ -9,7 +9,10 @@ from omnitransfer.mapping_dataset import (
     adapt_gui_odyssey_human_reviews,
     adapt_gui_odyssey_rows,
     audit_ui_correspondence_pairs,
+    iter_split_ui_correspondence_pool,
+    plan_ui_correspondence_pool,
     validate_ui_correspondence_pair,
+    write_ui_correspondence_pool,
     write_ui_correspondence_dataset,
 )
 from omnitransfer.schema import Candidate, Query
@@ -597,3 +600,198 @@ def test_writer_streams_single_pass_records_and_cleans_leakage_parts(
             leaking,
         )
     assert not list(leaking.glob("*.part"))
+
+
+def test_unified_pool_is_split_within_app_without_page_leakage(
+    tmp_path: Path,
+) -> None:
+    def record(index: int, *, label_status: str = "gold") -> dict:
+        pair_id = f"same-app-pair-{index}"
+        return {
+            "schema_version": UI_CORRESPONDENCE_PAIR_SCHEMA,
+            "pair_id": pair_id,
+            "split": "diagnostic" if label_status == "unreviewed" else "train",
+            "label_status": label_status,
+            "source": {
+                "page_id": f"same-app-source-{index}",
+                "platform": "android",
+                "screenshot_path": "",
+                "graph": {
+                    "graph_id": f"same-app-source-{index}",
+                    "nodes": [{"node_id": "source", "origin_id": "source"}],
+                },
+            },
+            "target": {
+                "page_id": f"same-app-target-{index}",
+                "platform": "android",
+                "screenshot_path": "",
+                "graph": {
+                    "graph_id": f"same-app-target-{index}",
+                    "nodes": [{"node_id": "target", "origin_id": "target"}],
+                },
+            },
+            "matches": [
+                {
+                    "source_node_id": "source",
+                    "target_node_ids": ["target"],
+                    "label": "correspondence",
+                }
+            ],
+            "partition_keys": ["mobileviews:app:shared"],
+            "provenance": {
+                "dataset": "MobileViews_Apps_CompleteTraces",
+                "annotation": "automatic_same_view_str_proposal",
+                "trace": "shared.app.apk",
+            },
+            "slices": {"app": "shared.app"},
+        }
+
+    pool_path = tmp_path / "pool.jsonl"
+    pool_manifest = write_ui_correspondence_pool(
+        [record(index) for index in range(10)],
+        pool_path,
+    )
+    plan = plan_ui_correspondence_pool(
+        pool_path,
+        seed=17,
+        train_percent=80,
+        dev_percent=10,
+    )
+    split_records = list(iter_split_ui_correspondence_pool(pool_path, plan))
+
+    assert pool_manifest["records"] == 10
+    assert {row["slices"]["app"] for row in split_records} == {"shared.app"}
+    assert {plan.assignments[row["pair_id"]] for row in split_records} == {
+        "train",
+        "dev",
+        "test",
+    }
+    assert plan.audit["app_protocol"] == "within_app_page_component"
+    assert plan.audit["overlap"]["page_id"] == {}
+    assert plan.audit["apps_in_multiple_splits"] == ["shared.app"]
+    assert {
+        row["split"]
+        for row in split_records
+        if plan.assignments[row["pair_id"]] in {"dev", "test"}
+    } == {"dev", "test"}
+    audit_ui_correspondence_pairs(split_records)
+
+
+def test_mobileviews_pool_keeps_connected_pages_together_and_reserves_review(
+    tmp_path: Path,
+) -> None:
+    def record(index: int, source_page: str, target_page: str) -> dict:
+        return {
+            "schema_version": UI_CORRESPONDENCE_PAIR_SCHEMA,
+            "pair_id": f"proposal-{index}",
+            "split": "diagnostic",
+            "label_status": "unreviewed",
+            "source": {
+                "page_id": source_page,
+                "platform": "android",
+                "screenshot_path": "",
+                "graph": {
+                    "graph_id": source_page,
+                    "nodes": [{"node_id": "source", "origin_id": "source"}],
+                },
+            },
+            "target": {
+                "page_id": target_page,
+                "platform": "android",
+                "screenshot_path": "",
+                "graph": {
+                    "graph_id": target_page,
+                    "nodes": [{"node_id": "target", "origin_id": "target"}],
+                },
+            },
+            "matches": [
+                {
+                    "source_node_id": "source",
+                    "target_node_ids": ["target"],
+                    "label": "correspondence",
+                }
+            ],
+            "partition_keys": ["mobileviews:trace:shared.app"],
+            "provenance": {
+                "dataset": "MobileViews_Apps_CompleteTraces",
+                "annotation": "automatic_same_view_str_proposal",
+                "trace": "shared.app",
+            },
+            "slices": {},
+        }
+
+    pool_path = tmp_path / "pool.jsonl"
+    rows = [
+        record(0, "page-a", "page-b"),
+        record(1, "page-b", "page-c"),
+        *(
+            record(index, f"page-{index}-a", f"page-{index}-b")
+            for index in range(2, 10)
+        ),
+    ]
+    write_ui_correspondence_pool(rows, pool_path)
+    plan = plan_ui_correspondence_pool(pool_path)
+    split_records = list(iter_split_ui_correspondence_pool(pool_path, plan))
+
+    assert plan.assignments["proposal-0"] == plan.assignments["proposal-1"]
+    for row in split_records:
+        assigned = plan.assignments[row["pair_id"]]
+        if assigned == "train":
+            assert row["split"] == "train"
+            assert row["label_status"] == "self_supervised"
+        else:
+            assert row["split"] == "diagnostic"
+            assert row["label_status"] == "unreviewed"
+            assert row["provenance"]["reserved_split"] == assigned
+    audit_ui_correspondence_pairs(split_records)
+
+
+def test_within_app_pool_split_can_disable_dev(tmp_path: Path) -> None:
+    rows = []
+    for index in range(6):
+        rows.append(
+            {
+                "schema_version": UI_CORRESPONDENCE_PAIR_SCHEMA,
+                "pair_id": f"pair-{index}",
+                "split": "train",
+                "label_status": "gold",
+                "source": {
+                    "page_id": f"source-{index}",
+                    "platform": "android",
+                    "screenshot_path": "",
+                    "graph": {
+                        "graph_id": f"source-{index}",
+                        "nodes": [{"node_id": "source", "origin_id": "source"}],
+                    },
+                },
+                "target": {
+                    "page_id": f"target-{index}",
+                    "platform": "android",
+                    "screenshot_path": "",
+                    "graph": {
+                        "graph_id": f"target-{index}",
+                        "nodes": [{"node_id": "target", "origin_id": "target"}],
+                    },
+                },
+                "matches": [
+                    {
+                        "source_node_id": "source",
+                        "target_node_ids": ["target"],
+                        "label": "correspondence",
+                    }
+                ],
+                "partition_keys": ["app:shared"],
+                "provenance": {"dataset": "example"},
+                "slices": {"app": "shared"},
+            }
+        )
+    pool_path = tmp_path / "pool.jsonl"
+    write_ui_correspondence_pool(rows, pool_path)
+
+    plan = plan_ui_correspondence_pool(
+        pool_path,
+        train_percent=80,
+        dev_percent=0,
+    )
+
+    assert set(plan.assignments.values()) == {"train", "test"}

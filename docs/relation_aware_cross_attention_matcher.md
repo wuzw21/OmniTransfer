@@ -124,14 +124,24 @@ matching results report positive Top-1 and Recall@K.
 
 ## Data Boundary
 
-MobileViews is the unified training, validation, and primary test source.
-Canonical App identity is split before UI-correspondence construction, so train, dev,
-and test share no App, page, pair, or partition identity.
+All admissible action-target sources are first normalized into one
+`omnitransfer.ui_correspondence_pair.v1` pool. MobileViews is the primary data
+source; a second dataset may join the same pool only through this schema and the
+same action-target contract. Dataset identity never selects another encoder,
+loss, trainer, or inference path. GUIOdyssey is excluded.
 
-Self-supervised proposals may enter only the training split. Formal dev and
-test records require reviewed or original gold correspondences. Ambiguous
-one-to-many rows and conflicting target assignments are filtered from the
-current loss. ASE 2023 is retained only as an external cross-platform gold test.
+The pool is then split inside each App by page-connected components. The same
+App is intentionally represented in train, dev, and test whenever it has enough
+independent components, while exact pair, page, and component identities have
+zero overlap. This makes the primary question new-state and new-layout transfer
+inside known Apps. An App-disjoint partition is reported separately as a harder
+generalization slice.
+
+Self-supervised proposals may enter only the training split. A non-gold record
+assigned to dev or test remains a diagnostic review candidate until a human
+accepts it; formal dev and test contain reviewed or original gold only.
+Ambiguous one-to-many labels are represented as set-valued targets rather than
+forced into a false one-to-one mapping.
 
 ## Evaluation
 

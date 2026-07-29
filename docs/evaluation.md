@@ -1,6 +1,25 @@
 # Evaluation
 
-## Primary Dataset
+## Primary RCAM Dataset
+
+RCAM is built from one mixed `omnitransfer.ui_correspondence_pair.v1` pool.
+Dataset adapters run before splitting and never create dataset-specific model
+paths. The canonical splitter assigns page-connected components inside each
+App, so the same App may appear across train/dev/test while pair, page, and
+component overlap remains zero. Non-gold dev/test assignments are review
+candidates, not formal metrics.
+
+```bash
+PYTHONPATH=src python scripts/build_ui_correspondence_dataset.py \
+  --correspondence-pairs runtime/datasets/mobileviews/pairs.jsonl \
+  --output-dir runtime/datasets/unified_mapping
+```
+
+The primary result measures transfer to unseen pages, states, layouts, and
+devices inside known Apps. App-disjoint evaluation is reported separately as a
+harder generalization slice.
+
+## Legacy ASE Cross-Platform Baseline
 
 Use the public `RuihuaJi/vision-based-widget-mapping` dataset only after binding
 the public boxes to real XML nodes and converting the screen hierarchies to the

@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from collections import defaultdict
 from collections import Counter
+from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
@@ -27,6 +28,17 @@ _LEGACY_UI_CORRESPONDENCE_PAIR_SCHEMAS = frozenset(
 )
 _SPLITS = frozenset({"train", "dev", "test", "diagnostic"})
 _LABEL_STATUSES = frozenset({"gold", "weak", "self_supervised", "unreviewed"})
+
+
+@dataclass(frozen=True)
+class UICorrespondenceSplitPlan:
+    """Frozen within-App assignment for one canonical correspondence pool."""
+
+    assignments: dict[str, str]
+    component_ids: dict[str, str]
+    app_ids: dict[str, str]
+    audit: dict[str, Any]
+    pool_sha256: str
 
 
 def adapt_ase_queries(
@@ -273,6 +285,232 @@ def adapt_gui_odyssey_human_reviews(
         "label_status": "gold",
         "split": split,
     }
+
+
+def write_ui_correspondence_pool(
+    records: Iterable[dict[str, Any]],
+    output_path: str | Path,
+) -> dict[str, Any]:
+    """Freeze heterogeneous inputs as one canonical, unsplit JSONL pool."""
+
+    path = Path(output_path).expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".part")
+    pair_ids: set[str] = set()
+    record_count = 0
+    match_count = 0
+    dataset_counts: Counter[str] = Counter()
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            for raw_record in records:
+                record = validate_ui_correspondence_pair(raw_record)
+                pair_id = record["pair_id"]
+                if pair_id in pair_ids:
+                    raise ValueError(f"duplicate pair id in unified pool: {pair_id}")
+                pair_ids.add(pair_id)
+                handle.write(
+                    json.dumps(
+                        record,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
+                record_count += 1
+                match_count += len(record["matches"])
+                dataset_counts[
+                    str(record["provenance"].get("dataset") or "unknown")
+                ] += 1
+        if record_count == 0:
+            raise ValueError("UI correspondence pool is empty")
+        temporary.replace(path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    return {
+        "schema_version": "omnitransfer.ui_correspondence_pool_manifest.v1",
+        "record_schema": UI_CORRESPONDENCE_PAIR_SCHEMA,
+        "path": path.name,
+        "records": record_count,
+        "matches": match_count,
+        "bytes": path.stat().st_size,
+        "sha256": _sha256_file(path),
+        "dataset_counts": dict(sorted(dataset_counts.items())),
+        "split_semantics": "source_declaration_only_until_pool_split",
+    }
+
+
+def plan_ui_correspondence_pool(
+    pool_path: str | Path,
+    *,
+    seed: int = 17,
+    train_percent: int = 80,
+    dev_percent: int = 10,
+) -> UICorrespondenceSplitPlan:
+    """Plan a deterministic page-disjoint split inside each App."""
+
+    if train_percent <= 0 or dev_percent < 0 or train_percent + dev_percent >= 100:
+        raise ValueError("split percentages must leave non-empty train and test ranges")
+    path = Path(pool_path).expanduser().resolve()
+    union = _StringUnionFind()
+    pair_ids: set[str] = set()
+    page_keys_by_pair: dict[str, tuple[str, str]] = {}
+    app_ids: dict[str, str] = {}
+    dataset_counts: Counter[str] = Counter()
+    for record in _iter_ui_correspondence_pool(path):
+        pair_id = record["pair_id"]
+        if pair_id in pair_ids:
+            raise ValueError(f"duplicate pair id in unified pool: {pair_id}")
+        pair_ids.add(pair_id)
+        app_id = _correspondence_app_id(record)
+        source_page = f"{app_id}\0{record['source']['page_id']}"
+        target_page = f"{app_id}\0{record['target']['page_id']}"
+        union.join(source_page, target_page)
+        page_keys_by_pair[pair_id] = (source_page, target_page)
+        app_ids[pair_id] = app_id
+        dataset_counts[
+            str(record["provenance"].get("dataset") or "unknown")
+        ] += 1
+    if not pair_ids:
+        raise ValueError("UI correspondence pool is empty")
+
+    component_pairs: dict[tuple[str, str], list[str]] = defaultdict(list)
+    component_pages: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for pair_id, page_keys in page_keys_by_pair.items():
+        component_key = (app_ids[pair_id], union.root(page_keys[0]))
+        component_pairs[component_key].append(pair_id)
+        component_pages[component_key].update(page_keys)
+
+    components_by_app: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    component_ids: dict[str, str] = {}
+    for component_key, pair_ids in component_pairs.items():
+        app_id = component_key[0]
+        pages = sorted(component_pages[component_key])
+        component_id = hashlib.blake2b(
+            f"{app_id}\0{chr(0).join(pages)}".encode(),
+            digest_size=10,
+        ).hexdigest()
+        ordered_pair_ids = tuple(sorted(pair_ids))
+        components_by_app[app_id].append(
+            {
+                "component_id": component_id,
+                "pair_ids": ordered_pair_ids,
+                "pages": tuple(pages),
+                "size": len(ordered_pair_ids),
+            }
+        )
+        for pair_id in ordered_pair_ids:
+            component_ids[pair_id] = component_id
+
+    percentages = {
+        "train": train_percent,
+        "dev": dev_percent,
+        "test": 100 - train_percent - dev_percent,
+    }
+    assignments: dict[str, str] = {}
+    component_assignments: dict[str, str] = {}
+    app_split_counts: dict[str, dict[str, int]] = {}
+    for app_id, components in sorted(components_by_app.items()):
+        assigned = _assign_app_components(
+            components,
+            seed=seed,
+            percentages=percentages,
+        )
+        counts: Counter[str] = Counter()
+        for component in components:
+            component_id = component["component_id"]
+            split = assigned[component_id]
+            component_assignments[component_id] = split
+            for pair_id in component["pair_ids"]:
+                assignments[pair_id] = split
+                counts[split] += 1
+        app_split_counts[app_id] = {
+            split: counts[split] for split in ("train", "dev", "test")
+        }
+
+    page_splits: dict[str, set[str]] = defaultdict(set)
+    app_splits: dict[str, set[str]] = defaultdict(set)
+    split_counts: Counter[str] = Counter()
+    for pair_id, split in assignments.items():
+        split_counts[split] += 1
+        app_splits[app_ids[pair_id]].add(split)
+        for page_key in page_keys_by_pair[pair_id]:
+            page_splits[page_key].add(split)
+    page_overlap = _cross_split_values(page_splits)
+    if page_overlap:
+        raise AssertionError(f"page leakage in pool split: {_first_overlap(page_overlap)}")
+    apps_in_multiple_splits = sorted(
+        app_id for app_id, splits in app_splits.items() if len(splits) > 1
+    )
+    audit = {
+        "schema_version": "omnitransfer.ui_correspondence_pool_split.v1",
+        "seed": seed,
+        "requested_percentages": percentages,
+        "app_protocol": "within_app_page_component",
+        "dataset_protocol": "one_mixed_pool",
+        "records": len(assignments),
+        "components": len(component_assignments),
+        "apps": len(app_splits),
+        "split_counts": dict(sorted(split_counts.items())),
+        "dataset_counts": dict(sorted(dataset_counts.items())),
+        "apps_in_multiple_splits": apps_in_multiple_splits,
+        "apps_in_multiple_splits_count": len(apps_in_multiple_splits),
+        "app_split_counts": app_split_counts,
+        "overlap": {
+            "pair_id": {},
+            "page_id": {},
+            "component_id": {},
+        },
+    }
+    return UICorrespondenceSplitPlan(
+        assignments=assignments,
+        component_ids=component_ids,
+        app_ids=app_ids,
+        audit=audit,
+        pool_sha256=_sha256_file(path),
+    )
+
+
+def iter_split_ui_correspondence_pool(
+    pool_path: str | Path,
+    plan: UICorrespondenceSplitPlan,
+) -> Iterable[dict[str, Any]]:
+    """Apply a frozen pool plan and emit canonical train/review/test records."""
+
+    path = Path(pool_path).expanduser().resolve()
+    if _sha256_file(path) != plan.pool_sha256:
+        raise ValueError("unified correspondence pool changed after split planning")
+    seen: set[str] = set()
+    for source_record in _iter_ui_correspondence_pool(path):
+        record = deepcopy(source_record)
+        pair_id = record["pair_id"]
+        if pair_id not in plan.assignments:
+            raise ValueError(f"pair is absent from split plan: {pair_id}")
+        assigned_split = plan.assignments[pair_id]
+        provenance = record["provenance"]
+        provenance["source_split"] = record["split"]
+        provenance["source_label_status"] = record["label_status"]
+        provenance.pop("reserved_split", None)
+        provenance["split_protocol"] = "within_app_page_component_v1"
+        record["partition_keys"] = [
+            f"pool:component:{plan.component_ids[pair_id]}"
+        ]
+        record["slices"]["app"] = plan.app_ids[pair_id]
+        if assigned_split == "train":
+            record["split"] = "train"
+            if _is_mobileviews_self_supervised_proposal(record):
+                record["label_status"] = "self_supervised"
+        elif record["label_status"] == "gold":
+            record["split"] = assigned_split
+        else:
+            record["split"] = "diagnostic"
+            record["label_status"] = "unreviewed"
+            provenance["reserved_split"] = assigned_split
+        seen.add(pair_id)
+        yield validate_ui_correspondence_pair(record)
+    missing = sorted(set(plan.assignments) - seen)
+    if missing:
+        raise ValueError(f"split plan contains pairs absent from pool: {missing[:3]}")
 
 
 def audit_ui_correspondence_pairs(records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -924,6 +1162,155 @@ def _review_page_id(endpoint: dict[str, Any], episode_id: str, *, side: str) -> 
         asset = str(endpoint.get("image_url") or endpoint.get("screenshot") or side)
         suffix = f"asset:{asset}"
     return f"guiodyssey:{episode_id}:{suffix}"
+
+
+def _iter_ui_correspondence_pool(path: Path) -> Iterable[dict[str, Any]]:
+    rows = 0
+    with path.open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                record = validate_ui_correspondence_pair(json.loads(line))
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"invalid unified correspondence pool {path}:{line_number}: {exc}"
+                ) from exc
+            rows += 1
+            yield record
+    if rows == 0:
+        raise ValueError(f"UI correspondence pool is empty: {path}")
+
+
+def _correspondence_app_id(record: dict[str, Any]) -> str:
+    slices = record["slices"]
+    provenance = record["provenance"]
+    for values in (slices, provenance):
+        for key in (
+            "app",
+            "app_id",
+            "package",
+            "package_name",
+            "app_package",
+            "domain",
+            "website",
+        ):
+            normalized = str(values.get(key) or "").strip()
+            if normalized:
+                return _normalize_app_id(normalized)
+    trace = str(provenance.get("trace") or "").strip()
+    if trace:
+        return _normalize_app_id(trace)
+    dataset = str(provenance.get("dataset") or "unknown").strip()
+    return f"{dataset}:unscoped"
+
+
+def _normalize_app_id(value: str) -> str:
+    normalized = value.strip()
+    if normalized.lower().endswith(".apk"):
+        normalized = normalized[:-4]
+    return normalized
+
+
+def _assign_app_components(
+    components: list[dict[str, Any]],
+    *,
+    seed: int,
+    percentages: dict[str, int],
+) -> dict[str, str]:
+    if not components:
+        return {}
+    stable = sorted(
+        components,
+        key=lambda component: (
+            int(component["size"]),
+            _stable_bucket(seed, str(component["component_id"])),
+            str(component["component_id"]),
+        ),
+    )
+    assignments: dict[str, str] = {}
+    counts: Counter[str] = Counter()
+    remaining = list(stable)
+
+    reserve = ["test"]
+    if percentages["dev"] > 0:
+        reserve.append("dev")
+    for split in reserve:
+        if len(remaining) <= 1:
+            break
+        component = remaining.pop(0)
+        component_id = str(component["component_id"])
+        assignments[component_id] = split
+        counts[split] += int(component["size"])
+
+    total = sum(int(component["size"]) for component in components)
+    targets = {
+        split: total * percentage / 100.0
+        for split, percentage in percentages.items()
+    }
+    enabled_splits = tuple(
+        split for split in ("train", "dev", "test") if percentages[split] > 0
+    )
+    for component in sorted(
+        remaining,
+        key=lambda item: (
+            -int(item["size"]),
+            _stable_bucket(seed, str(item["component_id"])),
+            str(item["component_id"]),
+        ),
+    ):
+        split = max(
+            enabled_splits,
+            key=lambda name: (
+                targets[name] - counts[name],
+                percentages[name],
+                name == "train",
+            ),
+        )
+        component_id = str(component["component_id"])
+        assignments[component_id] = split
+        counts[split] += int(component["size"])
+    return assignments
+
+
+def _stable_bucket(seed: int, value: str) -> int:
+    digest = hashlib.blake2b(f"{seed}:{value}".encode(), digest_size=8).digest()
+    return int.from_bytes(digest, "big")
+
+
+def _is_mobileviews_self_supervised_proposal(record: dict[str, Any]) -> bool:
+    if record["label_status"] != "unreviewed":
+        return False
+    provenance = record["provenance"]
+    dataset = str(provenance.get("dataset") or "").lower()
+    annotation = str(provenance.get("annotation") or "").lower()
+    return "mobileviews" in dataset and annotation.startswith("automatic_")
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+class _StringUnionFind:
+    def __init__(self) -> None:
+        self.parents: dict[str, str] = {}
+
+    def root(self, value: str) -> str:
+        self.parents.setdefault(value, value)
+        parent = self.parents[value]
+        if parent != value:
+            self.parents[value] = self.root(parent)
+        return self.parents[value]
+
+    def join(self, left: str, right: str) -> None:
+        left_root = self.root(left)
+        right_root = self.root(right)
+        if left_root != right_root:
+            self.parents[right_root] = left_root
 
 
 def _cross_split_values(values: dict[str, set[str]]) -> dict[str, list[str]]:

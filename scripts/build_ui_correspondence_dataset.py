@@ -12,7 +12,10 @@ from omnitransfer.experiment_logging import file_sha256
 from omnitransfer.importers import load_queries
 from omnitransfer.mapping_dataset import (
     adapt_ase_queries,
+    iter_split_ui_correspondence_pool,
+    plan_ui_correspondence_pool,
     validate_ui_correspondence_pair,
+    write_ui_correspondence_pool,
     write_ui_correspondence_dataset,
 )
 
@@ -34,6 +37,14 @@ def main() -> None:
         ),
     )
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--split-seed", type=int, default=17)
+    parser.add_argument("--train-percent", type=int, default=80)
+    parser.add_argument("--dev-percent", type=int, default=10)
+    parser.add_argument(
+        "--preserve-declared-splits",
+        action="store_true",
+        help="Compatibility mode; skip the canonical within-App pool split.",
+    )
     args = parser.parse_args()
 
     inputs: list[dict[str, Any]] = []
@@ -81,21 +92,57 @@ def main() -> None:
                 correspondence_adapter["records"] += 1
                 yield row
 
-    manifest = write_ui_correspondence_dataset(
-        records(),
-        args.output_dir,
-        metadata={
-            "inputs": inputs,
-            "protocol": {
-                "record_schema_identical_across_datasets_and_splits": True,
-                "one_training_entrypoint": "scripts/train_relation_aware_matcher.py",
-                "train_dev_test_differ_only_by_split_and_label_status": True,
-                "guiodyssey_included": False,
-                "stable_ids_are_offline_labels_only": True,
+    protocol = {
+        "record_schema_identical_across_datasets_and_splits": True,
+        "one_training_entrypoint": "scripts/train_relation_aware_matcher.py",
+        "train_dev_test_differ_only_by_split_and_label_status": True,
+        "guiodyssey_included": False,
+        "stable_ids_are_offline_labels_only": True,
+        "dataset_sources_share_one_pool_and_one_splitter": True,
+    }
+    output_dir = args.output_dir.expanduser().resolve()
+    if args.preserve_declared_splits:
+        protocol["split_protocol"] = "preserve_source_declarations"
+        manifest = write_ui_correspondence_dataset(
+            records(),
+            output_dir,
+            metadata={
+                "inputs": inputs,
+                "protocol": protocol,
+                "adapters": adapters,
             },
-            "adapters": adapters,
-        },
-    )
+        )
+    else:
+        pool = write_ui_correspondence_pool(records(), output_dir / "pool.jsonl")
+        split_plan = plan_ui_correspondence_pool(
+            output_dir / "pool.jsonl",
+            seed=args.split_seed,
+            train_percent=args.train_percent,
+            dev_percent=args.dev_percent,
+        )
+        protocol.update(
+            {
+                "split_protocol": "within_app_page_component_v1",
+                "same_app_may_span_train_dev_test": True,
+                "pair_page_component_overlap": "forbidden",
+                "app_disjoint_primary_test": False,
+                "app_disjoint_evaluation": "optional_generalization_slice",
+            }
+        )
+        manifest = write_ui_correspondence_dataset(
+            iter_split_ui_correspondence_pool(
+                output_dir / "pool.jsonl",
+                split_plan,
+            ),
+            output_dir,
+            metadata={
+                "inputs": inputs,
+                "protocol": protocol,
+                "pool": pool,
+                "split": split_plan.audit,
+                "adapters": adapters,
+            },
+        )
     print(json.dumps(manifest, ensure_ascii=False))
 
 

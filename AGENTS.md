@@ -21,19 +21,23 @@ image pixels. If the canonical shell is missing or broken, restore it before
 producing review output. Do not work around its absence by creating another
 viewer.
 
-# MobileViews Matching Dataset Long-Term Rule
+# Unified Matching Dataset Long-Term Rule
 
-The learned widget matcher uses MobileViews as its unified training,
-validation, and primary test data source. Do not add GUIOdyssey examples to
-these matcher splits.
+Normalize MobileViews and every admissible action-target correspondence source
+into one `omnitransfer.ui_correspondence_pair.v1` pool before assigning splits.
+Dataset origin never creates another trainer, objective, or model path.
+GUIOdyssey remains outside these matcher splits.
 
-Split MobileViews by canonical App identity before constructing page pairs;
-train, dev, and test must have no App, page, pair, or partition overlap.
-`view_str`, `origin_id`, `state_str`, and `structure_str` may be used only by
-offline self-supervised label construction and must never enter matcher model
-inputs. Self-supervised proposals may enter only the training split. Formal
-dev and test records require reviewed or original gold labels, and unmatched
-nodes remain ignored unless a human explicitly labels NULL.
+Split inside each canonical App by page-connected components. The same App
+should appear in train, dev, and test when it has enough independent
+components; exact pair, page, and component identities must never cross
+splits. App-disjoint evaluation is an additional generalization slice, not the
+primary split. `view_str`, `origin_id`, `state_str`, and `structure_str` may be
+used only by offline self-supervised label construction and must never enter
+matcher model inputs. Self-supervised proposals may enter only the training
+split. Non-gold dev/test assignments remain review candidates; formal dev and
+test records require reviewed or original gold labels. Unmatched nodes remain
+ignored unless a human explicitly labels NULL.
 
 # Shortcut-Free Actionable Matching Long-Term Rule
 

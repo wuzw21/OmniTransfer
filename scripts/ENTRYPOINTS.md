@@ -13,15 +13,9 @@ The standalone repo keeps canonical data, training, and evaluation entrypoints.
     relative-coordinate XML per screen, remove public/XML duplicate candidates,
     and freeze app-disjoint train/dev/test rows with a strict contamination audit.
 - `PYTHONPATH=src python scripts/import_mobileviews.py --input ... --output ...`
-  - Stream official `image_content/json_content` parquet rows into lossless 384px images and package-disjoint UIGraph JSONL files.
-- `PYTHONPATH=src python scripts/freeze_mobileviews_app_split.py --traces-root ... --frozen-test-apps ... --output-dir ...`
-  - Index all extracted complete-trace batches, reject duplicate App identities,
-    scan strict pair capacity, and freeze App-disjoint train/dev-candidate/test
-    allowlists without GUIOdyssey data.
-- `PYTHONPATH=src python scripts/build_mobileviews_allowlist_pair_pool.py --traces-root ... --app-allowlist ... --output-dir ...`
-  - Build self-supervised MobileViews training pairs or an unreviewed
-    diagnostic pool from a frozen App allowlist; offline identity fields remain
-    label-only.
+  - Stream official `image_content/json_content` parquet rows into lossless
+    384px images and immutable UIGraph ingestion shards. Importer partitions
+    are not canonical matcher splits.
 - `PYTHONPATH=src python scripts/import_openmobile.py --input ... --output ...`
   - Import Uni-GUI-OpenMobile trajectories with per-screen UI elements into deduplicated, package-disjoint UIGraph JSONL files.
 - `PYTHONPATH=src python scripts/download_hf_lfs_files.py --repository ... --path ...`
@@ -43,7 +37,11 @@ The standalone repo keeps canonical data, training, and evaluation entrypoints.
 - `PYTHONPATH=src python scripts/import_webui.py --input ... --output ... --source-revision ... --split train`
   - Import WebUI screenshots and visible semantic element boxes into the same Unified UIGraph matcher path.
 - `PYTHONPATH=src python scripts/build_ui_correspondence_dataset.py --ase-queries ... --correspondence-pairs ... --output-dir ...`
-  - Convert ASE queries and validate MobileViews correspondences into the single `omnitransfer.ui_correspondence_pair.v1` schema used unchanged by train/dev/test.
+  - Normalize every admitted source into one
+    `omnitransfer.ui_correspondence_pair.v1` pool, then split inside each App by
+    page-connected components. Dataset origin does not create separate training
+    logic; pair/page/component overlap is forbidden, while App overlap is
+    intentional.
 - `PYTHONPATH=src python scripts/build_ui_correspondence_review.py --input ... --output-dir ...`
   - Render UI correspondence records through the canonical review workbench.
 - `PYTHONPATH=src python scripts/train_relation_aware_matcher.py --input train.jsonl --validation-input dev.jsonl --output ...`

@@ -254,7 +254,7 @@ candidates are strictly actionable-node to actionable-node.
 Materialize an official MobileViews parquet shard once. The importer reads only
 `image_content/json_content`, pre-resizes screenshots losslessly to the same
 384px visual canvas used at runtime, recovers the package from DroidBot
-metadata, and writes immutable package-disjoint train/dev/test graph files:
+metadata, and writes immutable ingestion shards with package metadata:
 
 ```bash
 PYTHONPATH=src python scripts/import_mobileviews.py \
@@ -265,25 +265,36 @@ PYTHONPATH=src python scripts/import_mobileviews.py \
   --seed 17
 ```
 
-Raw graph files are data-source artifacts, not a second training format. Build
-MobileViews UI correspondence pairs first; same-page augmentation is then generated inside
-the one RCAM trainer:
+Raw graph files and any importer-level partitions are data-source artifacts,
+not benchmark splits and not a second training format. First normalize all
+admitted correspondence sources into one pool, then run the one within-App
+page-component splitter:
 
 ```bash
-PYTHONPATH=src python scripts/build_mobileviews_allowlist_pair_pool.py \
-  --traces-root runtime/datasets/mobileviews/traces \
-  --app-allowlist runtime/datasets/mobileviews/train_apps.json \
-  --output-dir runtime/datasets/mobileviews/page_pairs_train
+PYTHONPATH=src python scripts/build_ui_correspondence_dataset.py \
+  --correspondence-pairs \
+    runtime/datasets/mobileviews/pairs.jsonl \
+    runtime/datasets/other_action_target_pairs.jsonl \
+  --output-dir runtime/datasets/unified_mapping \
+  --split-seed 17 \
+  --train-percent 80 \
+  --dev-percent 10
 ```
 
-Aligned MobileViews/Mind2Web correspondence pairs can update the same model without a
-second scoring path. Automatic diagnostic labels require explicit opt-in and
-only globally one-to-one rows enter the cross-page loss:
+The output contains the frozen `pool.jsonl` plus train/dev/test/diagnostic
+views in the same schema. The same App intentionally spans splits when it has
+enough page-disjoint components; exact pair, page, and component identities
+never overlap. Non-gold dev/test assignments stay diagnostic review candidates.
+App-disjoint evaluation is a secondary generalization slice.
+
+Aligned MobileViews/Mind2Web correspondence pairs update the same model without
+a second scoring path. MobileViews automatic labels assigned to train are
+recorded as self-supervised:
 
 ```bash
 PYTHONPATH=src python scripts/train_relation_aware_matcher.py \
-  --input runtime/datasets/mobileviews/diagnostic.jsonl \
-  --allow-unreviewed-pseudo \
+  --input runtime/datasets/unified_mapping/train.jsonl \
+  --validation-input runtime/datasets/unified_mapping/dev.jsonl \
   --device cuda \
   --output runtime/models/mapping_self_supervised.pt
 ```
