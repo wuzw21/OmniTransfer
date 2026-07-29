@@ -1,16 +1,9 @@
 import json
 
-import pytest
-
 from omnitransfer.mobileviews import (
     attach_mobileviews_image,
     graph_from_mobileviews_record,
     split_name_for_group,
-)
-from omnitransfer.ui_graph import UIGraph, UINode, graph_to_record
-from scripts.pretrain_ui_graph_matcher import (
-    _load_usable_graphs,
-    assert_graph_splits_disjoint,
 )
 
 
@@ -131,48 +124,3 @@ def test_mobileviews_image_geometry_and_package_split_are_explicit() -> None:
         "com.example",
         seed=17,
     )
-
-
-def test_frozen_pretrain_files_reject_package_leakage() -> None:
-    def graph(graph_id: str, package: str) -> UIGraph:
-        return UIGraph(
-            graph_id=graph_id,
-            nodes=(UINode(node_id="0", origin_id="0"),),
-            metadata={"package": package},
-        )
-
-    assert_graph_splits_disjoint(
-        {
-            "train": [graph("train", "com.train")],
-            "dev": [graph("dev", "com.dev")],
-            "test": [graph("test", "com.test")],
-        }
-    )
-    with pytest.raises(ValueError, match="leakage"):
-        assert_graph_splits_disjoint(
-            {
-                "train": [graph("train", "com.shared")],
-                "dev": [graph("dev", "com.shared")],
-                "test": [],
-            }
-        )
-
-
-def test_pretraining_loader_combines_multiple_graph_streams(tmp_path) -> None:
-    paths = []
-    for stream in ("mobile", "web"):
-        graph = UIGraph(
-            graph_id=stream,
-            nodes=tuple(
-                UINode(node_id=f"{stream}:{index}", origin_id=str(index))
-                for index in range(4)
-            ),
-            metadata={"dataset": stream},
-        )
-        path = tmp_path / f"{stream}.jsonl"
-        path.write_text(json.dumps(graph_to_record(graph)) + "\n", encoding="utf-8")
-        paths.append(str(path))
-
-    graphs = _load_usable_graphs(paths, split="train", limit=0)
-
-    assert [graph.graph_id for graph in graphs] == ["mobile", "web"]

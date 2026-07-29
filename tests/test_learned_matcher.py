@@ -12,6 +12,7 @@ from omnitransfer.learned_matcher import (
     cross_relation_features,
     encode_graph,
     matcher_inputs,
+    mutual_log_assignment,
     parameter_count,
     save_matcher_checkpoint,
 )
@@ -158,6 +159,81 @@ def test_relation_matcher_forward_and_partial_assignment_loss() -> None:
     assert any(
         isinstance(module, torch.nn.MultiheadAttention) for module in model.modules()
     )
+
+
+def test_mutual_log_assignment_normalizes_both_matching_directions() -> None:
+    torch = pytest.importorskip("torch")
+    affinity = torch.tensor(
+        [[4.0, 1.0, -1.0], [2.0, 3.0, 0.0]],
+        requires_grad=True,
+    )
+
+    scores = mutual_log_assignment(affinity)
+    expected = 0.5 * (
+        torch.log_softmax(affinity, dim=1)
+        + torch.log_softmax(affinity, dim=0)
+    )
+
+    assert torch.allclose(scores, expected)
+    scores.sum().backward()
+    assert affinity.grad is not None
+    assert torch.isfinite(affinity.grad).all()
+
+
+def test_mutual_projection_reports_one_assignment_per_attention_layer() -> None:
+    torch = pytest.importorskip("torch")
+    config = MatcherConfig(
+        hidden_dim=32,
+        num_heads=4,
+        num_layers=2,
+        dropout=0.0,
+        assignment_head="mutual_projection",
+    )
+    source = _graph("source")
+    target = _graph("target")
+    model = build_relation_aware_matcher(config)
+
+    output = model(*matcher_inputs(source, target, config=config))
+
+    assert len(output["assignment_scores_by_layer"]) == 2
+    assert len(output["affinities_by_layer"]) == 2
+    assert torch.equal(
+        output["logits_ab"],
+        output["assignment_scores_by_layer"][-1],
+    )
+    assert torch.equal(output["logits_ba"], output["logits_ab"].T)
+    assert torch.equal(output["affinity"], output["affinities_by_layer"][-1])
+
+
+def test_context_forced_input_keeps_class_action_and_relations(tmp_path) -> None:
+    torch = pytest.importorskip("torch")
+    image_module = pytest.importorskip("PIL.Image")
+    screenshot = tmp_path / "screen.png"
+    image_module.new("RGB", (100, 100), color=(120, 80, 40)).save(screenshot)
+    base = _graph("masked-source")
+    source = UIGraph(
+        **{
+            **base.__dict__,
+            "metadata": {"screenshot_path": str(screenshot)},
+        }
+    )
+    target = _graph("target")
+    plain = matcher_inputs(source, target)
+
+    masked = matcher_inputs(
+        source,
+        target,
+        source_context_mask_indices=(1,),
+    )
+
+    assert not torch.equal(masked[0][1], plain[0][1])
+    assert torch.equal(masked[0][2], plain[0][2])
+    assert torch.count_nonzero(masked[0][1]) > 0
+    assert torch.equal(masked[1], plain[1])
+    assert torch.equal(masked[2], plain[2])
+    assert masked[8][1].item() == 0.0
+    assert plain[8][1].item() == 1.0
+    assert torch.equal(masked[3], plain[3])
 
 
 def test_inference_adapter_rejects_low_pair_confidence() -> None:

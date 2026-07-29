@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a reproducible learned-matcher diagnostic grid and collect reports."""
+"""Run page-pair matcher ablations through the one canonical trainer."""
 
 from __future__ import annotations
 
@@ -12,52 +12,25 @@ import sys
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input", type=Path, required=True)
-    parser.add_argument("--pretrained", type=Path)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input", type=Path, nargs="+", required=True)
+    parser.add_argument("--validation-input", type=Path, nargs="+", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seeds", type=int, nargs="+", default=[17, 29, 41])
-    parser.add_argument("--split-seed", type=int, default=17)
-    parser.add_argument("--eval-split", choices=("dev", "test"), default="dev")
     parser.add_argument("--source-context-nodes", type=int, nargs="+", default=[32, 48])
     parser.add_argument("--num-layers", type=int, nargs="+", default=[1, 2])
-    parser.add_argument("--hidden-dim", type=int, default=96)
+    parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--latency-images", type=int, default=20)
-    parser.add_argument("--limit-train", type=int, default=0)
-    parser.add_argument("--limit-eval", type=int, default=0)
+    parser.add_argument("--context-mask-probability", type=float, default=0.35)
+    parser.add_argument("--max-pairs", type=int, default=0)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
-    if args.pretrained:
-        from omnitransfer.learned_matcher import LearnedGraphMatcher
-
-        pretrained = LearnedGraphMatcher.from_checkpoint(args.pretrained, device="cpu")
-        expected = {
-            "hidden_dim": args.hidden_dim,
-            "num_heads": args.num_heads,
-        }
-        for name, value in expected.items():
-            actual = getattr(pretrained.config, name)
-            if value != actual:
-                raise SystemExit(
-                    f"--pretrained uses {name}={actual}, but the grid requested {value}."
-                )
-        if set(args.source_context_nodes) != {pretrained.config.source_context_nodes}:
-            raise SystemExit(
-                "--pretrained requires --source-context-nodes "
-                f"{pretrained.config.source_context_nodes}."
-            )
-        if set(args.num_layers) != {pretrained.config.num_layers}:
-            raise SystemExit(
-                f"--pretrained requires --num-layers {pretrained.config.num_layers}."
-            )
-
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    train_script = Path(__file__).with_name("train_learned_matcher.py")
+    trainer = Path(__file__).with_name("train_mapping_page_pairs.py")
     runs: list[dict[str, object]] = []
     for seed in args.seeds:
         for context_nodes in args.source_context_nodes:
@@ -70,9 +43,11 @@ def main() -> None:
                 run_dir.mkdir(parents=True, exist_ok=True)
                 command = [
                     sys.executable,
-                    str(train_script),
+                    str(trainer),
                     "--input",
-                    str(args.input.resolve()),
+                    *(str(path.resolve()) for path in args.input),
+                    "--validation-input",
+                    *(str(path.resolve()) for path in args.validation_input),
                     "--output",
                     str(model_path),
                     "--report",
@@ -81,10 +56,6 @@ def main() -> None:
                     str(args.epochs),
                     "--seed",
                     str(seed),
-                    "--split-seed",
-                    str(args.split_seed),
-                    "--eval-split",
-                    args.eval_split,
                     "--hidden-dim",
                     str(args.hidden_dim),
                     "--num-heads",
@@ -93,17 +64,15 @@ def main() -> None:
                     str(num_layers),
                     "--source-context-nodes",
                     str(context_nodes),
+                    "--assignment-head",
+                    "mutual_projection",
+                    "--context-mask-probability",
+                    str(args.context_mask_probability),
                     "--device",
                     args.device,
-                    "--latency-images",
-                    str(args.latency_images),
                 ]
-                if args.pretrained:
-                    command.extend(("--pretrained", str(args.pretrained.resolve())))
-                if args.limit_train:
-                    command.extend(("--limit-train", str(args.limit_train)))
-                if args.limit_eval:
-                    command.extend(("--limit-eval", str(args.limit_eval)))
+                if args.max_pairs:
+                    command.extend(("--max-pairs", str(args.max_pairs)))
                 if args.force or not report_path.is_file():
                     with log_path.open("w", encoding="utf-8") as log:
                         subprocess.run(
@@ -114,8 +83,8 @@ def main() -> None:
                             env=os.environ.copy(),
                         )
                 report = json.loads(report_path.read_text(encoding="utf-8"))
-                metrics = report["metrics"]["all"]
-                latency = report["new_image_latency"]
+                metrics = report["evaluation"]["metrics"]
+                latency = metrics["warm_end_to_end_latency_ms"]
                 runs.append(
                     {
                         "run_id": run_id,
@@ -123,29 +92,27 @@ def main() -> None:
                         "source_context_nodes": context_nodes,
                         "num_layers": num_layers,
                         "epochs": args.epochs,
-                        "pretrained": report["pretrained"],
                         "top1_accuracy": metrics["top1_accuracy"],
                         "recall_at_5": metrics["recall_at_k"]["5"],
-                        "wrong_target_rate": metrics["wrong_target_rate"],
-                        "max_latency_ms": latency["max_latency_ms"],
-                        "latency_budget_met": latency["budget_met"],
-                        "final_loss": report["history"][-1]["loss"],
+                        "p95_end_to_end_ms": latency["p95"],
+                        "max_end_to_end_ms": latency["max"],
+                        "under_50ms_rate": latency["under_50ms_rate"],
+                        "final_loss": report["training"]["history"][-1]["loss"],
                         "report": str(report_path),
                         "model": str(model_path),
                     }
                 )
                 summary = {
-                    "schema_version": "omnitransfer_diagnostic_grid_v1",
-                    "input": str(args.input.resolve()),
-                    "pretrained": (
-                        str(args.pretrained.resolve()) if args.pretrained else None
-                    ),
-                    "split_seed": args.split_seed,
-                    "eval_split": args.eval_split,
+                    "schema_version": "omnitransfer.page_pair_grid.v2",
+                    "record_schema": "omnitransfer.mapping_page_pair.v1",
+                    "inputs": [str(path.resolve()) for path in args.input],
+                    "validation_inputs": [
+                        str(path.resolve()) for path in args.validation_input
+                    ],
                     "runs": runs,
                 }
                 (output_dir / "grid_summary.json").write_text(
-                    json.dumps(summary, ensure_ascii=False, indent=2),
+                    json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
                     encoding="utf-8",
                 )
                 print(json.dumps(runs[-1], ensure_ascii=False), flush=True)

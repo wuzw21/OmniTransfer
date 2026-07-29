@@ -10,7 +10,6 @@ from omnitransfer.self_supervised import (
     make_training_pair,
     matching_loss,
     train_mapping_matcher,
-    train_self_supervised_matcher,
 )
 from omnitransfer.learned_matcher import MatcherConfig, RELATION_FEATURE_DIM
 from omnitransfer.ui_graph import (
@@ -265,7 +264,88 @@ def test_matching_loss_ranks_only_actionable_target_candidates() -> None:
     assert float(loss) < 0.01
 
 
-def test_self_supervised_seed_controls_model_initialization() -> None:
+def test_matching_loss_supervises_every_assignment_layer() -> None:
+    torch = __import__("pytest").importorskip("torch")
+    source = UIGraph(
+        graph_id="source",
+        nodes=(
+            UINode(node_id="source-action", origin_id="source-action", clickable=True),
+            UINode(
+                node_id="source-hard-negative",
+                origin_id="source-hard-negative",
+                clickable=True,
+            ),
+        ),
+    )
+    target = UIGraph(
+        graph_id="target",
+        nodes=(
+            UINode(node_id="target-action", origin_id="target-action", clickable=True),
+            UINode(
+                node_id="target-hard-negative",
+                origin_id="target-hard-negative",
+                clickable=True,
+            ),
+        ),
+    )
+    pair = make_correspondence_training_pair(
+        source,
+        target,
+        (("source-action", "target-action"),),
+    )
+
+    class LayerwiseMatcher(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.first = torch.nn.Parameter(torch.zeros((2, 2)))
+            self.final = torch.nn.Parameter(torch.zeros((2, 2)))
+
+        def forward(self, *inputs):
+            return {
+                "logits_ab": self.final,
+                "logits_ba": self.final.T,
+                "affinity": self.final,
+                "assignment_scores_by_layer": (self.first, self.final),
+            }
+
+    model = LayerwiseMatcher()
+    loss = matching_loss(model, pair, cycle_weight=0.0)
+    loss.backward()
+
+    assert model.first.grad is not None
+    assert model.final.grad is not None
+    assert torch.count_nonzero(model.first.grad) > 0
+    assert torch.count_nonzero(model.final.grad) > 0
+
+
+def test_correspondence_pair_preserves_set_valued_positive_nodes() -> None:
+    source = UIGraph(
+        graph_id="source",
+        nodes=(
+            UINode(node_id="s0", origin_id="s0", clickable=True),
+            UINode(node_id="s1", origin_id="s1", clickable=True),
+        ),
+    )
+    target = UIGraph(
+        graph_id="target",
+        nodes=(
+            UINode(node_id="t0", origin_id="t0", clickable=True),
+            UINode(node_id="t1", origin_id="t1", clickable=True),
+        ),
+    )
+
+    pair = make_correspondence_training_pair(
+        source,
+        target,
+        (("s0", "t0"), ("s0", "t1"), ("s1", "t1")),
+    )
+
+    assert pair.positive_targets_a_to_b == ((0, 1), (1,))
+    assert pair.positive_targets_b_to_a == ((0,), (0, 1))
+    assert pair.origin_ids == ("s0->t0", "s0->t1", "s1->t1")
+
+
+def test_unified_mapping_seed_controls_model_initialization() -> None:
     torch = __import__("pytest").importorskip("torch")
     graph = graph_from_record(
         {
@@ -287,15 +367,23 @@ def test_self_supervised_seed_controls_model_initialization() -> None:
     )
     config = MatcherConfig(hidden_dim=32, num_heads=4, num_layers=1, dropout=0.0)
     augment = AugmentConfig(drop_node_prob=0.0, distractor_prob=0.0)
+    pair = make_correspondence_training_pair(
+        graph,
+        graph,
+        (("action", "action"),),
+        matcher_config=config,
+    )
 
-    model_a, history_a = train_self_supervised_matcher(
+    model_a, history_a = train_mapping_matcher(
         [graph],
+        [pair],
         seed=23,
         matcher_config=config,
         augment_config=augment,
     )
-    model_b, history_b = train_self_supervised_matcher(
+    model_b, history_b = train_mapping_matcher(
         [graph],
+        [pair],
         seed=23,
         matcher_config=config,
         augment_config=augment,
@@ -396,6 +484,12 @@ def test_mapping_training_mixes_augmented_and_cross_page_pairs() -> None:
             "self_supervised_pairs": 2.0,
             "cross_page_pairs": 1.0,
             "positive_labels": 12.0,
+            "assignment_loss": history[0]["assignment_loss"],
+            "final_assignment_loss": history[0]["final_assignment_loss"],
+            "intermediate_assignment_loss": 0.0,
+            "cycle_loss": history[0]["cycle_loss"],
+            "supervised_layers": 1.0,
+            "context_masked_nodes": 0.0,
         }
     ]
 

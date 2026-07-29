@@ -85,22 +85,19 @@ TEMdroid/SemFinder is retained as metadata-only diagnostic data. It does not
 include the same screenshot/XML grounding richness and should not be used as the
 main visual/layout robustness dataset.
 
-## Structural Representation Diagnostics
+## Canonical Page-Pair Evaluation
 
-Frozen UI graph files from MobileViews, package-disjoint Uni-GUI-OpenMobile,
-and image-disjoint OS-Atlas AndroidWorld are evaluated independently with the
-same deterministic view generator. Reports include positive Top1 and learned
-NULL recall. OS-Atlas omits app identity, so its held-out images measure
-in-source representation quality only and are never described as cross-app
-generalization.
+Every learned matcher result uses the same
+`omnitransfer.mapping_page_pair.v1` adapter as training. Raw graph files are
+not a second evaluation format.
 
 ```bash
 PYTHONPATH=src:. python scripts/evaluate_ui_graph_matcher.py \
-  --input runtime/datasets/unigui_openmobile/graphs_seed17/graphs.test.jsonl \
+  --input runtime/datasets/unified_mapping/test.jsonl \
+  --split test \
   --checkpoint runtime/models/relation_matcher.pt \
-  --label openmobile_package_disjoint_test \
   --device cuda \
-  --output runtime/reports/openmobile_package_disjoint_test.json
+  --output runtime/reports/page_pair_test.json
 ```
 
 Local path:

@@ -1,45 +1,23 @@
 import json
 
-from scripts.evaluate_ui_graph_matcher import load_eval_graphs
+from omnitransfer.learned_matcher import MatcherConfig
+from scripts.evaluate_ui_graph_matcher import load_evaluation_pairs
+from tests.test_mapping_training import _record
 
 
-def test_eval_graph_loader_applies_minimum_and_immutable_limit(tmp_path) -> None:
-    input_path = tmp_path / "graphs.test.jsonl"
-    records = [
-        {
-            "graph_id": "small",
-            "width": 100,
-            "height": 100,
-            "nodes": [
-                {"node_id": "only", "origin_id": "only", "bbox": [0, 0, 10, 10]}
-            ],
-        },
-        *[
-            {
-                "graph_id": f"screen-{index}",
-                "width": 100,
-                "height": 100,
-                "nodes": [
-                    {
-                        "node_id": "a",
-                        "origin_id": "a",
-                        "bbox": [0, 0, 10, 10],
-                    },
-                    {
-                        "node_id": "b",
-                        "origin_id": "b",
-                        "bbox": [20, 0, 30, 10],
-                    },
-                ],
-            }
-            for index in range(2)
-        ],
-    ]
-    input_path.write_text(
-        "\n".join(json.dumps(record) for record in records),
-        encoding="utf-8",
+def test_evaluation_uses_the_same_page_pair_adapter_and_split(tmp_path) -> None:
+    record = _record()
+    record["split"] = "test"
+    record["label_status"] = "gold"
+    path = tmp_path / "test.jsonl"
+    path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    pairs, adapter = load_evaluation_pairs(
+        [path],
+        split="test",
+        config=MatcherConfig(),
     )
 
-    graphs = load_eval_graphs([str(input_path)], limit=1, min_nodes=2)
-
-    assert [graph.graph_id for graph in graphs] == ["screen-0"]
+    assert len(pairs) == 1
+    assert adapter["allowed_splits"] == ["test"]
+    assert adapter["set_valued_match_rows_retained"] == 1

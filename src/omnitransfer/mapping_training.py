@@ -24,11 +24,12 @@ def load_mapping_training_pairs(
     *,
     matcher_config: MatcherConfig | None = None,
     allow_unreviewed_pseudo: bool = False,
-    minimum_correspondences: int = 2,
+    minimum_correspondences: int = 1,
     max_pairs: int = 0,
     screenshot_root: str | Path | None = None,
+    allowed_splits: frozenset[str] = frozenset({"train", "diagnostic"}),
 ) -> tuple[list[TrainingPair], list[UIGraph], dict[str, Any]]:
-    """Load strict one-to-one cross-page labels plus their unlabeled pages."""
+    """Load set-valued page-pair labels through the one canonical adapter."""
 
     if minimum_correspondences <= 0:
         raise ValueError("minimum_correspondences must be positive")
@@ -43,8 +44,8 @@ def load_mapping_training_pairs(
     input_rows = 0
     accepted_correspondences = 0
     explicit_correspondences = 0
-    ambiguous_rows = 0
-    conflicting_rows = 0
+    set_valued_rows = 0
+    shared_target_rows = 0
     non_actionable_correspondences = 0
     assets = (
         Path(screenshot_root).expanduser().resolve()
@@ -64,7 +65,7 @@ def load_mapping_training_pairs(
                     skipped[f"invalid:{exc}"] += 1
                     continue
                 label_status = record["label_status"]
-                if record["split"] not in {"train", "diagnostic"}:
+                if record["split"] not in allowed_splits:
                     skipped[f"split:{record['split']}"] += 1
                     continue
                 if label_status == "unreviewed" and not allow_unreviewed_pseudo:
@@ -84,10 +85,10 @@ def load_mapping_training_pairs(
                 target_graph = _page_graph(
                     record, side="target", screenshot_root=assets
                 )
-                correspondences, row_stats = _strict_correspondences(record)
+                correspondences, row_stats = _correspondence_edges(record)
                 explicit_correspondences += len(correspondences)
-                ambiguous_rows += row_stats["ambiguous_rows"]
-                conflicting_rows += row_stats["conflicting_rows"]
+                set_valued_rows += row_stats["set_valued_rows"]
+                shared_target_rows += row_stats["shared_target_rows"]
                 source_nodes = {node.node_id: node for node in source_graph.nodes}
                 target_nodes = {node.node_id: node for node in target_graph.nodes}
                 actionable_correspondences = [
@@ -101,7 +102,7 @@ def load_mapping_training_pairs(
                 )
                 correspondences = actionable_correspondences
                 if len(correspondences) < minimum_correspondences:
-                    skipped["too_few_strict_correspondences"] += 1
+                    skipped["too_few_actionable_correspondences"] += 1
                     continue
                 source_actionable_ids = tuple(
                     node.node_id for node in source_graph.nodes if _is_actionable(node)
@@ -146,25 +147,26 @@ def load_mapping_training_pairs(
         if max_pairs and len(pairs) >= max_pairs:
             break
     manifest = {
-        "schema_version": "omnitransfer.mapping_training_adapter.v1",
+        "schema_version": "omnitransfer.mapping_training_adapter.v2",
         "input_rows": input_rows,
         "accepted_pairs": len(pairs),
         "accepted_graphs": len(graphs),
         "accepted_correspondences": accepted_correspondences,
         "explicit_correspondences": explicit_correspondences,
-        "ambiguous_match_rows_filtered": ambiguous_rows,
-        "conflicting_target_rows_filtered": conflicting_rows,
+        "set_valued_match_rows_retained": set_valued_rows,
+        "shared_target_rows_retained": shared_target_rows,
         "non_actionable_correspondences_filtered": non_actionable_correspondences,
         "allow_unreviewed_pseudo": allow_unreviewed_pseudo,
         "minimum_correspondences": minimum_correspondences,
+        "allowed_splits": sorted(allowed_splits),
         "screenshot_root": str(assets) if assets is not None else None,
         "datasets": dict(sorted(datasets.items())),
         "label_statuses": dict(sorted(labels.items())),
         "skipped": dict(sorted(skipped.items())),
         "training_boundary": {
             "stable_ids_are_label_only": True,
-            "set_valued_rows_are_filtered": True,
-            "target_collisions_are_filtered": True,
+            "set_valued_rows_are_retained": True,
+            "shared_targets_are_retained": True,
             "actionable_correspondence_only": True,
             "non_actionable_nodes_are_context_only": True,
             "same_screen_actionable_nodes_are_candidates": True,
@@ -223,27 +225,27 @@ def _resolve_screenshot_path(value: str, *, screenshot_root: Path | None) -> str
     return str(original)
 
 
-def _strict_correspondences(
+def _correspondence_edges(
     record: dict[str, Any],
 ) -> tuple[list[tuple[str, str]], dict[str, int]]:
-    single_target_rows = [
+    correspondence_rows = [
         match
         for match in record["matches"]
-        if match["label"] == "correspondence" and len(match["target_node_ids"]) == 1
+        if match["label"] == "correspondence"
     ]
-    target_counts = Counter(match["target_node_ids"][0] for match in single_target_rows)
     correspondences = [
-        (match["source_node_id"], match["target_node_ids"][0])
-        for match in single_target_rows
-        if target_counts[match["target_node_ids"][0]] == 1
+        (match["source_node_id"], target_id)
+        for match in correspondence_rows
+        for target_id in match["target_node_ids"]
     ]
+    target_counts = Counter(target_id for _, target_id in correspondences)
     return correspondences, {
-        "ambiguous_rows": sum(
-            match["label"] == "correspondence" and len(match["target_node_ids"]) != 1
-            for match in record["matches"]
+        "set_valued_rows": sum(
+            len(match["target_node_ids"]) > 1 for match in correspondence_rows
         ),
-        "conflicting_rows": sum(
-            target_counts[match["target_node_ids"][0]] > 1
-            for match in single_target_rows
+        "shared_target_rows": sum(
+            target_counts[target_id] > 1
+            for match in correspondence_rows
+            for target_id in match["target_node_ids"]
         ),
     }

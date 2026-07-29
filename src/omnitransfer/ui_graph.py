@@ -239,6 +239,31 @@ def multi_anchor_context_graph(
                 frontier.append(neighbor_id)
                 if len(selected_ids) >= max_nodes:
                     break
+        if len(selected_ids) < max_nodes:
+            anchor_centers = [
+                _normalized_center(nodes_by_id[node_id].bbox, graph)
+                for node_id in anchor_ids
+            ]
+            remaining = sorted(
+                (
+                    node
+                    for node in graph.nodes
+                    if node.node_id not in selected_ids
+                ),
+                key=lambda node: (
+                    min(
+                        _center_distance(
+                            anchor_center,
+                            _normalized_center(node.bbox, graph),
+                        )
+                        for anchor_center in anchor_centers
+                    ),
+                    node.node_id,
+                ),
+            )
+            selected_ids.update(
+                node.node_id for node in remaining[: max_nodes - len(selected_ids)]
+            )
     selected_nodes = tuple(
         UINode(
             **{

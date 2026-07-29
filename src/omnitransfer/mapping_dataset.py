@@ -8,7 +8,7 @@ from collections import Counter
 import hashlib
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from omnitransfer.schema import Query
 from omnitransfer.gui_odyssey_pairs import (
@@ -26,9 +26,18 @@ _SPLITS = frozenset({"train", "dev", "test", "diagnostic"})
 _LABEL_STATUSES = frozenset({"gold", "weak", "self_supervised", "unreviewed"})
 
 
-def adapt_ase_queries(queries: list[Query]) -> list[dict[str, Any]]:
+def adapt_ase_queries(
+    queries: list[Query],
+    *,
+    asset_root: str | Path | None = None,
+) -> list[dict[str, Any]]:
     """Group authored ASE queries into gold multi-match page-pair records."""
 
+    resolved_assets = (
+        Path(asset_root).expanduser().resolve()
+        if asset_root is not None
+        else None
+    )
     grouped: dict[tuple[str, str], list[Query]] = defaultdict(list)
     for query in queries:
         source_page_id = _ase_page_id(query, "source")
@@ -62,12 +71,18 @@ def adapt_ase_queries(queries: list[Query]) -> list[dict[str, Any]]:
         }
         source_graph = _page_graph(
             source_page_id,
-            str(page_queries[0].metadata.get("source_xml_path") or ""),
+            _resolve_asset_path(
+                str(page_queries[0].metadata.get("source_xml_path") or ""),
+                asset_root=resolved_assets,
+            ),
             source_nodes,
         )
         target_graph = _page_graph(
             target_page_id,
-            str(page_queries[0].metadata.get("target_xml_path") or ""),
+            _resolve_asset_path(
+                str(page_queries[0].metadata.get("target_xml_path") or ""),
+                asset_root=resolved_assets,
+            ),
             target_nodes,
         )
         matches_by_source: dict[str, list[str]] = defaultdict(list)
@@ -78,6 +93,11 @@ def adapt_ase_queries(queries: list[Query]) -> list[dict[str, Any]]:
             for target_id in query.acceptable_gold_candidate_ids():
                 if target_id not in matches_by_source[source_id]:
                     matches_by_source[source_id].append(target_id)
+        _mark_action_anchors(
+            source_graph,
+            matches_by_source,
+            evidence="ase_public_mapping_source",
+        )
         record = {
             "schema_version": MAPPING_PAGE_PAIR_SCHEMA,
             "pair_id": _stable_pair_id("ase", source_page_id, target_page_id),
@@ -86,16 +106,24 @@ def adapt_ase_queries(queries: list[Query]) -> list[dict[str, Any]]:
             "source": {
                 "page_id": source_page_id,
                 "platform": _ase_platform(page_queries[0], "source"),
-                "screenshot_path": str(
-                    page_queries[0].metadata.get("source_screenshot_path") or ""
+                "screenshot_path": _resolve_asset_path(
+                    str(
+                        page_queries[0].metadata.get("source_screenshot_path")
+                        or ""
+                    ),
+                    asset_root=resolved_assets,
                 ),
                 "graph": source_graph,
             },
             "target": {
                 "page_id": target_page_id,
                 "platform": _ase_platform(page_queries[0], "target"),
-                "screenshot_path": str(
-                    page_queries[0].metadata.get("target_screenshot_path") or ""
+                "screenshot_path": _resolve_asset_path(
+                    str(
+                        page_queries[0].metadata.get("target_screenshot_path")
+                        or ""
+                    ),
+                    asset_root=resolved_assets,
                 ),
                 "graph": target_graph,
             },
@@ -291,27 +319,107 @@ def audit_mapping_page_pairs(records: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def write_mapping_dataset(
-    records: list[dict[str, Any]],
+    records: Iterable[dict[str, Any]],
     output_dir: str | Path,
     *,
     metadata: dict[str, Any] | None = None,
     review_candidates: dict[str, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
-    """Atomically write split JSONL files and a leakage-audited manifest."""
+    """Stream validated rows into atomic split files with leakage auditing."""
 
-    normalized = [validate_mapping_page_pair(record) for record in records]
-    audit = audit_mapping_page_pairs(normalized)
     output = Path(output_dir).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
-    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for record in normalized:
-        grouped[record["split"]].append(record)
+    splits = ("train", "dev", "test", "diagnostic")
+    final_paths = {split: output / f"{split}.jsonl" for split in splits}
+    temporary_paths = {
+        split: path.with_suffix(path.suffix + ".part")
+        for split, path in final_paths.items()
+    }
+    handles: dict[str, Any] = {}
+    pair_splits: dict[str, set[str]] = defaultdict(set)
+    page_splits: dict[str, set[str]] = defaultdict(set)
+    partition_splits: dict[str, set[str]] = defaultdict(set)
+    split_counts: Counter[str] = Counter()
+    assignment_counts: Counter[str] = Counter()
+    label_counts: Counter[str] = Counter()
+    dataset_counts: Counter[str] = Counter()
+    match_counts: Counter[str] = Counter()
+    file_match_counts: Counter[str] = Counter()
+    record_count = 0
+    try:
+        handles = {
+            split: temporary_paths[split].open("w", encoding="utf-8")
+            for split in splits
+        }
+        for raw_record in records:
+            record = validate_mapping_page_pair(raw_record)
+            split = record["split"]
+            assignment_split = _assignment_split(record)
+            _record_assignment(pair_splits, record["pair_id"], assignment_split, "pair id")
+            for side in ("source", "target"):
+                _record_assignment(
+                    page_splits,
+                    record[side]["page_id"],
+                    assignment_split,
+                    "page",
+                )
+            for key in record["partition_keys"]:
+                _record_assignment(
+                    partition_splits,
+                    key,
+                    assignment_split,
+                    "partition",
+                )
+            encoded = json.dumps(
+                record,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            handles[split].write(encoded + "\n")
+            record_count += 1
+            split_counts[split] += 1
+            assignment_counts[assignment_split] += 1
+            label_counts[record["label_status"]] += 1
+            dataset_counts[
+                str(record["provenance"].get("dataset") or "unknown")
+            ] += 1
+            file_match_counts[split] += len(record["matches"])
+            for match in record["matches"]:
+                match_counts[match["label"]] += 1
+        if record_count == 0:
+            raise ValueError("mapping dataset is empty")
+        for handle in handles.values():
+            handle.close()
+        handles.clear()
+        for split in splits:
+            temporary_paths[split].replace(final_paths[split])
+    except BaseException:
+        for handle in handles.values():
+            handle.close()
+        for path in temporary_paths.values():
+            path.unlink(missing_ok=True)
+        raise
+
+    audit = {
+        "schema_version": "omnitransfer.mapping_dataset_audit.v1",
+        "valid": True,
+        "records": record_count,
+        "matches": sum(match_counts.values()),
+        "split_counts": dict(sorted(split_counts.items())),
+        "assignment_counts": dict(sorted(assignment_counts.items())),
+        "label_status_counts": dict(sorted(label_counts.items())),
+        "dataset_counts": dict(sorted(dataset_counts.items())),
+        "match_label_counts": dict(sorted(match_counts.items())),
+        "overlap": {"pair_id": {}, "page_id": {}, "partition_key": {}},
+    }
     files: dict[str, Any] = {}
-    for split in ("train", "dev", "test", "diagnostic"):
-        path = output / f"{split}.jsonl"
-        rows = sorted(grouped.get(split, ()), key=lambda row: row["pair_id"])
-        _write_jsonl_atomic(path, rows)
-        files[path.name] = _file_manifest(path, rows)
+    for split in splits:
+        path = final_paths[split]
+        files[path.name] = _file_manifest(
+            path,
+            records=split_counts[split],
+            matches=file_match_counts[split],
+        )
 
     for reserved_split, candidates in sorted((review_candidates or {}).items()):
         if reserved_split not in {"dev", "test"}:
@@ -324,7 +432,11 @@ def write_mapping_dataset(
         path = output / f"review_{reserved_split}_candidates.jsonl"
         ordered = sorted(rows, key=lambda row: row["pair_id"])
         _write_jsonl_atomic(path, ordered)
-        files[path.name] = _file_manifest(path, ordered)
+        files[path.name] = _file_manifest(
+            path,
+            records=len(ordered),
+            matches=sum(len(row["matches"]) for row in ordered),
+        )
 
     manifest = {
         "schema_version": "omnitransfer.mapping_dataset_manifest.v1",
@@ -731,6 +843,35 @@ def _page_graph(
     return graph
 
 
+def _resolve_asset_path(value: str, *, asset_root: Path | None) -> str:
+    if not value:
+        return ""
+    path = Path(value).expanduser()
+    if path.is_absolute() or asset_root is None:
+        return str(path)
+    return str((asset_root / path).resolve())
+
+
+def _mark_action_anchors(
+    graph: dict[str, Any],
+    source_matches: dict[str, list[str]],
+    *,
+    evidence: str,
+) -> None:
+    """Record that an authored source mapping row is an executed action anchor."""
+
+    source_ids = set(source_matches)
+    for node in graph["nodes"]:
+        if str(node.get("node_id")) not in source_ids:
+            continue
+        node["clickable"] = True
+        metadata = node.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+            node["metadata"] = metadata
+        metadata["actionability_evidence"] = evidence
+
+
 def _ase_platform(query: Query, side: str) -> str:
     if side == "source":
         source_metadata = query.source.get("metadata")
@@ -797,6 +938,18 @@ def _first_overlap(overlap: dict[str, list[str]]) -> str:
     return f"{key} -> {overlap[key]}"
 
 
+def _record_assignment(
+    assignments: dict[str, set[str]],
+    key: str,
+    split: str,
+    label: str,
+) -> None:
+    assigned = assignments[key]
+    assigned.add(split)
+    if len(assigned) > 1:
+        raise ValueError(f"{label} leakage: {key} -> {sorted(assigned)}")
+
+
 def _write_jsonl_atomic(path: Path, rows: list[dict[str, Any]]) -> None:
     _write_text_atomic(
         path,
@@ -813,11 +966,15 @@ def _write_text_atomic(path: Path, text: str) -> None:
     temporary.replace(path)
 
 
-def _file_manifest(path: Path, rows: list[dict[str, Any]]) -> dict[str, Any]:
+def _file_manifest(path: Path, *, records: int, matches: int) -> dict[str, Any]:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
     return {
         "path": path.name,
-        "records": len(rows),
-        "matches": sum(len(row["matches"]) for row in rows),
+        "records": records,
+        "matches": matches,
         "bytes": path.stat().st_size,
-        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "sha256": digest.hexdigest(),
     }

@@ -81,7 +81,7 @@ def test_unreviewed_pairs_require_explicit_opt_in(tmp_path: Path) -> None:
     assert manifest["skipped"] == {"unreviewed_requires_opt_in": 1}
 
 
-def test_adapter_filters_set_valued_and_target_collisions(tmp_path: Path) -> None:
+def test_adapter_retains_set_valued_and_shared_target_labels(tmp_path: Path) -> None:
     record = _record()
     record["matches"].append(
         {"source_node_id": "s4", "target_node_ids": ["t4"], "label": "correspondence"}
@@ -98,10 +98,19 @@ def test_adapter_filters_set_valued_and_target_collisions(tmp_path: Path) -> Non
 
     assert len(pairs) == 1
     assert len(graphs) == 2
-    assert pairs[0].origin_ids == ("s0->t0", "s4->t4")
-    assert manifest["accepted_correspondences"] == 2
-    assert manifest["ambiguous_match_rows_filtered"] == 1
-    assert manifest["conflicting_target_rows_filtered"] == 2
+    assert pairs[0].origin_ids == (
+        "s0->t0",
+        "s1->t1",
+        "s2->t2",
+        "s2->t3",
+        "s3->t1",
+        "s4->t4",
+    )
+    assert pairs[0].positive_targets_a_to_b[2] == (2, 3)
+    assert pairs[0].positive_targets_b_to_a[1] == (1, 3)
+    assert manifest["accepted_correspondences"] == 6
+    assert manifest["set_valued_match_rows_retained"] == 1
+    assert manifest["shared_target_rows_retained"] == 2
 
 
 def test_adapter_supervises_only_actionable_to_actionable_pairs(tmp_path: Path) -> None:

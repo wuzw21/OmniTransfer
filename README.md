@@ -140,8 +140,8 @@ to know which source element from the recorded screen should be relocated.
 python -m py_compile \
   src/omnitransfer/*.py \
   scripts/import_mobileviews.py \
-  scripts/pretrain_ui_graph_matcher.py \
-  scripts/train_learned_matcher.py \
+  scripts/build_unified_mapping_dataset.py \
+  scripts/train_mapping_page_pairs.py \
   scripts/benchmark_matcher_latency.py \
   scripts/import_dataset.py \
   scripts/run_eval.py \
@@ -199,26 +199,15 @@ PYTHONPATH=src python scripts/import_mobileviews.py \
   --seed 17
 ```
 
-Minimal parser and augmentation smoke run:
+Raw graph files are data-source artifacts, not a second training format. Build
+MobileViews page pairs first; same-page augmentation is then generated inside
+the one page-pair trainer:
 
 ```bash
-PYTHONPATH=src python scripts/pretrain_ui_graph_matcher.py \
-  --input runtime/datasets/mobileviews_600k/graphs_50k_seed17/graphs.train.jsonl \
-  --max-screens 16 \
-  --dry-run
-```
-
-Actual training:
-
-```bash
-PYTHONPATH=src python scripts/pretrain_ui_graph_matcher.py \
-  --input runtime/datasets/mobileviews_600k/graphs_50k_seed17/graphs.train.jsonl \
-  --dev-input runtime/datasets/mobileviews_600k/graphs_50k_seed17/graphs.dev.jsonl \
-  --test-input runtime/datasets/mobileviews_600k/graphs_50k_seed17/graphs.test.jsonl \
-  --max-screens 40000 \
-  --epochs 1 \
-  --device cuda \
-  --output runtime/models/mobileviews_ui_graph_matcher.pt
+PYTHONPATH=src python scripts/build_mobileviews_allowlist_pair_pool.py \
+  --traces-root runtime/datasets/mobileviews/traces \
+  --app-allowlist runtime/datasets/mobileviews/train_apps.json \
+  --output-dir runtime/datasets/mobileviews/page_pairs_train
 ```
 
 Aligned MobileViews/Mind2Web page pairs can update the same model without a
@@ -322,54 +311,38 @@ PYTHONPATH=src python scripts/import_webui.py \
   --split train
 ```
 
-Continue training the same encoder and matcher across multiple graph streams;
-`--pretrained` resumes the checkpoint instead of creating a new model. Mix a
-rehearsal sample from every earlier domain in each run; sequential single-domain
-fine-tuning is not used because it measurably forgets prior pair-confidence calibration:
+Every additional source is adapted to `omnitransfer.mapping_page_pair.v1`
+before it can enter optimization. There is no graph-only pretraining command
+and no sequential domain-specific trainer.
 
-```bash
-PYTHONPATH=src python scripts/pretrain_ui_graph_matcher.py \
-  --input \
-    runtime/datasets/mobileviews_600k/graphs_50k_seed17/graphs.train.jsonl \
-    runtime/datasets/webui_70k_20260720/graphs_train/graphs.train.jsonl \
-    runtime/datasets/os_atlas_aw_20260720/graphs_seed17/graphs.train.jsonl \
-  --pretrained runtime/models/mobileviews_ui_graph_matcher.pt \
-  --device cuda \
-  --output runtime/models/mobileviews_webui_matcher.pt
-```
-
-Evaluate each frozen structural domain independently after every mixed run:
+Evaluate the frozen page-pair split without changing adapters:
 
 ```bash
 PYTHONPATH=src:. python scripts/evaluate_ui_graph_matcher.py \
-  --input runtime/datasets/mobileviews_600k/graphs_50k_seed17/graphs.test.jsonl \
-  --checkpoint runtime/models/mobileviews_webui_matcher.pt \
-  --label mobileviews_frozen_test \
+  --input runtime/datasets/unified_mapping/test.jsonl \
+  --split test \
+  --checkpoint runtime/models/context_forced_cross_attention_v1.pt \
   --device cuda \
-  --output runtime/reports/mobileviews_frozen_test.json
+  --output runtime/reports/context_forced_cross_attention_v1_test.json
 ```
 
-Fine-tune the checkpoint on canonical source-target widget pairs:
+Convert every source-target dataset to the same page-pair rows, then use the
+one canonical training entrypoint:
 
 ```bash
-PYTHONPATH=src python scripts/train_learned_matcher.py \
-  --input runtime/evals/vision_widget_mapping/action_transfer_queries.with_images.jsonl \
-  --pretrained runtime/models/mobileviews_ui_graph_matcher.pt \
+PYTHONPATH=src python scripts/build_unified_mapping_dataset.py \
+  --ase-queries runtime/evals/vision_widget_mapping/clean_relative_xml_v1/queries.jsonl \
+  --page-pairs runtime/datasets/mobileviews/train-*.jsonl \
+  --output-dir runtime/datasets/unified_mapping
+
+PYTHONPATH=src python scripts/train_mapping_page_pairs.py \
+  --input runtime/datasets/unified_mapping/train.jsonl \
+  --validation-input runtime/datasets/unified_mapping/dev.jsonl \
+  --assignment-head mutual_projection \
+  --context-mask-probability 0.35 \
   --epochs 3 \
   --device cuda \
-  --output runtime/models/relation_matcher_finetuned.pt
-```
-
-Optional train-app validator outcomes use the same candidate logits and add a
-simple success-over-failure preference loss:
-
-```bash
-PYTHONPATH=src python scripts/train_learned_matcher.py \
-  --input runtime/evals/vision_widget_mapping/action_transfer_queries.with_images.jsonl \
-  --outcomes runtime/training/verified_outcomes.train.jsonl \
-  --preference-weight 0.2 \
-  --device cuda \
-  --output runtime/models/relation_matcher_outcome.pt
+  --output runtime/models/context_forced_cross_attention_v1.pt
 ```
 
 Enforce the decoded-image RTX 4090 compute budget after model-only warmup; PNG

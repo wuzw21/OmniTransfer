@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train one matcher with page augmentation and strict cross-page pseudo labels."""
+"""Train one matcher from the canonical mapping page-pair schema."""
 
 from __future__ import annotations
 
@@ -8,6 +8,11 @@ from dataclasses import asdict, replace
 import json
 from pathlib import Path
 
+from omnitransfer.experiment_logging import (
+    TrainingMetricLog,
+    file_sha256,
+    runtime_environment,
+)
 from omnitransfer.learned_matcher import (
     LearnedGraphMatcher,
     MatcherConfig,
@@ -25,6 +30,13 @@ from omnitransfer.self_supervised import (
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", nargs="+", type=Path, required=True)
+    parser.add_argument(
+        "--validation-input",
+        nargs="+",
+        type=Path,
+        default=(),
+        help="Gold dev page-pair JSONL files with the same record schema.",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--report", type=Path)
     parser.add_argument("--pretrained", type=Path)
@@ -33,12 +45,18 @@ def main() -> None:
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--num-layers", type=int, default=2)
+    parser.add_argument(
+        "--assignment-head",
+        choices=("pair_mlp", "mutual_projection"),
+    )
     parser.add_argument("--source-context-nodes", type=int, default=48)
     parser.add_argument("--target-context-nodes", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--progress-interval", type=int, default=1000)
-    parser.add_argument("--minimum-correspondences", type=int, default=2)
+    parser.add_argument("--context-mask-probability", type=float, default=0.0)
+    parser.add_argument("--metrics-log", type=Path)
+    parser.add_argument("--minimum-correspondences", type=int, default=1)
     parser.add_argument("--max-pairs", type=int, default=0)
     parser.add_argument("--allow-unreviewed-pseudo", action="store_true")
     parser.add_argument("--screenshot-root", type=Path)
@@ -56,6 +74,13 @@ def main() -> None:
             source_context_nodes=args.source_context_nodes,
             target_context_nodes=args.target_context_nodes,
         )
+        if (
+            args.assignment_head is not None
+            and args.assignment_head != config.assignment_head
+        ):
+            raise SystemExit(
+                "--assignment-head cannot change a pretrained checkpoint architecture"
+            )
         pretrained_model = pretrained.model
     else:
         config = MatcherConfig(
@@ -64,6 +89,7 @@ def main() -> None:
             num_layers=args.num_layers,
             source_context_nodes=args.source_context_nodes,
             target_context_nodes=args.target_context_nodes,
+            assignment_head=args.assignment_head or "pair_mlp",
         )
     pairs, graphs, adapter = load_mapping_training_pairs(
         args.input,
@@ -74,20 +100,64 @@ def main() -> None:
         screenshot_root=args.screenshot_root,
     )
     if not pairs:
-        raise SystemExit("No strict correspondence pairs were accepted")
+        raise SystemExit("No actionable correspondence pairs were accepted")
+    validation_pairs = []
+    validation_adapter = None
+    if args.validation_input:
+        validation_pairs, _, validation_adapter = load_mapping_training_pairs(
+            args.validation_input,
+            matcher_config=config,
+            minimum_correspondences=1,
+            screenshot_root=args.screenshot_root,
+            allowed_splits=frozenset({"dev"}),
+        )
+        if not validation_pairs:
+            raise SystemExit("No gold dev page pairs were accepted")
     preview = {
         "adapter": adapter,
         "matcher_config": asdict(config),
         "pretrained": str(args.pretrained.resolve()) if args.pretrained else None,
-        "training": "mixed_self_supervised_and_cross_page_pairs",
+        "training": "one_shuffled_page_pair_optimizer",
+        "context_mask_probability": args.context_mask_probability,
+        "validation_adapter": validation_adapter,
     }
     print(json.dumps(preview, ensure_ascii=False), flush=True)
     if args.dry_run:
         return
 
     augment = AugmentConfig()
+    metrics_path = args.metrics_log or args.output.with_suffix(".metrics.jsonl")
+    metric_log = TrainingMetricLog(metrics_path)
+    metric_log.start(
+        {
+            "architecture": "local_relation_cross_attention_matcher",
+            "objective": "layerwise_symmetric_mutual_assignment",
+            "inputs": [
+                {
+                    "path": str(path.resolve()),
+                    "sha256": file_sha256(path),
+                }
+                for path in args.input
+            ],
+            "validation_inputs": [
+                {
+                    "path": str(path.resolve()),
+                    "sha256": file_sha256(path),
+                }
+                for path in args.validation_input
+            ],
+            "matcher_config": asdict(config),
+            "augmentation": asdict(augment),
+            "context_mask_probability": args.context_mask_probability,
+            "seed": args.seed,
+            "epochs": args.epochs,
+            "learning_rate": args.learning_rate,
+            "runtime": runtime_environment(args.device),
+        }
+    )
 
     def report_progress(metrics: dict[str, float]) -> None:
+        metric_log.append("training_progress", metrics)
         print(
             json.dumps({"event": "training_progress", **metrics}),
             flush=True,
@@ -103,37 +173,67 @@ def main() -> None:
         device=args.device,
         augment_config=augment,
         matcher_config=config,
+        context_mask_probability=args.context_mask_probability,
         progress_callback=report_progress,
         progress_interval=args.progress_interval,
+        validation_pairs=validation_pairs,
     )
+    evaluation_pairs = validation_pairs or pairs
+    evaluation_split = "dev" if validation_pairs else "training_fit_smoke"
     metrics = evaluate_correspondence_pairs(
         model,
-        pairs,
+        evaluation_pairs,
         device=args.device,
         matcher_config=config,
     )
     report = {
-        "schema_version": "omnitransfer.mixed_mapping_experiment.v1",
+        "schema_version": "omnitransfer.page_pair_matcher_experiment.v1",
         "architecture": "local_relation_cross_attention_matcher",
-        "objective": "symmetric_partial_assignment_with_bidirectional_consistency",
+        "objective": "layerwise_symmetric_mutual_assignment",
         "inputs": [str(path.resolve()) for path in args.input],
         "pretrained": str(args.pretrained.resolve()) if args.pretrained else None,
         "adapter": adapter,
+        "validation_adapter": validation_adapter,
         "matcher_config": asdict(config),
         "parameter_count": parameter_count(model),
         "augmentation": asdict(augment),
+        "context_mask_probability": args.context_mask_probability,
+        "metrics_log": str(metrics_path.resolve()),
         "training": {"history": history},
-        "training_set_fit_smoke": metrics,
+        "evaluation": {
+            "split": evaluation_split,
+            "metrics": metrics,
+        },
         "evaluation_boundary": "formal metrics require held-out human gold",
     }
     checkpoint_metadata = {
-        key: value for key, value in report.items() if key != "training_set_fit_smoke"
+        key: value for key, value in report.items() if key != "evaluation"
     }
     save_matcher_checkpoint(
         args.output,
         model,
         config=config,
         metadata=checkpoint_metadata,
+    )
+    for row in history:
+        metric_log.append("epoch_end", row)
+    metric_log.append(
+        "evaluation",
+        {
+            "split": evaluation_split,
+            "top1_accuracy": metrics["top1_accuracy"],
+            "recall_at_k": metrics["recall_at_k"],
+            "warm_model_latency_ms": metrics["warm_model_latency_ms"],
+            "warm_end_to_end_latency_ms": metrics["warm_end_to_end_latency_ms"],
+        },
+    )
+    metric_log.append(
+        "checkpoint",
+        {
+            "path": str(args.output.resolve()),
+            "sha256": file_sha256(args.output),
+            "parameter_count": parameter_count(model),
+        },
     )
     report_path = args.report or args.output.with_suffix(".json")
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -146,7 +246,8 @@ def main() -> None:
             {
                 "output": str(args.output.resolve()),
                 "accepted_pairs": len(pairs),
-                "top1_fit_smoke": metrics["top1_accuracy"],
+                "evaluation_split": evaluation_split,
+                "top1": metrics["top1_accuracy"],
                 "warm_p95_ms": metrics["warm_model_latency_ms"]["p95"],
                 "warm_end_to_end_p95_ms": metrics["warm_end_to_end_latency_ms"]["p95"],
             },

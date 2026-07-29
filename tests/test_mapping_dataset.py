@@ -142,6 +142,75 @@ def test_ase_queries_are_grouped_into_one_multi_match_page_pair() -> None:
         "target-a-label",
         "target-a",
     ]
+    source_nodes = {
+        node["node_id"]: node for node in record["source"]["graph"]["nodes"]
+    }
+    assert source_nodes["source-a"]["clickable"] is True
+    assert (
+        source_nodes["source-a"]["metadata"]["actionability_evidence"]
+        == "ase_public_mapping_source"
+    )
+
+
+def test_ase_adapter_materializes_relative_xml_into_the_page_pair(
+    tmp_path: Path,
+) -> None:
+    assets = tmp_path / "bundle" / "assets"
+    assets.mkdir(parents=True)
+    source_xml = assets / "source.xml"
+    target_xml = assets / "target.xml"
+    source_xml.write_text(
+        '<hierarchy><node index="0" text="Search" class="Button" '
+        'clickable="true" bounds="[0,0][20,20]" /></hierarchy>',
+        encoding="utf-8",
+    )
+    target_xml.write_text(
+        '<hierarchy><node index="0" content-desc="Search" class="Button" '
+        'clickable="true" bounds="[10,10][30,30]" /></hierarchy>',
+        encoding="utf-8",
+    )
+    query = Query(
+        query_id="relative-assets",
+        source={
+            "node_id": "0",
+            "text": "Search",
+            "class_name": "Button",
+            "clickable": True,
+        },
+        target_candidates=(
+            Candidate(
+                "0",
+                metadata={
+                    "content_desc": "Search",
+                    "class_name": "Button",
+                    "clickable": True,
+                },
+            ),
+        ),
+        gold_candidate_id="0",
+        metadata={
+            "app": "Example",
+            "split": "train",
+            "source_screen": "Example/iOS/0",
+            "target_screen": "Example/Android/0",
+            "source_xml_path": "bundle/assets/source.xml",
+            "target_xml_path": "bundle/assets/target.xml",
+            "source_screenshot_path": "",
+            "target_screenshot_path": "",
+        },
+    )
+
+    record = adapt_ase_queries([query], asset_root=tmp_path)[0]
+
+    assert record["source"]["graph"]["metadata"]["source_format"] == "xml"
+    assert record["target"]["graph"]["metadata"]["source_format"] == "xml"
+    assert any(
+        node["text"] == "Search" for node in record["source"]["graph"]["nodes"]
+    )
+    assert any(
+        node["content_desc"] == "Search"
+        for node in record["target"]["graph"]["nodes"]
+    )
 
 
 def test_gui_odyssey_weak_pair_uses_the_same_page_pair_schema(tmp_path: Path) -> None:
@@ -416,3 +485,74 @@ def test_writer_emits_same_schema_for_train_and_test(tmp_path: Path) -> None:
     test = json.loads((tmp_path / "dataset" / "test.jsonl").read_text().strip())
     assert train.keys() == test.keys()
     assert train["schema_version"] == MAPPING_PAGE_PAIR_SCHEMA
+
+
+def test_writer_streams_single_pass_records_and_cleans_leakage_parts(
+    tmp_path: Path,
+) -> None:
+    def record(pair_id: str, split: str, app: str) -> dict:
+        return {
+            "schema_version": MAPPING_PAGE_PAIR_SCHEMA,
+            "pair_id": pair_id,
+            "split": split,
+            "label_status": "gold",
+            "source": {
+                "page_id": f"{pair_id}:source",
+                "platform": "android",
+                "screenshot_path": "",
+                "graph": {
+                    "graph_id": f"{pair_id}:source",
+                    "nodes": [{"node_id": "source", "origin_id": "source"}],
+                },
+            },
+            "target": {
+                "page_id": f"{pair_id}:target",
+                "platform": "android",
+                "screenshot_path": "",
+                "graph": {
+                    "graph_id": f"{pair_id}:target",
+                    "nodes": [{"node_id": "target", "origin_id": "target"}],
+                },
+            },
+            "matches": [
+                {
+                    "source_node_id": "source",
+                    "target_node_ids": ["target"],
+                    "label": "correspondence",
+                }
+            ],
+            "partition_keys": [f"app:{app}"],
+            "provenance": {"dataset": "mobileviews", "annotation": "gold"},
+            "slices": {},
+        }
+
+    consumed: list[str] = []
+
+    def records():
+        for row in (
+            record("train-pair", "train", "train"),
+            record("test-pair", "test", "test"),
+        ):
+            consumed.append(row["pair_id"])
+            yield row
+
+    manifest = write_mapping_dataset(records(), tmp_path / "streamed")
+
+    assert consumed == ["train-pair", "test-pair"]
+    assert manifest["audit"]["records"] == 2
+    assert manifest["files"]["train.jsonl"]["records"] == 1
+    assert manifest["files"]["test.jsonl"]["records"] == 1
+
+    leaking = tmp_path / "leaking"
+    with pytest.raises(ValueError, match="partition leakage"):
+        write_mapping_dataset(
+            (
+                row
+                for row in (
+                    record("train-pair", "train", "shared"),
+                    record("test-pair", "test", "shared"),
+                )
+            ),
+            leaking,
+        )
+    assert not list(leaking.glob("*.part"))

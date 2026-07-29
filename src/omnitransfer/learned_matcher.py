@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from functools import lru_cache
 import hashlib
 import math
@@ -36,6 +36,7 @@ class MatcherConfig:
     visual_canvas_size: int = 384
     source_context_nodes: int = 48
     target_context_nodes: int = 64
+    assignment_head: str = "pair_mlp"
 
 
 @dataclass(frozen=True)
@@ -111,6 +112,20 @@ def cross_relation_features(
     )
 
 
+def mutual_log_assignment(affinity: Any) -> Any:
+    """Turn one dense affinity matrix into a bidirectionally normalized score."""
+
+    torch = _require_torch()
+    if affinity.ndim != 2:
+        raise ValueError("affinity must be a two-dimensional matrix")
+    if affinity.shape[0] == 0 or affinity.shape[1] == 0:
+        raise ValueError("affinity must contain at least one source and target node")
+    return 0.5 * (
+        torch.log_softmax(affinity, dim=1)
+        + torch.log_softmax(affinity, dim=0)
+    )
+
+
 def build_relation_aware_matcher(
     config: MatcherConfig | None = None,
 ) -> Any:
@@ -127,6 +142,12 @@ def build_relation_aware_matcher(
         raise ValueError("target_context_nodes must be positive")
     if cfg.visual_canvas_size < cfg.visual_patch_size:
         raise ValueError("visual_canvas_size must cover one visual patch")
+    if cfg.num_layers <= 0:
+        raise ValueError("num_layers must be positive")
+    if cfg.assignment_head not in {"pair_mlp", "mutual_projection"}:
+        raise ValueError(
+            "assignment_head must be 'pair_mlp' or 'mutual_projection'"
+        )
 
     class RelationSelfAttention(nn.Module):
         def __init__(self) -> None:
@@ -253,19 +274,26 @@ def build_relation_aware_matcher(
             self.missing_visual = nn.Parameter(torch.zeros(cfg.hidden_dim))
             self.input_norm = nn.LayerNorm(cfg.hidden_dim)
             self.layers = nn.ModuleList(MatcherLayer() for _ in range(cfg.num_layers))
-            self.cross_relation_projection = nn.Sequential(
-                nn.Linear(RELATION_FEATURE_DIM, cfg.relation_hidden_dim),
-                nn.GELU(),
-            )
-            pair_dim = cfg.hidden_dim * 4 + cfg.relation_hidden_dim
-            self.pair_head = nn.Sequential(
-                nn.LayerNorm(pair_dim),
-                nn.Linear(pair_dim, cfg.hidden_dim),
-                nn.GELU(),
-                nn.Dropout(cfg.dropout),
-                nn.Linear(cfg.hidden_dim, 1),
-            )
-            self.matchability = nn.Linear(cfg.hidden_dim, 1)
+            if cfg.assignment_head == "pair_mlp":
+                self.cross_relation_projection = nn.Sequential(
+                    nn.Linear(RELATION_FEATURE_DIM, cfg.relation_hidden_dim),
+                    nn.GELU(),
+                )
+                pair_dim = cfg.hidden_dim * 4 + cfg.relation_hidden_dim
+                self.pair_head = nn.Sequential(
+                    nn.LayerNorm(pair_dim),
+                    nn.Linear(pair_dim, cfg.hidden_dim),
+                    nn.GELU(),
+                    nn.Dropout(cfg.dropout),
+                    nn.Linear(cfg.hidden_dim, 1),
+                )
+                self.matchability = nn.Linear(cfg.hidden_dim, 1)
+            else:
+                self.affinity_projection = nn.Linear(
+                    cfg.hidden_dim,
+                    cfg.hidden_dim,
+                    bias=False,
+                )
 
         def _encode_nodes(
             self,
@@ -307,6 +335,16 @@ def build_relation_aware_matcher(
                 + self.matchability(target_states).T
             )
 
+        def _mutual_assignment(
+            self,
+            source_states: Any,
+            target_states: Any,
+        ) -> tuple[Any, Any]:
+            source = self.affinity_projection(source_states)
+            target = self.affinity_projection(target_states)
+            affinity = (source @ target.T) / math.sqrt(cfg.hidden_dim)
+            return mutual_log_assignment(affinity), affinity
+
         def forward(
             self,
             source_token_ids: Any,
@@ -333,6 +371,8 @@ def build_relation_aware_matcher(
                 target_visual,
                 target_visual_mask,
             )
+            assignment_scores_by_layer = []
+            affinities_by_layer = []
             for layer in self.layers:
                 source_states, target_states = layer(
                     source_states,
@@ -340,6 +380,26 @@ def build_relation_aware_matcher(
                     source_relations,
                     target_relations,
                 )
+                if cfg.assignment_head == "mutual_projection":
+                    assignment, affinity = self._mutual_assignment(
+                        source_states,
+                        target_states,
+                    )
+                    assignment_scores_by_layer.append(assignment)
+                    affinities_by_layer.append(affinity)
+            if cfg.assignment_head == "mutual_projection":
+                pair_logits = assignment_scores_by_layer[-1]
+                return {
+                    "logits_ab": pair_logits,
+                    "logits_ba": pair_logits.T,
+                    "affinity": affinities_by_layer[-1],
+                    "assignment_scores_by_layer": tuple(
+                        assignment_scores_by_layer
+                    ),
+                    "affinities_by_layer": tuple(affinities_by_layer),
+                    "source_states": source_states,
+                    "target_states": target_states,
+                }
             pair_logits = self._score_pairs(
                 source_states,
                 target_states,
@@ -372,20 +432,48 @@ def matcher_inputs(
     *,
     config: MatcherConfig | None = None,
     device: str | Any = "cpu",
+    source_context_mask_indices: Iterable[int] = (),
+    target_context_mask_indices: Iterable[int] = (),
 ) -> tuple[Any, ...]:
-    """Convert two UI graphs to tensors accepted by the learned matcher."""
+    """Convert two UI graphs to tensors accepted by the learned matcher.
+
+    Context-forced indices lose their own text/description and visual crop only.
+    Their class/action state and every within-screen relation remain available.
+    """
 
     torch = _require_torch()
     cfg = config or MatcherConfig()
     encoded_source = encode_graph(source, config=cfg)
     encoded_target = encode_graph(target, config=cfg)
+    source_masked = _validated_mask_indices(
+        source_context_mask_indices,
+        node_count=len(source.nodes),
+        side="source",
+    )
+    target_masked = _validated_mask_indices(
+        target_context_mask_indices,
+        node_count=len(target.nodes),
+        side="target",
+    )
+    source_token_rows = list(encoded_source.token_ids)
+    target_token_rows = list(encoded_target.token_ids)
+    for index in source_masked:
+        source_token_rows[index] = _context_forced_token_ids(
+            source.nodes[index],
+            config=cfg,
+        )
+    for index in target_masked:
+        target_token_rows[index] = _context_forced_token_ids(
+            target.nodes[index],
+            config=cfg,
+        )
     source_token_ids = torch.as_tensor(
-        encoded_source.token_ids,
+        source_token_rows,
         dtype=torch.long,
         device=device,
     )
     target_token_ids = torch.as_tensor(
-        encoded_target.token_ids,
+        target_token_rows,
         dtype=torch.long,
         device=device,
     )
@@ -428,6 +516,10 @@ def matcher_inputs(
         torch=torch,
         device=device,
     )
+    if source_masked:
+        source_visual_mask[list(source_masked)] = 0.0
+    if target_masked:
+        target_visual_mask[list(target_masked)] = 0.0
     return (
         source_token_ids,
         source_numeric,
@@ -582,7 +674,7 @@ def save_matcher_checkpoint(
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "schema_version": "omnitransfer_relation_matcher_v2",
+            "schema_version": "omnitransfer_relation_matcher_v3",
             "matcher_config": asdict(config),
             "state_dict": model.state_dict(),
             "metadata": dict(metadata or {}),
@@ -782,6 +874,29 @@ def _node_token_ids(node: UINode, *, config: MatcherConfig) -> tuple[int, ...]:
         if len(token_ids) >= config.max_tokens:
             break
     return tuple(token_ids + [0] * (config.max_tokens - len(token_ids)))
+
+
+def _context_forced_token_ids(
+    node: UINode,
+    *,
+    config: MatcherConfig,
+) -> tuple[int, ...]:
+    return _node_token_ids(
+        replace(node, text="", content_desc=""),
+        config=config,
+    )
+
+
+def _validated_mask_indices(
+    indices: Iterable[int],
+    *,
+    node_count: int,
+    side: str,
+) -> tuple[int, ...]:
+    normalized = tuple(sorted(set(int(index) for index in indices)))
+    if any(index < 0 or index >= node_count for index in normalized):
+        raise ValueError(f"{side} context mask index is outside the graph")
+    return normalized
 
 
 def _node_numeric_features(node: UINode, graph: UIGraph) -> tuple[float, ...]:

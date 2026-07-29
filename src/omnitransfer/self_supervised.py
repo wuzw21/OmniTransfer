@@ -52,6 +52,8 @@ class TrainingPair:
     encoded_b: EncodedGraph
     targets_a_to_b: tuple[int, ...]
     targets_b_to_a: tuple[int, ...]
+    positive_targets_a_to_b: tuple[tuple[int, ...], ...]
+    positive_targets_b_to_a: tuple[tuple[int, ...], ...]
     source_indices: tuple[int, ...]
     target_indices: tuple[int, ...]
     origin_ids: tuple[str, ...]
@@ -86,12 +88,12 @@ def make_correspondence_training_pair(
     if allow_empty and not unmatched_as_null:
         raise ValueError("empty correspondence requires explicit NULL supervision")
     unmatched_target = -1 if unmatched_as_null else -2
-    targets_a_to_b = [unmatched_target] * len(graph_a.nodes)
-    targets_b_to_a = [unmatched_target] * len(graph_b.nodes)
+    positive_a_to_b = [set() for _ in graph_a.nodes]
+    positive_b_to_a = [set() for _ in graph_b.nodes]
     source_indices: list[int] = []
     target_indices: list[int] = []
     labels: list[str] = []
-    for source_id, target_id in correspondences:
+    for source_id, target_id in dict.fromkeys(correspondences):
         if source_id not in index_a:
             raise ValueError(f"source correspondence node is absent: {source_id}")
         if target_id not in index_b:
@@ -103,15 +105,21 @@ def make_correspondence_training_pair(
             and _is_actionable(graph_b.nodes[target_index])
         ):
             raise ValueError("correspondences must be actionable-to-actionable")
-        if targets_a_to_b[source_index] >= 0 or targets_b_to_a[target_index] >= 0:
-            raise ValueError("correspondences must be one-to-one")
-        targets_a_to_b[source_index] = target_index
-        targets_b_to_a[target_index] = source_index
+        positive_a_to_b[source_index].add(target_index)
+        positive_b_to_a[target_index].add(source_index)
         source_indices.append(source_index)
         target_indices.append(target_index)
         labels.append(f"{source_id}->{target_id}")
     if not source_indices and not allow_empty:
         raise ValueError("at least one correspondence is required")
+    targets_a_to_b = [
+        min(targets) if targets else unmatched_target
+        for targets in positive_a_to_b
+    ]
+    targets_b_to_a = [
+        min(targets) if targets else unmatched_target
+        for targets in positive_b_to_a
+    ]
     return TrainingPair(
         graph_a=graph_a,
         graph_b=graph_b,
@@ -119,6 +127,12 @@ def make_correspondence_training_pair(
         encoded_b=encode_graph(graph_b, config=config),
         targets_a_to_b=tuple(targets_a_to_b),
         targets_b_to_a=tuple(targets_b_to_a),
+        positive_targets_a_to_b=tuple(
+            tuple(sorted(targets)) for targets in positive_a_to_b
+        ),
+        positive_targets_b_to_a=tuple(
+            tuple(sorted(targets)) for targets in positive_b_to_a
+        ),
         source_indices=tuple(source_indices),
         target_indices=tuple(target_indices),
         origin_ids=tuple(labels),
@@ -240,6 +254,14 @@ def make_training_pair(
         encoded_b=encode_graph(graph_b, config=model_cfg),
         targets_a_to_b=targets_a_to_b,
         targets_b_to_a=targets_b_to_a,
+        positive_targets_a_to_b=tuple(
+            (target,) if target >= 0 else ()
+            for target in targets_a_to_b
+        ),
+        positive_targets_b_to_a=tuple(
+            (target,) if target >= 0 else ()
+            for target in targets_b_to_a
+        ),
         source_indices=tuple(index_a[origin_id] for origin_id in common),
         target_indices=tuple(index_b[origin_id] for origin_id in common),
         origin_ids=common,
@@ -277,36 +299,84 @@ def matching_loss(
     device: str = "cpu",
     matcher_config: MatcherConfig | None = None,
     cycle_weight: float = 0.05,
+    context_mask_probability: float = 0.0,
+    rng: random.Random | None = None,
+    return_details: bool = False,
 ) -> Any:
-    """Compute symmetric partial-assignment loss on known correspondences."""
+    """Compute symmetric layer-wise assignment loss on known correspondences."""
 
     torch = _require_torch()
+    if not 0.0 <= context_mask_probability <= 1.0:
+        raise ValueError("context_mask_probability must be between zero and one")
+    masking_rng = rng or random.Random(0)
+    masked_source_indices = tuple(
+        index
+        for index in pair.source_indices
+        if masking_rng.random() < context_mask_probability
+    )
+    masked_target_indices = tuple(
+        index
+        for index in pair.target_indices
+        if masking_rng.random() < context_mask_probability
+    )
     inputs = matcher_inputs(
         pair.graph_a,
         pair.graph_b,
         config=matcher_config or MatcherConfig(),
         device=device,
+        source_context_mask_indices=masked_source_indices,
+        target_context_mask_indices=masked_target_indices,
     )
     output = model(*inputs)
     logits_ab = output["logits_ab"]
     logits_ba = output["logits_ba"]
     actionable_a = _actionable_indices(pair.graph_a.nodes)
     actionable_b = _actionable_indices(pair.graph_b.nodes)
-    loss_ab = _partial_assignment_loss(
-        logits_ab,
-        pair.targets_a_to_b,
-        candidate_indices=actionable_b,
-        torch=torch,
-        device=device,
-    )
-    loss_ba = _partial_assignment_loss(
-        logits_ba,
-        pair.targets_b_to_a,
-        candidate_indices=actionable_a,
-        torch=torch,
-        device=device,
-    )
-    loss = 0.5 * (loss_ab + loss_ba)
+    layer_scores = tuple(output.get("assignment_scores_by_layer") or ())
+    if layer_scores:
+        layer_losses = tuple(
+            0.5
+            * (
+                _partial_assignment_loss(
+                    scores,
+                    pair.positive_targets_a_to_b,
+                    candidate_indices=actionable_b,
+                    torch=torch,
+                    device=device,
+                )
+                + _partial_assignment_loss(
+                    scores.T,
+                    pair.positive_targets_b_to_a,
+                    candidate_indices=actionable_a,
+                    torch=torch,
+                    device=device,
+                )
+            )
+            for scores in layer_scores
+        )
+    else:
+        layer_losses = (
+            0.5
+            * (
+                _partial_assignment_loss(
+                    logits_ab,
+                    pair.positive_targets_a_to_b,
+                    candidate_indices=actionable_b,
+                    torch=torch,
+                    device=device,
+                )
+                + _partial_assignment_loss(
+                    logits_ba,
+                    pair.positive_targets_b_to_a,
+                    candidate_indices=actionable_a,
+                    torch=torch,
+                    device=device,
+                )
+            ),
+        )
+    assignment_loss = torch.stack(layer_losses).mean()
+    loss = assignment_loss
+    cycle_loss = assignment_loss.new_zeros(())
     if cycle_weight > 0.0 and pair.source_indices:
         source_indices = torch.tensor(
             pair.source_indices, dtype=torch.long, device=device
@@ -332,6 +402,22 @@ def matching_loss(
         reverse = probabilities_ba[target_indices, reverse_positions]
         cycle_loss = torch.mean(torch.abs(forward - reverse))
         loss = loss + float(cycle_weight) * cycle_loss
+    if return_details:
+        intermediate = (
+            torch.stack(layer_losses[:-1]).mean()
+            if len(layer_losses) > 1
+            else assignment_loss.new_zeros(())
+        )
+        return loss, {
+            "assignment_loss": float(assignment_loss.detach().cpu()),
+            "final_assignment_loss": float(layer_losses[-1].detach().cpu()),
+            "intermediate_assignment_loss": float(intermediate.detach().cpu()),
+            "cycle_loss": float(cycle_loss.detach().cpu()),
+            "supervised_layers": float(len(layer_losses)),
+            "context_masked_nodes": float(
+                len(masked_source_indices) + len(masked_target_indices)
+            ),
+        }
     return loss
 
 
@@ -390,13 +476,21 @@ def evaluate_correspondence_pairs(
                 end_to_end_latencies.append(
                     (time.perf_counter() - total_started) * 1000.0
                 )
-            for logits, targets, candidate_nodes in (
-                (output["logits_ab"], pair.targets_a_to_b, pair.graph_b.nodes),
-                (output["logits_ba"], pair.targets_b_to_a, pair.graph_a.nodes),
+            for logits, positive_targets, candidate_nodes in (
+                (
+                    output["logits_ab"],
+                    pair.positive_targets_a_to_b,
+                    pair.graph_b.nodes,
+                ),
+                (
+                    output["logits_ba"],
+                    pair.positive_targets_b_to_a,
+                    pair.graph_a.nodes,
+                ),
             ):
                 candidate_indices = _actionable_indices(candidate_nodes)
-                for row_index, target_index in enumerate(targets):
-                    if target_index == -2:
+                for row_index, target_indices in enumerate(positive_targets):
+                    if not target_indices:
                         continue
                     ranked_positions = torch.argsort(
                         logits[row_index, candidate_indices], descending=True
@@ -404,11 +498,12 @@ def evaluate_correspondence_pairs(
                     ranked = [
                         candidate_indices[position] for position in ranked_positions
                     ]
-                    if target_index >= 0:
-                        positive_total += 1
-                        positive_correct += int(ranked[0] == target_index)
-                        for value in recall_hits:
-                            recall_hits[value] += int(target_index in ranked[:value])
+                    positive_total += 1
+                    positive_correct += int(ranked[0] in target_indices)
+                    for value in recall_hits:
+                        recall_hits[value] += int(
+                            any(target in ranked[:value] for target in target_indices)
+                        )
     return {
         "schema_version": "omnitransfer_correspondence_metrics_v1",
         "pair_count": len(pair_list),
@@ -532,8 +627,10 @@ def train_mapping_matcher(
     augment_config: AugmentConfig | None = None,
     matcher_config: MatcherConfig | None = None,
     cycle_weight: float = 0.05,
+    context_mask_probability: float = 0.0,
     progress_callback: Callable[[dict[str, float]], None] | None = None,
     progress_interval: int = 1000,
+    validation_pairs: Iterable[TrainingPair] = (),
 ) -> tuple[Any, list[dict[str, float]]]:
     """Train one matcher on mixed augmented-view and cross-page pairs."""
 
@@ -541,6 +638,7 @@ def train_mapping_matcher(
         raise ValueError("progress_interval must be positive")
     graph_list = list(graphs)
     cross_page_pairs = list(correspondence_pairs)
+    dev_pairs = list(validation_pairs)
     if not cross_page_pairs:
         raise ValueError("at least one cross-page correspondence pair is required")
     torch = _require_torch()
@@ -563,6 +661,7 @@ def train_mapping_matcher(
         rng.shuffle(training_items)
         matcher.train()
         losses: list[float] = []
+        loss_details: list[dict[str, float]] = []
         self_supervised_pairs = 0
         aligned_cross_page_pairs = 0
         positive_labels = 0
@@ -579,21 +678,29 @@ def train_mapping_matcher(
             else:
                 pair = item
             optimizer.zero_grad(set_to_none=True)
-            loss = matching_loss(
+            loss, details = matching_loss(
                 matcher,
                 pair,
                 device=device,
                 matcher_config=config,
                 cycle_weight=cycle_weight,
+                context_mask_probability=context_mask_probability,
+                rng=rng,
+                return_details=True,
             )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(matcher.parameters(), max_norm=1.0)
             optimizer.step()
             losses.append(float(loss.detach().cpu()))
+            loss_details.append(details)
             self_supervised_pairs += int(pair_kind == "self_supervised")
             aligned_cross_page_pairs += int(pair_kind == "cross_page")
             positive_labels += sum(
-                target >= 0 for target in (*pair.targets_a_to_b, *pair.targets_b_to_a)
+                len(targets)
+                for targets in (
+                    *pair.positive_targets_a_to_b,
+                    *pair.positive_targets_b_to_a,
+                )
             )
             if progress_callback is not None and len(losses) % progress_interval == 0:
                 window = losses[-progress_interval:]
@@ -605,180 +712,38 @@ def train_mapping_matcher(
                         "self_supervised_pairs": float(self_supervised_pairs),
                         "cross_page_pairs": float(aligned_cross_page_pairs),
                         "positive_labels": float(positive_labels),
+                        **_mean_loss_details(loss_details[-progress_interval:]),
                     }
                 )
-        history.append(
-            {
-                "epoch": float(epoch + 1),
-                "loss": sum(losses) / len(losses),
-                "pairs": float(len(losses)),
-                "self_supervised_pairs": float(self_supervised_pairs),
-                "cross_page_pairs": float(aligned_cross_page_pairs),
-                "positive_labels": float(positive_labels),
-            }
-        )
-    matcher.eval()
-    return matcher, history
-
-
-def train_self_supervised_matcher(
-    graphs: list[UIGraph],
-    *,
-    model: Any | None = None,
-    epochs: int = 1,
-    learning_rate: float = 1e-3,
-    hidden_dim: int = 64,
-    num_heads: int = 4,
-    num_layers: int = 2,
-    seed: int = 13,
-    device: str = "cpu",
-    augment_config: AugmentConfig | None = None,
-    matcher_config: MatcherConfig | None = None,
-    progress_callback: Callable[[dict[str, float]], None] | None = None,
-    progress_interval: int = 1000,
-) -> tuple[Any, list[dict[str, float]]]:
-    """Train the relation-aware matcher on unlabeled UI graphs."""
-
-    torch = _require_torch()
-    torch.manual_seed(seed)
-    rng = random.Random(seed)
-    cfg = augment_config or AugmentConfig()
-    model_cfg = matcher_config or MatcherConfig(
-        hidden_dim=hidden_dim,
-        num_heads=num_heads,
-        num_layers=num_layers,
-    )
-    if model is None:
-        model = build_relation_aware_matcher(model_cfg)
-    model = model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-    if progress_interval <= 0:
-        raise ValueError("progress_interval must be positive")
-    history: list[dict[str, float]] = []
-    training_graphs = list(graphs)
-    for epoch in range(max(1, int(epochs))):
-        model.train()
-        rng.shuffle(training_graphs)
-        losses: list[float] = []
-        positive_labels = null_labels = 0
-        for graph in training_graphs:
-            pair = make_training_pair(
-                graph,
-                rng=rng,
-                config=cfg,
-                matcher_config=model_cfg,
-            )
-            if pair is None:
-                continue
-            optimizer.zero_grad(set_to_none=True)
-            loss = matching_loss(
-                model,
-                pair,
-                device=device,
-                matcher_config=model_cfg,
-            )
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            losses.append(float(loss.detach().cpu()))
-            labels = (*pair.targets_a_to_b, *pair.targets_b_to_a)
-            positive_labels += sum(target >= 0 for target in labels)
-            null_labels += sum(target < 0 for target in labels)
-            if progress_callback is not None and len(losses) % progress_interval == 0:
-                window = losses[-progress_interval:]
-                progress_callback(
-                    {
-                        "epoch": float(epoch + 1),
-                        "pairs": float(len(losses)),
-                        "running_loss": sum(window) / len(window),
-                        "positive_labels": float(positive_labels),
-                        "null_labels": float(null_labels),
-                    }
-                )
-        history.append(
-            {
-                "epoch": float(epoch + 1),
-                "loss": sum(losses) / max(len(losses), 1),
-                "pairs": float(len(losses)),
-                "positive_labels": float(positive_labels),
-                "null_labels": float(null_labels),
-            }
-        )
-    model.eval()
-    return model, history
-
-
-def train_correspondence_matcher(
-    pairs: Iterable[TrainingPair],
-    *,
-    model: Any | None = None,
-    epochs: int = 1,
-    learning_rate: float = 3e-4,
-    weight_decay: float = 1e-4,
-    seed: int = 17,
-    device: str = "cpu",
-    matcher_config: MatcherConfig | None = None,
-    cycle_weight: float = 0.05,
-    progress_callback: Callable[[dict[str, float]], None] | None = None,
-    progress_interval: int = 1000,
-) -> tuple[Any, list[dict[str, float]]]:
-    """Train the same matcher directly on aligned cross-page graph pairs."""
-
-    if progress_interval <= 0:
-        raise ValueError("progress_interval must be positive")
-    pair_list = list(pairs)
-    if not pair_list:
-        raise ValueError("at least one correspondence pair is required")
-    torch = _require_torch()
-    config = matcher_config or MatcherConfig()
-    torch.manual_seed(seed)
-    rng = random.Random(seed)
-    matcher = (model or build_relation_aware_matcher(config)).to(device)
-    optimizer = torch.optim.AdamW(
-        matcher.parameters(),
-        lr=learning_rate,
-        weight_decay=weight_decay,
-    )
-    history: list[dict[str, float]] = []
-    for epoch in range(max(1, int(epochs))):
-        matcher.train()
-        rng.shuffle(pair_list)
-        losses: list[float] = []
-        positive_labels = 0
-        for pair in pair_list:
-            optimizer.zero_grad(set_to_none=True)
-            loss = matching_loss(
+        epoch_metrics = {
+            "epoch": float(epoch + 1),
+            "loss": sum(losses) / len(losses),
+            "pairs": float(len(losses)),
+            "self_supervised_pairs": float(self_supervised_pairs),
+            "cross_page_pairs": float(aligned_cross_page_pairs),
+            "positive_labels": float(positive_labels),
+            **_mean_loss_details(loss_details),
+        }
+        if dev_pairs:
+            dev_metrics = evaluate_correspondence_pairs(
                 matcher,
-                pair,
+                dev_pairs,
                 device=device,
                 matcher_config=config,
-                cycle_weight=cycle_weight,
+                latency_repeats=0,
             )
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(matcher.parameters(), max_norm=1.0)
-            optimizer.step()
-            losses.append(float(loss.detach().cpu()))
-            positive_labels += sum(
-                target >= 0 for target in (*pair.targets_a_to_b, *pair.targets_b_to_a)
+            epoch_metrics.update(
+                {
+                    "dev_pairs": float(dev_metrics["pair_count"]),
+                    "dev_positive_rows": float(dev_metrics["positive_total"]),
+                    "dev_top1_accuracy": float(dev_metrics["top1_accuracy"]),
+                    **{
+                        f"dev_recall_at_{value}": float(score)
+                        for value, score in dev_metrics["recall_at_k"].items()
+                    },
+                }
             )
-            if progress_callback is not None and len(losses) % progress_interval == 0:
-                window = losses[-progress_interval:]
-                progress_callback(
-                    {
-                        "epoch": float(epoch + 1),
-                        "pairs": float(len(losses)),
-                        "running_loss": sum(window) / len(window),
-                        "positive_labels": float(positive_labels),
-                    }
-                )
-        history.append(
-            {
-                "epoch": float(epoch + 1),
-                "loss": sum(losses) / len(losses),
-                "pairs": float(len(losses)),
-                "positive_labels": float(positive_labels),
-            }
-        )
+        history.append(epoch_metrics)
     matcher.eval()
     return matcher, history
 
@@ -954,13 +919,15 @@ def _clip01(value: float) -> float:
 
 def _partial_assignment_loss(
     logits: Any,
-    targets: tuple[int, ...],
+    positive_targets: tuple[tuple[int, ...], ...],
     *,
     candidate_indices: tuple[int, ...],
     torch: Any,
     device: str,
 ) -> Any:
-    supervised_rows = [index for index, target in enumerate(targets) if target >= 0]
+    supervised_rows = [
+        index for index, targets in enumerate(positive_targets) if targets
+    ]
     if not supervised_rows:
         raise ValueError("partial assignment has no supervised rows")
     if not candidate_indices:
@@ -969,23 +936,49 @@ def _partial_assignment_loss(
         index: position for position, index in enumerate(candidate_indices)
     }
     missing = [
-        targets[index]
+        target
         for index in supervised_rows
-        if targets[index] not in candidate_positions
+        for target in positive_targets[index]
+        if target not in candidate_positions
     ]
     if missing:
         raise ValueError("supervised targets must be actionable")
     row_indices = torch.tensor(supervised_rows, dtype=torch.long, device=device)
     column_indices = torch.tensor(candidate_indices, dtype=torch.long, device=device)
-    labels = torch.tensor(
-        [candidate_positions[targets[index]] for index in supervised_rows],
-        dtype=torch.long,
-        device=device,
+    selected_logits = logits[row_indices][:, column_indices]
+    log_probabilities = torch.log_softmax(selected_logits, dim=1)
+    losses = []
+    for row_position, row_index in enumerate(supervised_rows):
+        positive_positions = torch.tensor(
+            [
+                candidate_positions[target]
+                for target in positive_targets[row_index]
+            ],
+            dtype=torch.long,
+            device=device,
+        )
+        losses.append(
+            -torch.logsumexp(
+                log_probabilities[row_position, positive_positions],
+                dim=0,
+            )
+        )
+    return torch.stack(losses).mean()
+
+
+def _mean_loss_details(rows: list[dict[str, float]]) -> dict[str, float]:
+    keys = (
+        "assignment_loss",
+        "final_assignment_loss",
+        "intermediate_assignment_loss",
+        "cycle_loss",
+        "supervised_layers",
+        "context_masked_nodes",
     )
-    return torch.nn.functional.cross_entropy(
-        logits[row_indices][:, column_indices],
-        labels,
-    )
+    return {
+        key: sum(row[key] for row in rows) / max(len(rows), 1)
+        for key in keys
+    }
 
 
 def _actionable_indices(nodes: Iterable[UINode]) -> tuple[int, ...]:
