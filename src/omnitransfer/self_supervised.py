@@ -19,6 +19,7 @@ from omnitransfer.ui_graph import BBox, UIGraph, UINode, multi_anchor_context_gr
 
 
 FEATURE_DIM = NUMERIC_FEATURE_DIM
+DEFAULT_CONTEXT_MASK_PROBABILITY = 0.25
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,7 @@ class AugmentConfig:
     visual_brightness: float = 0.10
     visual_contrast: float = 0.12
     visual_channel_scale: float = 0.08
+    visual_dropout_prob: float = 0.50
     distractor_prob: float = 0.20
     max_distractors: int = 4
     shuffle_nodes: bool = True
@@ -71,7 +73,7 @@ class CorrespondencePair:
         return [list(values) for values in self.encoded_b.numeric_features]
 
 
-# Compatibility name for checkpoints and downstream code predating RCAM.
+# Compatibility name retained for existing checkpoints and downstream code.
 TrainingPair = CorrespondencePair
 
 
@@ -631,7 +633,7 @@ def train_relation_aware_matcher(
     augment_config: AugmentConfig | None = None,
     matcher_config: MatcherConfig | None = None,
     cycle_weight: float = 0.05,
-    context_mask_probability: float = 0.0,
+    context_mask_probability: float = DEFAULT_CONTEXT_MASK_PROBABILITY,
     progress_callback: Callable[[dict[str, float]], None] | None = None,
     progress_interval: int = 1000,
     validation_pairs: Iterable[CorrespondencePair] = (),
@@ -752,7 +754,9 @@ def train_relation_aware_matcher(
     return matcher, history
 
 
-# Compatibility name; both names resolve to the same optimizer implementation.
+# OmniTransfer has one optimizer implementation. The descriptive and older
+# public names remain aliases so existing experiment commands keep working.
+train_omnitransfer_matcher = train_relation_aware_matcher
 train_mapping_matcher = train_relation_aware_matcher
 
 
@@ -764,8 +768,14 @@ def _select_kept_nodes(
 ) -> list[UINode]:
     if not nodes:
         return []
-    kept = [node for node in nodes if rng.random() >= config.drop_node_prob]
-    minimum = min(max(1, config.min_nodes), len(nodes))
+    actionable = [node for node in nodes if _is_actionable(node)]
+    context = [
+        node
+        for node in nodes
+        if not _is_actionable(node) and rng.random() >= config.drop_node_prob
+    ]
+    kept = [*actionable, *context]
+    minimum = min(max(1, config.min_nodes, len(actionable)), len(nodes))
     if len(kept) < minimum:
         kept_ids = {node.node_id for node in kept}
         missing = [node for node in nodes if node.node_id not in kept_ids]
@@ -824,6 +834,8 @@ def _augment_node(
             **node.metadata,
             "augmented_view": view_id,
             "visual_bbox": node.metadata.get("visual_bbox") or node.bbox,
+            "visual_disabled": bool(node.metadata.get("visual_disabled"))
+            or rng.random() < config.visual_dropout_prob,
         },
     )
 

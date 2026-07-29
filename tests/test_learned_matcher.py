@@ -180,6 +180,27 @@ def test_mutual_log_assignment_normalizes_both_matching_directions() -> None:
     assert torch.isfinite(affinity.grad).all()
 
 
+def test_omnitransfer_defaults_to_mutual_assignment() -> None:
+    assert MatcherConfig().assignment_head == "mutual_projection"
+
+
+def test_omnitransfer_public_names_share_one_implementation() -> None:
+    from omnitransfer.learned_matcher import (
+        OmniTransferMatcher,
+        RelationAwareMatcher,
+        build_omnitransfer_matcher,
+        build_relation_aware_matcher,
+    )
+    from omnitransfer.self_supervised import (
+        train_omnitransfer_matcher,
+        train_relation_aware_matcher,
+    )
+
+    assert OmniTransferMatcher is RelationAwareMatcher
+    assert build_omnitransfer_matcher is build_relation_aware_matcher
+    assert train_omnitransfer_matcher is train_relation_aware_matcher
+
+
 def test_mutual_projection_reports_one_assignment_per_attention_layer() -> None:
     torch = pytest.importorskip("torch")
     config = MatcherConfig(
@@ -234,6 +255,35 @@ def test_context_masking_input_keeps_class_action_and_relations(tmp_path) -> Non
     assert masked[8][1].item() == 0.0
     assert plain[8][1].item() == 1.0
     assert torch.equal(masked[3], plain[3])
+
+
+def test_visual_modality_dropout_uses_missing_visual_path(tmp_path) -> None:
+    torch = pytest.importorskip("torch")
+    image_module = pytest.importorskip("PIL.Image")
+    screenshot = tmp_path / "screen.png"
+    image_module.new("RGB", (100, 100), color=(80, 120, 160)).save(screenshot)
+    base = _graph("visual-dropout")
+    graph = UIGraph(
+        **{
+            **base.__dict__,
+            "metadata": {"screenshot_path": str(screenshot)},
+        }
+    )
+
+    pair = make_training_pair(
+        graph,
+        rng=random.Random(13),
+        config=AugmentConfig(
+            drop_node_prob=0.0,
+            distractor_prob=0.0,
+            visual_dropout_prob=1.0,
+        ),
+    )
+
+    assert pair is not None
+    inputs = matcher_inputs(pair.graph_a, pair.graph_b)
+    assert torch.count_nonzero(inputs[8]) == 0
+    assert torch.count_nonzero(inputs[10]) == 0
 
 
 def test_inference_adapter_rejects_low_pair_confidence() -> None:

@@ -47,7 +47,7 @@ class MatcherConfig:
     visual_canvas_size: int = 384
     source_context_nodes: int = 48
     target_context_nodes: int = 64
-    assignment_head: str = "pair_mlp"
+    assignment_head: str = "mutual_projection"
 
 
 @dataclass(frozen=True)
@@ -454,6 +454,11 @@ def build_relation_aware_matcher(
     return RelationAwareCrossAttentionMatcher()
 
 
+# Canonical paper-facing builder. Keep the descriptive implementation name
+# checkpoint-compatible without exposing it as a second model.
+build_omnitransfer_matcher = build_relation_aware_matcher
+
+
 def matcher_inputs(
     source: UIGraph,
     target: UIGraph,
@@ -694,7 +699,8 @@ class RelationAwareMatcher:
         )
 
 
-# Compatibility name for callers and checkpoints predating the RCAM naming.
+# Canonical paper-facing adapter plus the older public compatibility name.
+OmniTransferMatcher = RelationAwareMatcher
 LearnedGraphMatcher = RelationAwareMatcher
 
 
@@ -783,6 +789,10 @@ def _visual_inputs(
     normalized_boxes: list[tuple[float, float, float, float]] = []
     available: list[float] = []
     for node in graph.nodes:
+        if bool(node.metadata.get("visual_disabled")):
+            normalized_boxes.append((-1.0, -1.0, -1.0, -1.0))
+            available.append(0.0)
+            continue
         visual_bbox = _visual_bbox(node)
         if visual_bbox is None or graph_width <= 0.0 or graph_height <= 0.0:
             normalized_boxes.append((-1.0, -1.0, -1.0, -1.0))

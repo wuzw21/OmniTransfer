@@ -1,6 +1,4 @@
-# Relation-Aware Cross-Attention Matcher
-
-We refer to the method as **RCAM**.
+# OmniTransfer
 
 ## Core Idea
 
@@ -40,7 +38,7 @@ loss, optimizer, and training history.
 
 ### Node Encoding
 
-For every node `i`, the model builds one 64-dimensional state by summing three
+For every node `i`, OmniTransfer builds one 64-dimensional state by summing three
 learned embeddings:
 
 ```text
@@ -86,14 +84,18 @@ target <- attend(target, source)
 
 The score for source node `i` and target node `j` is learned only from their
 contextual descriptors. A shared low-dimensional projection produces the dense
-affinity matrix; there is no direct cross-page geometry input:
+affinity matrix; there is no direct cross-page geometry input. Row and column
+normalization are averaged so that a pair must be competitive in both matching
+directions:
 
 ```text
-S_ij = <W_s h_i, W_t h_j> / sqrt(d)
+A_ij = <W h_i, W h_j> / sqrt(d)
+S_ij = 0.5 * (log_softmax_row(A)_ij + log_softmax_col(A)_ij)
 ```
 
 The default model uses hidden size 64, two layers, four heads, at least 48 source
-context slots and 64 target context slots, and 579,926 trainable parameters.
+context slots and 64 target context slots. The exact trainable parameter count
+is computed and stored with every checkpoint.
 If a page has more actionable nodes than the nominal context limit, every
 actionable node is retained so it remains an explicit candidate hard negative.
 
@@ -102,6 +104,17 @@ actionable node is retained so it remains an explicit candidate hard negative.
 Each epoch builds one shuffled stream containing both augmented-view pairs and
 cross-page pairs. Augmented views are generated lazily when sampled so the
 complete MobileViews training set does not need to be materialized in memory.
+Every actionable node is retained in both augmented views. Node dropout applies
+only to non-actionable context, so sibling buttons, rows, and menu items remain
+real in-screen hard negatives.
+
+The same-page augmentation masks text and descriptions, perturbs relations,
+drops non-actionable context, injects distractors, and hides visual crops for
+half of the nodes by default. In addition, 25% of supervised action nodes lose
+their own text, description, and crop inside the loss computation. The node
+must then be identified from class/action state and attention over the
+surrounding nodes. This is the direct training signal for anonymous clickable
+containers; it does not synthesize a parent label.
 
 For known correspondences, training minimizes one symmetric objective:
 
@@ -118,7 +131,7 @@ Non-actionable text and icon nodes remain attention context, while unannotated
 rows are ignored rather than treated as negative or NULL. Descendant labels are
 never lifted into synthetic actionable-container labels.
 
-The current core does not claim learned NULL rejection. A no-match objective is
+The current method does not claim learned NULL rejection. A no-match objective is
 added only when formal human-labeled NULL examples exist. Until then, formal
 matching results report positive Top-1 and Recall@K.
 
@@ -166,7 +179,7 @@ under large layout changes.
 The runtime target is less than 50 ms per page pair on one RTX 4090 after model
 warmup, with graph/input preparation and model time reported separately.
 
-## Current Smoke Result
+## Historical Implementation Smoke
 
 The deterministic two-pair implementation smoke uses four augmented-view pairs
 and two cross-page pairs in one optimizer loop. Two identical runs produce:

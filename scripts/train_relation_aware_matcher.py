@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train the Relation-Aware Cross-Attention Matcher."""
+"""Train the OmniTransfer node-correspondence matcher."""
 
 from __future__ import annotations
 
@@ -14,16 +14,17 @@ from omnitransfer.experiment_logging import (
     runtime_environment,
 )
 from omnitransfer.learned_matcher import (
-    RelationAwareMatcher,
     MatcherConfig,
+    OmniTransferMatcher,
     parameter_count,
     save_matcher_checkpoint,
 )
 from omnitransfer.mapping_training import load_ui_correspondence_pairs
 from omnitransfer.self_supervised import (
     AugmentConfig,
+    DEFAULT_CONTEXT_MASK_PROBABILITY,
     evaluate_correspondence_pairs,
-    train_relation_aware_matcher,
+    train_omnitransfer_matcher,
 )
 
 
@@ -58,7 +59,20 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--progress-interval", type=int, default=1000)
-    parser.add_argument("--context-mask-probability", type=float, default=0.0)
+    parser.add_argument(
+        "--context-mask-probability",
+        type=float,
+        default=DEFAULT_CONTEXT_MASK_PROBABILITY,
+    )
+    parser.add_argument(
+        "--visual-dropout-probability",
+        type=float,
+        default=AugmentConfig.visual_dropout_prob,
+        help=(
+            "Probability of hiding each node crop in an augmented view; "
+            "the XML/context path remains unchanged."
+        ),
+    )
     parser.add_argument("--metrics-log", type=Path)
     parser.add_argument("--minimum-correspondences", type=int, default=1)
     parser.add_argument("--max-pairs", type=int, default=0)
@@ -69,7 +83,7 @@ def main() -> None:
 
     pretrained_model = None
     if args.pretrained is not None:
-        pretrained = RelationAwareMatcher.from_checkpoint(
+        pretrained = OmniTransferMatcher.from_checkpoint(
             args.pretrained,
             device=args.device,
         )
@@ -93,7 +107,7 @@ def main() -> None:
             num_layers=args.num_layers,
             source_context_nodes=args.source_context_nodes,
             target_context_nodes=args.target_context_nodes,
-            assignment_head=args.assignment_head or "pair_mlp",
+            assignment_head=args.assignment_head or "mutual_projection",
         )
     pairs, graphs, adapter = load_ui_correspondence_pairs(
         args.input,
@@ -129,12 +143,16 @@ def main() -> None:
     if args.dry_run:
         return
 
-    augment = AugmentConfig()
+    if not 0.0 <= args.visual_dropout_probability <= 1.0:
+        raise SystemExit("--visual-dropout-probability must be in [0, 1]")
+    augment = AugmentConfig(
+        visual_dropout_prob=args.visual_dropout_probability,
+    )
     metrics_path = args.metrics_log or args.output.with_suffix(".metrics.jsonl")
     metric_log = TrainingMetricLog(metrics_path)
     metric_log.start(
         {
-            "architecture": "relation_aware_cross_attention_matcher",
+            "architecture": "omnitransfer",
             "objective": "layerwise_symmetric_mutual_assignment",
             "inputs": [
                 {
@@ -167,7 +185,7 @@ def main() -> None:
             flush=True,
         )
 
-    model, history = train_relation_aware_matcher(
+    model, history = train_omnitransfer_matcher(
         graphs,
         pairs,
         model=pretrained_model,
@@ -191,8 +209,8 @@ def main() -> None:
         matcher_config=config,
     )
     report = {
-        "schema_version": "omnitransfer.relation_aware_matcher_experiment.v1",
-        "architecture": "relation_aware_cross_attention_matcher",
+        "schema_version": "omnitransfer.matcher_experiment.v1",
+        "architecture": "omnitransfer",
         "objective": "layerwise_symmetric_mutual_assignment",
         "inputs": [str(path.resolve()) for path in args.input],
         "pretrained": str(args.pretrained.resolve()) if args.pretrained else None,

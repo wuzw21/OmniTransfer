@@ -1,8 +1,9 @@
 # Evaluation
 
-## Primary RCAM Dataset
+## Primary OmniTransfer Dataset
 
-RCAM is built from one mixed `omnitransfer.ui_correspondence_pair.v1` pool.
+OmniTransfer is built from one mixed `omnitransfer.ui_correspondence_pair.v1`
+pool.
 Dataset adapters run before splitting and never create dataset-specific model
 paths. The canonical splitter assigns page-connected components inside each
 App, so the same App may appear across train/dev/test while pair, page, and

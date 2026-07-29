@@ -144,8 +144,8 @@ to know which source element from the recorded screen should be relocated.
 ## Fixed Runtime Release
 
 Training experiments and replay-time deployment are intentionally separated.
-The research architecture is the Relation-Aware Cross-Attention Matcher (RCAM),
-described below. RCAM has not yet passed the frozen reviewed-gold promotion
+The research method is OmniTransfer's lightweight cross-attention matcher,
+described below. The new matcher has not yet passed the frozen reviewed-gold promotion
 gate, so it is not silently used by `action_transfer`.
 
 The current immutable replay-time release is:
@@ -170,7 +170,7 @@ rank-margin gate was selected on dev: coverage is 78.90% and selective accuracy
 is 85.00% when combined with the 0.5 pair-confidence gate. On the untouched
 test split, the same frozen gates give 80.09% coverage and 86.90% selective
 accuracy. These numbers belong only to this fixed legacy release; they are not
-RCAM results and they are not MobileViews generalization results.
+OmniTransfer results and they are not MobileViews generalization results.
 
 The release bundles both PyTorch and NumPy exports of the same weights.
 PyTorch is used when available and NumPy is the portable fallback. The runtime
@@ -183,11 +183,12 @@ mapping reproducible instead of relying on an ambiguous `mapping_mode` string.
 The legacy production checkpoint is inseparable from its training-time encoder:
 that encoder includes resource id, normalized geometry, and cross-screen
 geometry because those were present when the weights were learned. Loading the
-checkpoint through the newer RCAM encoder is forbidden even though both happen
-to produce 64D tensors. RCAM remains the proposed method: its separate
+checkpoint through the newer OmniTransfer encoder is forbidden even though both
+happen to produce 64D tensors. OmniTransfer remains the proposed method: its separate
 `rcam-node-context-v1` schema removes resource id and absolute node geometry.
 The fixed legacy schema exists only to make the deployed baseline reproducible,
-not to redefine the RCAM paper method.
+not to redefine the OmniTransfer paper method. The `rcam-...` string is retained
+only as a checkpoint compatibility identifier; it is not a second method name.
 
 `rank_probability` is not an attention weight. It is the softmax probability
 over target candidates after the model has produced pair affinities.
@@ -195,7 +196,7 @@ over target candidates after the model has produced pair affinities.
 used by the fail-closed gate. Internal attention weights are neither returned
 nor interpreted as calibrated confidence.
 
-A new RCAM checkpoint may replace this release only after its exact checkpoint,
+A new OmniTransfer checkpoint may replace this release only after its exact checkpoint,
 data manifest, code commit, reviewed-gold metrics, and warm latency have been
 frozen together. Transfer failure always returns to the caller's VLM fallback;
 the runtime never replays source coordinates on the target device.
@@ -401,9 +402,9 @@ Evaluate the frozen UI-correspondence split without changing adapters:
 PYTHONPATH=src:. python scripts/evaluate_relation_aware_matcher.py \
   --input runtime/datasets/unified_mapping/test.jsonl \
   --split test \
-  --checkpoint runtime/models/relation_aware_cross_attention_matcher_v1.pt \
+  --checkpoint runtime/models/omnitransfer_v1.pt \
   --device cuda \
-  --output runtime/reports/relation_aware_cross_attention_matcher_v1_test.json
+  --output runtime/reports/omnitransfer_v1_test.json
 ```
 
 Convert every source-target dataset to the same UI correspondence rows, then
@@ -422,7 +423,7 @@ PYTHONPATH=src python scripts/train_relation_aware_matcher.py \
   --context-mask-probability 0.35 \
   --epochs 3 \
   --device cuda \
-  --output runtime/models/relation_aware_cross_attention_matcher_v1.pt
+  --output runtime/models/omnitransfer_v1.pt
 ```
 
 Enforce the decoded-image RTX 4090 compute budget after model-only warmup; PNG

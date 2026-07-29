@@ -4,6 +4,7 @@ import pytest
 
 from omnitransfer.self_supervised import (
     AugmentConfig,
+    DEFAULT_CONTEXT_MASK_PROBABILITY,
     FEATURE_DIM,
     evaluate_correspondence_pairs,
     make_correspondence_training_pair,
@@ -229,6 +230,99 @@ def test_same_page_supervision_keeps_context_but_labels_only_actionable_nodes() 
         "title",
     }
     assert sum(target >= 0 for target in pair.targets_a_to_b) == 2
+
+
+def test_node_dropout_preserves_actionable_hard_negatives() -> None:
+    graph = graph_from_record(
+        {
+            "screen_id": "preserve-actionable",
+            "nodes": [
+                {"node_id": "root", "class": "Root"},
+                {
+                    "node_id": "first",
+                    "text": "First",
+                    "class": "Button",
+                    "clickable": True,
+                },
+                {
+                    "node_id": "second",
+                    "text": "Second",
+                    "class": "Button",
+                    "clickable": True,
+                },
+                {"node_id": "context-a", "text": "Context A", "class": "TextView"},
+                {"node_id": "context-b", "text": "Context B", "class": "TextView"},
+            ],
+        }
+    )
+
+    pair = make_training_pair(
+        graph,
+        rng=random.Random(5),
+        config=AugmentConfig(
+            drop_node_prob=1.0,
+            min_nodes=1,
+            distractor_prob=0.0,
+        ),
+    )
+
+    assert pair is not None
+    for view in (pair.graph_a, pair.graph_b):
+        assert {
+            node.origin_id for node in view.nodes if node.clickable
+        } == {"first", "second"}
+        assert not {
+            node.origin_id
+            for node in view.nodes
+            if node.origin_id.startswith("context-")
+        }
+
+
+def test_visual_dropout_marks_every_augmented_node_as_missing() -> None:
+    graph = graph_from_record(
+        {
+            "screen_id": "visual-dropout",
+            "nodes": [
+                {"node_id": "root", "class": "Root"},
+                {
+                    "node_id": "first",
+                    "text": "First",
+                    "class": "Button",
+                    "clickable": True,
+                },
+                {
+                    "node_id": "second",
+                    "text": "Second",
+                    "class": "Button",
+                    "clickable": True,
+                },
+            ],
+        }
+    )
+
+    pair = make_training_pair(
+        graph,
+        rng=random.Random(19),
+        config=AugmentConfig(
+            drop_node_prob=0.0,
+            distractor_prob=0.0,
+            visual_dropout_prob=1.0,
+        ),
+    )
+
+    assert pair is not None
+    assert all(node.metadata["visual_disabled"] for node in pair.graph_a.nodes)
+    assert all(node.metadata["visual_disabled"] for node in pair.graph_b.nodes)
+
+
+def test_omnitransfer_training_defaults_to_anchor_context_masking() -> None:
+    import inspect
+
+    parameter = inspect.signature(train_relation_aware_matcher).parameters[
+        "context_mask_probability"
+    ]
+    assert DEFAULT_CONTEXT_MASK_PROBABILITY == 0.25
+    assert parameter.default == DEFAULT_CONTEXT_MASK_PROBABILITY
 
 
 def test_matching_loss_ranks_only_actionable_target_candidates() -> None:
@@ -474,6 +568,7 @@ def test_mapping_training_mixes_augmented_and_cross_page_pairs() -> None:
         seed=29,
         matcher_config=config,
         augment_config=AugmentConfig(drop_node_prob=0.0, distractor_prob=0.0),
+        context_mask_probability=0.0,
     )
 
     assert history == [
