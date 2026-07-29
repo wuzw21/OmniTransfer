@@ -686,15 +686,21 @@ def test_unified_pool_is_split_within_app_without_page_leakage(
     audit_ui_correspondence_pairs(split_records)
 
 
+@pytest.mark.parametrize(
+    ("source_split", "source_label_status"),
+    [("diagnostic", "unreviewed"), ("train", "self_supervised")],
+)
 def test_mobileviews_pool_keeps_connected_pages_together_across_splits(
     tmp_path: Path,
+    source_split: str,
+    source_label_status: str,
 ) -> None:
     def record(index: int, source_page: str, target_page: str) -> dict:
         return {
             "schema_version": UI_CORRESPONDENCE_PAIR_SCHEMA,
             "pair_id": f"proposal-{index}",
-            "split": "diagnostic",
-            "label_status": "unreviewed",
+            "split": source_split,
+            "label_status": source_label_status,
             "source": {
                 "page_id": source_page,
                 "platform": "android",

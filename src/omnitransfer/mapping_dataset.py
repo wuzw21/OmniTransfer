@@ -1295,7 +1295,7 @@ def _stable_bucket(seed: int, value: str) -> int:
 
 
 def _is_mobileviews_self_supervised_proposal(record: dict[str, Any]) -> bool:
-    if record["label_status"] != "unreviewed":
+    if record["label_status"] not in {"unreviewed", "self_supervised"}:
         return False
     provenance = record["provenance"]
     dataset = str(provenance.get("dataset") or "").lower()
