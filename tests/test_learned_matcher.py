@@ -4,16 +4,15 @@ import random
 import pytest
 
 from omnitransfer.learned_matcher import (
-    NUMERIC_FEATURE_DIM,
-    RELATION_FEATURE_DIM,
     LearnedGraphMatcher,
     MatcherConfig,
+    NUMERIC_FEATURE_DIM,
+    RELATION_FEATURE_DIM,
     build_relation_aware_matcher,
     cross_relation_features,
     encode_graph,
     matcher_inputs,
     parameter_count,
-    propagate_local_affinity,
     save_matcher_checkpoint,
 )
 from omnitransfer.self_supervised import (
@@ -152,21 +151,6 @@ def test_relation_matcher_forward_and_partial_assignment_loss() -> None:
         len(pair.graph_b.nodes),
         len(pair.graph_a.nodes),
     )
-    expected_affinity = propagate_local_affinity(
-        output["base_affinity"],
-        output["source_relation_attention"],
-        output["target_relation_attention"],
-    )
-    assert torch.allclose(output["affinity"], expected_affinity)
-    assert torch.allclose(output["logits_ab"], expected_affinity)
-    assert torch.allclose(
-        torch.diagonal(output["source_relation_attention"]),
-        torch.zeros(len(pair.graph_a.nodes)),
-    )
-    assert torch.allclose(
-        output["source_relation_attention"].sum(dim=-1),
-        torch.ones(len(pair.graph_a.nodes)),
-    )
     assert math.isfinite(float(loss.detach()))
     loss.backward()
     assert any(parameter.grad is not None for parameter in model.parameters())
@@ -174,32 +158,6 @@ def test_relation_matcher_forward_and_partial_assignment_loss() -> None:
     assert any(
         isinstance(module, torch.nn.MultiheadAttention) for module in model.modules()
     )
-
-
-def test_local_affinity_propagation_transfers_child_evidence_to_parent_pair() -> None:
-    torch = pytest.importorskip("torch")
-    base_affinity = torch.tensor(
-        [
-            [0.0, 0.0],
-            [0.0, 4.0],
-        ]
-    )
-    source_relation_attention = torch.tensor(
-        [
-            [0.0, 1.0],
-            [0.0, 1.0],
-        ]
-    )
-    target_relation_attention = source_relation_attention.clone()
-
-    propagated = propagate_local_affinity(
-        base_affinity,
-        source_relation_attention,
-        target_relation_attention,
-    )
-
-    assert propagated[0, 0].item() == pytest.approx(4.0)
-    assert propagated[1, 1].item() == pytest.approx(8.0)
 
 
 def test_inference_adapter_rejects_low_pair_confidence() -> None:
@@ -368,30 +326,3 @@ def test_visual_checkpoint_round_trip(tmp_path) -> None:
 
     assert restored.config == config
     assert parameter_count(restored.model) == parameter_count(model)
-
-
-def test_v2_checkpoint_keeps_legacy_non_propagating_behavior(tmp_path) -> None:
-    torch = pytest.importorskip("torch")
-    config = MatcherConfig(
-        hidden_dim=32,
-        num_heads=4,
-        num_layers=1,
-        dropout=0.0,
-        local_affinity_propagation=False,
-    )
-    model = build_relation_aware_matcher(config)
-    checkpoint = tmp_path / "legacy-v2.pt"
-    legacy_config = dict(config.__dict__)
-    legacy_config.pop("local_affinity_propagation")
-    torch.save(
-        {
-            "schema_version": "omnitransfer_relation_matcher_v2",
-            "matcher_config": legacy_config,
-            "state_dict": model.state_dict(),
-        },
-        checkpoint,
-    )
-
-    restored = LearnedGraphMatcher.from_checkpoint(checkpoint)
-
-    assert restored.config.local_affinity_propagation is False

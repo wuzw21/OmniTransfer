@@ -15,10 +15,7 @@ from omnitransfer.mapping_dataset import (
     MAPPING_PAGE_PAIR_SCHEMA,
     validate_mapping_page_pair,
 )
-from omnitransfer.mobileviews import (
-    attach_mobileviews_image,
-    graph_from_mobileviews_record,
-)
+from omnitransfer.mobileviews import attach_mobileviews_image, graph_from_mobileviews_record
 from omnitransfer.ui_graph import UIGraph, UINode, graph_to_record
 
 
@@ -38,7 +35,6 @@ def build_mobileviews_trace_pair_pilot(
     *,
     pair_limit: int = 20,
     minimum_matches: int = 2,
-    candidate_pairs_per_structure: int = 0,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Build deterministic, unreviewed page-pair proposals from one trace.
 
@@ -52,36 +48,17 @@ def build_mobileviews_trace_pair_pilot(
         raise ValueError("pair_limit must be positive")
     if minimum_matches <= 0:
         raise ValueError("minimum_matches must be positive")
-    if candidate_pairs_per_structure < 0:
-        raise ValueError("candidate_pairs_per_structure must be non-negative")
     states = load_mobileviews_trace_states(root)
     groups: dict[str, list[MobileViewsTraceState]] = defaultdict(list)
     for state in states:
         groups[state.structure_str].append(state)
 
-    candidates: list[
-        tuple[tuple[float, int, str, str], dict[str, Any], dict[str, Any]]
-    ] = []
+    candidates: list[tuple[tuple[float, int, str, str], dict[str, Any], dict[str, Any]]] = []
     rejected = Counter()
     for structure_str, group in sorted(groups.items()):
         if len(group) < 2:
             continue
-        state_pairs = list(
-            itertools.combinations(sorted(group, key=lambda item: item.state_id), 2)
-        )
-        if (
-            candidate_pairs_per_structure
-            and len(state_pairs) > candidate_pairs_per_structure
-        ):
-            state_pairs = sorted(
-                state_pairs,
-                key=lambda pair: _state_pair_sample_key(
-                    structure_str,
-                    pair[0].state_id,
-                    pair[1].state_id,
-                ),
-            )[:candidate_pairs_per_structure]
-        for source, target in state_pairs:
+        for source, target in itertools.combinations(sorted(group, key=lambda item: item.state_id), 2):
             try:
                 record, stats = _build_pair(root, source, target)
             except ValueError as exc:
@@ -118,7 +95,6 @@ def build_mobileviews_trace_pair_pilot(
         "repeated_structure_groups": sum(len(group) > 1 for group in groups.values()),
         "candidate_pairs": len(candidates),
         "selected_pairs": len(records),
-        "candidate_pairs_per_structure": candidate_pairs_per_structure,
         "match_rows": sum(item["match_rows"] for item in stats),
         "single_target_rows": sum(item["single_target_rows"] for item in stats),
         "set_valued_rows": sum(item["set_valued_rows"] for item in stats),
@@ -129,102 +105,11 @@ def build_mobileviews_trace_pair_pilot(
             "split": "diagnostic",
             "page_retrieval_signal": "structure_str",
             "node_proposal_signal": "view_str",
-            "matcher_inputs_must_exclude": [
-                "structure_str",
-                "state_str",
-                "view_str",
-                "origin_id",
-            ],
+            "matcher_inputs_must_exclude": ["structure_str", "state_str", "view_str", "origin_id"],
             "null_labels": "not_proposed_without_human_review",
         },
     }
     return records, manifest
-
-
-def build_mobileviews_sequence_pair_pilot(
-    trace_dir: str | Path,
-    *,
-    pair_limit: int = 50,
-    minimum_matches: int = 2,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Build conservative pairs from non-trivial complete-trace transitions."""
-
-    root = Path(trace_dir).expanduser().resolve()
-    if pair_limit <= 0:
-        raise ValueError("pair_limit must be positive")
-    if minimum_matches <= 0:
-        raise ValueError("minimum_matches must be positive")
-    states = load_mobileviews_trace_states(root)
-    by_state_str: dict[str, MobileViewsTraceState] = {}
-    for state in sorted(states, key=lambda item: item.state_id):
-        by_state_str.setdefault(state.state_str, state)
-    actions_path = root / "actions.csv"
-    if not actions_path.is_file():
-        return [], {"transitions": 0, "candidate_pairs": 0, "selected_pairs": 0}
-    transitions: dict[tuple[str, str], str] = {}
-    with actions_path.open(newline="", encoding="utf-8-sig") as handle:
-        for row in csv.DictReader(handle):
-            source_state = str(row.get("from_state") or "").strip()
-            target_state = str(row.get("to_state") or "").strip()
-            if (
-                not source_state
-                or not target_state
-                or source_state == target_state
-                or source_state not in by_state_str
-                or target_state not in by_state_str
-            ):
-                continue
-            transitions.setdefault(
-                (source_state, target_state),
-                str(row.get("action") or "").strip(),
-            )
-    candidates: list[
-        tuple[tuple[float, int, str, str], dict[str, Any], dict[str, Any]]
-    ] = []
-    rejected = Counter()
-    for (source_state, target_state), action in sorted(transitions.items()):
-        source = by_state_str[source_state]
-        target = by_state_str[target_state]
-        try:
-            record, stats = _build_pair(root, source, target)
-        except ValueError as exc:
-            rejected[
-                "no_correspondence_proposals"
-                if "no conservative correspondence proposals" in str(exc)
-                else "invalid_state"
-            ] += 1
-            continue
-        except (OSError, json.JSONDecodeError):
-            rejected["invalid_state"] += 1
-            continue
-        if stats["match_rows"] < minimum_matches:
-            rejected["too_few_matches"] += 1
-            continue
-        record["provenance"]["annotation"] = "automatic_sequence_view_str_proposal"
-        record["provenance"]["sequence_action"] = action
-        record["slices"]["track"] = "trace_state_transition"
-        score = (
-            float(stats["changed_semantic_fraction"]),
-            int(stats["match_rows"]),
-            source.state_id,
-            target.state_id,
-        )
-        candidates.append((score, record, stats))
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    selected = candidates[:pair_limit]
-    records = [item[1] for item in selected]
-    stats = [item[2] for item in selected]
-    return records, {
-        "schema_version": "omnitransfer.mobileviews_sequence_pair_pilot.v1",
-        "trace_dir": str(root),
-        "states": len(states),
-        "transitions": len(transitions),
-        "candidate_pairs": len(candidates),
-        "selected_pairs": len(records),
-        "match_rows": sum(item["match_rows"] for item in stats),
-        "rejected": dict(sorted(rejected.items())),
-        "label_boundary": "unreviewed_sequence_transition_proposal",
-    }
 
 
 def load_mobileviews_trace_states(trace_dir: str | Path) -> list[MobileViewsTraceState]:
@@ -233,7 +118,7 @@ def load_mobileviews_trace_states(trace_dir: str | Path) -> list[MobileViewsTrac
     root = Path(trace_dir).expanduser().resolve()
     mapping_path = root / "screenshot_state_mapping.csv"
     if not mapping_path.is_file():
-        return _load_mobileviews_native_trace_states(root)
+        raise FileNotFoundError(mapping_path)
     states: list[MobileViewsTraceState] = []
     with mapping_path.open(newline="", encoding="utf-8-sig") as handle:
         for row in csv.DictReader(handle):
@@ -252,32 +137,6 @@ def load_mobileviews_trace_states(trace_dir: str | Path) -> list[MobileViewsTrac
                     json_path=state_json,
                 )
             )
-    return states
-
-
-def _load_mobileviews_native_trace_states(root: Path) -> list[MobileViewsTraceState]:
-    states: list[MobileViewsTraceState] = []
-    for state_json in sorted((root / "states").glob("state_*.json")):
-        state_id = state_json.stem.removeprefix("state_")
-        screenshot = state_json.with_name(f"screen_{state_id}.jpg")
-        if not screenshot.is_file():
-            continue
-        payload = json.loads(state_json.read_text(encoding="utf-8"))
-        structure_str = str(
-            payload.get("state_str_content_free") or payload.get("structure_str") or ""
-        ).strip()
-        state_str = str(payload.get("state_str") or "").strip()
-        if not state_id or not structure_str:
-            continue
-        states.append(
-            MobileViewsTraceState(
-                state_id=state_id,
-                state_str=state_str,
-                structure_str=structure_str,
-                screenshot_path=screenshot,
-                json_path=state_json,
-            )
-        )
     return states
 
 
@@ -345,12 +204,7 @@ def _build_pair(
                 "source_state_str": source.state_str,
                 "target_state_str": target.state_str,
                 "structure_str": source.structure_str,
-                "label_only_fields": [
-                    "structure_str",
-                    "state_str",
-                    "view_str",
-                    "origin_id",
-                ],
+                "label_only_fields": ["structure_str", "state_str", "view_str", "origin_id"],
             },
             "slices": {
                 "platform": "android",
@@ -379,8 +233,7 @@ def _build_pair(
         "single_target_rows": sum(count == 1 for count in target_counts),
         "set_valued_rows": sum(count > 1 for count in target_counts),
         "target_links": sum(target_counts),
-        "changed_semantic_fraction": 1.0
-        - (len(semantic_source & semantic_target) / max(1, len(union))),
+        "changed_semantic_fraction": 1.0 - (len(semantic_source & semantic_target) / max(1, len(union))),
     }
     return record, stats
 
@@ -405,9 +258,7 @@ def _labelled_graph(
             if view.get("parent") in (None, -1, "-1")
             else f"state-{state.state_id}-node-{view['parent']}"
         )
-        view["origin_id"] = (
-            f"mobileviews:{view_str or 'missing'}:{occurrence[view_str]}"
-        )
+        view["origin_id"] = f"mobileviews:{view_str or 'missing'}:{occurrence[view_str]}"
         enriched_views.append(view)
         label_by_raw_id[view["node_id"]] = {
             "view_str": view_str,
@@ -453,12 +304,15 @@ def _labelled_graph(
 def _eligible_anchor(view: dict[str, Any]) -> bool:
     if view.get("visible") is False or not str(view.get("view_str") or "").strip():
         return False
+    semantic = any(
+        str(view.get(key) or "").strip()
+        for key in ("text", "content_description", "resource_id")
+    )
     return bool(
-        view.get("clickable")
+        semantic
+        or view.get("clickable")
         or view.get("editable")
         or view.get("scrollable")
-        or view.get("checkable")
-        or view.get("long_clickable")
     )
 
 
@@ -479,14 +333,3 @@ def _pair_id(trace_name: str, source_state: str, target_state: str) -> str:
         f"{trace_name}\0{source_state}\0{target_state}".encode(), digest_size=10
     ).hexdigest()
     return f"mobileviews-trace-pair-{digest}"
-
-
-def _state_pair_sample_key(
-    structure_str: str,
-    source_state: str,
-    target_state: str,
-) -> str:
-    return hashlib.blake2b(
-        f"{structure_str}\0{source_state}\0{target_state}".encode(),
-        digest_size=12,
-    ).hexdigest()

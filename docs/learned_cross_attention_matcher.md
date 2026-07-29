@@ -10,9 +10,8 @@ a selector or hand-written matching formula.
 The paper-facing statement is:
 
 > Given two UI graphs, OmniTransfer jointly encodes node semantics, appearance,
-> and within-page relative structure, predicts a dense source-target
-> correspondence matrix, and explicitly propagates matched-neighbor evidence
-> back to each actionable candidate pair.
+> and within-page relative structure, exchanges information with bidirectional
+> cross-attention, and predicts a dense source-target correspondence matrix.
 
 There is one matcher, one forward path, and one training objective.
 
@@ -67,7 +66,7 @@ relative position / relative size / IoU / tree distance
 A relation MLP produces an attention bias rather than a fixed similarity score:
 
 ```text
-P_ik = softmax(q_i k_k / sqrt(d) + MLP_relation(r_ik))
+A_ik = softmax(q_i k_k / sqrt(d) + MLP_relation(r_ik))
 ```
 
 This is how the model learns local relationships without observing a node's
@@ -83,28 +82,12 @@ source <- attend(source, target)
 target <- attend(target, source)
 ```
 
-The model first predicts a dense base affinity matrix from contextual node
-descriptors. There is no direct cross-page geometry input:
+The score for source node `i` and target node `j` is learned only from their
+contextual descriptors. There is no direct cross-page geometry input:
 
 ```text
-A0_ij = MLP([h_i, h_j, |h_i-h_j|, h_i*h_j])
+S_ij = MLP([h_i, h_j, |h_i-h_j|, h_i*h_j])
 ```
-
-The final score performs one explicit local correspondence propagation:
-
-```text
-S = A0 + P_source A0 P_target^T
-```
-
-`P_source` and `P_target` are the learned within-page relation-attention
-matrices with the diagonal removed and each remaining row renormalized. The
-support term therefore comes from other nodes rather than duplicating a node's
-own base score. Consequently, a strong text-node or icon-node correspondence
-directly supports the pair of actionable containers that attend to those
-nodes. Unlike independent descriptor pooling, the local evidence is propagated
-in affinity space and therefore retains which source evidence matched which
-target evidence. All selected nodes participate in this computation; only
-actionable rows and columns are supervised and returned as interaction targets.
 
 The default model uses hidden size 64, two layers, four heads, at least 48 source
 context slots and 64 target context slots, and 579,926 trainable parameters.

@@ -4,10 +4,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from omnitransfer.mobileviews_trace_pairs import (
-    build_mobileviews_sequence_pair_pilot,
-    build_mobileviews_trace_pair_pilot,
-)
+from omnitransfer.mobileviews_trace_pairs import build_mobileviews_trace_pair_pilot
 
 
 def _state(path: Path, state_id: str, text: str) -> None:
@@ -38,7 +35,6 @@ def _state(path: Path, state_id: str, text: str) -> None:
             "bounds": [[0, 60], [50, 100]],
             "class": "android.widget.TextView",
             "text": text,
-            "clickable": True,
             "view_str": "row",
         },
         {
@@ -48,7 +44,6 @@ def _state(path: Path, state_id: str, text: str) -> None:
             "bounds": [[0, 110], [50, 150]],
             "class": "android.widget.TextView",
             "text": text,
-            "clickable": True,
             "view_str": "row",
         },
     ]
@@ -63,18 +58,10 @@ def test_mobileviews_trace_pair_is_unreviewed_and_set_valued(tmp_path: Path) -> 
     states.mkdir()
     _state(states, "1", "Alpha")
     _state(states, "2", "Beta")
-    with (tmp_path / "screenshot_state_mapping.csv").open(
-        "w", newline="", encoding="utf-8"
-    ) as handle:
+    with (tmp_path / "screenshot_state_mapping.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=[
-                "screen_id",
-                "state_str",
-                "structure_str",
-                "vh_json_id",
-                "vh_xml_id",
-            ],
+            fieldnames=["screen_id", "state_str", "structure_str", "vh_json_id", "vh_xml_id"],
         )
         writer.writeheader()
         for state_id in ("1", "2"):
@@ -91,42 +78,11 @@ def test_mobileviews_trace_pair_is_unreviewed_and_set_valued(tmp_path: Path) -> 
     records, manifest = build_mobileviews_trace_pair_pilot(tmp_path, pair_limit=10)
 
     assert manifest["selected_pairs"] == 1
-    assert manifest["candidate_pairs_per_structure"] == 0
     assert manifest["set_valued_rows"] == 2
     assert len(records) == 1
     record = records[0]
     assert record["split"] == "diagnostic"
     assert record["label_status"] == "unreviewed"
     assert record["provenance"]["annotation"] == "automatic_same_view_str_proposal"
-    row_matches = [
-        match for match in record["matches"] if len(match["target_node_ids"]) == 2
-    ]
+    row_matches = [match for match in record["matches"] if len(match["target_node_ids"]) == 2]
     assert len(row_matches) == 2
-
-
-def test_mobileviews_sequence_pair_uses_nontrivial_action_transition(
-    tmp_path: Path,
-) -> None:
-    states = tmp_path / "states"
-    states.mkdir()
-    _state(states, "1", "Alpha")
-    _state(states, "2", "Beta")
-    for state_id, state_str in (("1", "s1"), ("2", "s2")):
-        payload = json.loads((states / f"state_{state_id}.json").read_text())
-        payload["state_str"] = state_str
-        payload["state_str_content_free"] = "same-layout"
-        (states / f"state_{state_id}.json").write_text(json.dumps(payload))
-    (tmp_path / "actions.csv").write_text(
-        "from_state,to_state,action\ns1,s2,click\ns2,s2,no-op\n",
-        encoding="utf-8",
-    )
-
-    records, manifest = build_mobileviews_sequence_pair_pilot(tmp_path)
-
-    assert manifest["transitions"] == 1
-    assert manifest["selected_pairs"] == 1
-    assert records[0]["provenance"]["annotation"] == (
-        "automatic_sequence_view_str_proposal"
-    )
-    assert records[0]["provenance"]["sequence_action"] == "click"
-    assert records[0]["slices"]["track"] == "trace_state_transition"
