@@ -68,9 +68,42 @@ Its untouched human-gold test result is Top-1 `70.73%`, Recall@3 `87.12%`,
 Recall@5 `91.39%`, and recorded p95 latency `55.68 ms`. This is the honest
 relation-matcher baseline. The new OmniTransfer matcher must be trained from
 the same declared human-gold train split and selected on the same dev split
-before any claim that it improves this result. MobileViews may supply
-augmentation evidence, but it cannot redefine, contaminate, or dominate the
-human-gold metric.
+before any claim that it improves this result. MobileViews is excluded from
+the primary training, selection, and evaluation protocol.
+
+## ASE-Only Unified Dataset
+
+The new primary dataset removes MobileViews entirely while retaining the one
+UI-correspondence schema and trainer:
+
+```text
+/home/wuzewen/omnitransfer_eval_20260620/runs/
+omnitransfer_ase_human_gold_only_20260729_v1
+```
+
+| Split | Page pairs | Human-gold mappings | SHA-256 |
+|---|---:|---:|---|
+| train | 639 | 4,092 | `53f67e01b1c33046697e5012f50e633d82f1dff1e085e8ecf73260a937eb174e` |
+| dev | 173 | 1,014 | `82b9b4f15742eec034b587b39a34eeb8b2b5e0c50bf706781e5addbaae0c304a` |
+| test | 240 | 1,592 | `7a629d112ae83723259fe7c2881bb63ae4a432197e9687adbdde45862e9b6113` |
+
+All 1,052 records have `label_status=gold` and provenance
+`ase2023_vision_based_widget_mapping`. The audit reports zero pair, page, and
+partition-key overlap. The serialized splits contain zero MobileViews rows and
+preserve the original App-disjoint source declarations. Grouping duplicate
+source mappings into set-valued rows explains why the canonical train mapping
+count is 4,092 while the original query view contains 4,124 rows.
+
+```text
+source queries SHA-256:
+  cb940b5abb8d027cee0cfc7b402e56aacbbf107c019cb5840f59e17c69afc39e
+manifest SHA-256:
+  083593b24aa8ed3436ed32bcdb67a41957760975e3d794b54823c251b01c5839
+schema:
+  omnitransfer.ui_correspondence_pair.v1
+split protocol:
+  preserve_source_declarations
+```
 
 ## Environment
 

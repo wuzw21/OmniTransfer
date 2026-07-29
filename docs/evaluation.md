@@ -2,27 +2,26 @@
 
 ## Primary OmniTransfer Dataset
 
-OmniTransfer is built from one mixed `omnitransfer.ui_correspondence_pair.v1`
-pool.
-Dataset adapters run before splitting and never create dataset-specific model
-paths. The canonical splitter assigns page-connected components inside each
-App, so the same App may appear across train/dev/test while pair, page, and
-component overlap remains zero. Page-disjoint MobileViews proposals may occupy
-dev/test with `label_status=self_supervised`; those splits support fast
-development comparisons but are not formal metrics. Formal paper metrics use
-only reviewed or original `label_status=gold` records.
+The primary experiment uses only the ASE 2023 human-gold iOS-to-Android
+mappings, normalized to `omnitransfer.ui_correspondence_pair.v1`. The original
+App-disjoint train/dev/test declarations are preserved. MobileViews automatic
+labels are excluded from primary training, checkpoint selection, and
+evaluation.
 
 ```bash
 PYTHONPATH=src python scripts/build_ui_correspondence_dataset.py \
-  --correspondence-pairs runtime/datasets/mobileviews/pairs.jsonl \
-  --output-dir runtime/datasets/unified_mapping
+  --ase-queries runtime/evals/vision_widget_mapping/clean_relative_xml_v1/queries.jsonl \
+  --ase-assets-root . \
+  --preserve-declared-splits \
+  --output-dir runtime/datasets/ase_human_gold
 ```
 
-The primary result measures transfer to unseen pages, states, layouts, and
-devices inside known Apps. App-disjoint evaluation is reported separately as a
-harder generalization slice.
+The canonical grouped output contains 639/173/240 page pairs and
+4,092/1,014/1,592 correspondence rows for train/dev/test. The query counts
+remain 4,124/1,014/1,592 before duplicate source mappings are grouped into
+set-valued training rows.
 
-## Legacy ASE Cross-Platform Baseline
+## ASE Source and Cleaning
 
 Use the public `RuihuaJi/vision-based-widget-mapping` dataset only after binding
 the public boxes to real XML nodes and converting the screen hierarchies to the

@@ -220,7 +220,12 @@ python -m py_compile \
 PYTHONPATH=src python -m pytest tests/test_schema.py tests/test_outline_imports.py
 ```
 
-## Self-Supervised UI Graph Pretraining
+## Archived Self-Supervised UI Graph Diagnostic
+
+MobileViews is not part of the primary OmniTransfer training, checkpoint
+selection, or formal evaluation protocol. The commands below are retained only
+to reproduce the historical self-supervised diagnostic. The paper-facing
+experiment uses the preserved ASE human-gold train/dev/test declarations.
 
 For MobileViews/RICO-style unlabeled UI hierarchies, OmniTransfer can construct
 training pairs without manual source-target widget labels:

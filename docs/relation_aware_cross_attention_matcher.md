@@ -23,12 +23,13 @@ Every training example has the same representation:
 CorrespondencePair(source_graph, target_graph, correspondences)
 ```
 
-The pair can come from either of two sources:
+The pair can come from either of two transformations of the human-gold ASE
+training split:
 
-1. **Augmented-view pair.** Two views are generated from one MobileViews page.
-   Known transformation identity constructs the correspondence labels.
-2. **Cross-page pair.** Two MobileViews pages provide multiple aligned nodes
-   under a real layout or device change.
+1. **Augmented-view pair.** Two views are generated from one ASE training page.
+   Known transformation identity constructs auxiliary correspondence labels.
+2. **Cross-page pair.** The human annotation supplies multiple iOS-to-Android
+   aligned nodes under a real platform and layout change.
 
 The origin or stable node identity is used only to construct offline labels. It
 is never passed to the matcher. Both pair sources use the same tensors, matcher,
@@ -99,8 +100,9 @@ actionable node is retained so it remains an explicit candidate hard negative.
 ## Unified Training
 
 Each epoch builds one shuffled stream containing both augmented-view pairs and
-cross-page pairs. Augmented views are generated lazily when sampled so the
-complete MobileViews training set does not need to be materialized in memory.
+cross-page pairs from the declared ASE training split. Augmented views are
+generated lazily when sampled so they do not create another serialized
+dataset.
 Every actionable node is retained in both augmented views. Node dropout applies
 only to non-actionable context, so sibling buttons, rows, and menu items remain
 real in-screen hard negatives.
@@ -138,25 +140,16 @@ matching results report positive Top-1 and Recall@K.
 
 ## Data Boundary
 
-All admissible action-target sources are first normalized into one
-`omnitransfer.ui_correspondence_pair.v1` pool. MobileViews is the primary data
-source; a second dataset may join the same pool only through this schema and the
-same action-target contract. Dataset identity never selects another encoder,
-loss, trainer, or inference path. GUIOdyssey is excluded.
+Every record uses `omnitransfer.ui_correspondence_pair.v1`, but the primary
+experiment contains only the clean ASE 2023 human-gold mappings. Its original
+App-disjoint declarations are preserved: 4,124 train, 1,014 dev, and 1,592
+test mappings. Exact pair, page, partition, and App leakage across these splits
+is forbidden.
 
-The pool is then split inside each App by page-connected components. The same
-App is intentionally represented in train, dev, and test whenever it has enough
-independent components, while exact pair, page, and component identities have
-zero overlap. This makes the primary question new-state and new-layout transfer
-inside known Apps. An App-disjoint partition is reported separately as a harder
-generalization slice.
-
-MobileViews self-supervised proposals enter their page-disjoint assigned split,
-including dev and test, while retaining `label_status=self_supervised`. These
-held-out rows provide scalable development metrics but never reviewed-gold
-claims. Other non-gold records remain diagnostic review candidates; formal
-paper metrics contain reviewed or original gold only. Ambiguous one-to-many
-labels are represented as set-valued targets rather than forced into a false
+MobileViews automatic correspondences are excluded from primary training,
+checkpoint selection, and evaluation. Existing MobileViews artifacts remain
+only as historical self-supervised diagnostics. Ambiguous human-equivalent
+targets are represented as set-valued labels rather than forced into a false
 one-to-one mapping.
 
 ## Evaluation
