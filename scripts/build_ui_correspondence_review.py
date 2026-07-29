@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a static HTML reviewer for unified mapping page-pair JSONL files."""
+"""Build a static HTML reviewer for UI correspondence pairs."""
 
 from __future__ import annotations
 

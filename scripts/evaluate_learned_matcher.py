@@ -16,7 +16,7 @@ from omnitransfer.benchmark import (
     predict_queries,
 )
 from omnitransfer.importers import load_queries
-from omnitransfer.learned_matcher import LearnedGraphMatcher, parameter_count
+from omnitransfer.learned_matcher import RelationAwareMatcher, parameter_count
 
 
 def main() -> None:
@@ -41,7 +41,7 @@ def main() -> None:
     eval_queries = splits[args.eval_split][: args.limit_eval or None]
     if not eval_queries:
         raise SystemExit(f"App/group split produced an empty {args.eval_split} partition.")
-    matcher = LearnedGraphMatcher.from_checkpoint(
+    matcher = RelationAwareMatcher.from_checkpoint(
         args.checkpoint,
         device=args.device,
     )

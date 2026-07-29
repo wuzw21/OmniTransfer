@@ -12,8 +12,8 @@ from pathlib import Path
 from typing import Any
 
 from omnitransfer.mapping_dataset import (
-    MAPPING_PAGE_PAIR_SCHEMA,
-    validate_mapping_page_pair,
+    UI_CORRESPONDENCE_PAIR_SCHEMA,
+    validate_ui_correspondence_pair,
 )
 from omnitransfer.mobileviews import attach_mobileviews_image, graph_from_mobileviews_record
 from omnitransfer.ui_graph import UIGraph, UINode, graph_to_record
@@ -177,9 +177,9 @@ def _build_pair(
     source_record["graph_id"] = source_page_id
     target_record["graph_id"] = target_page_id
     pair_id = _pair_id(trace_name, source.state_id, target.state_id)
-    record = validate_mapping_page_pair(
+    record = validate_ui_correspondence_pair(
         {
-            "schema_version": MAPPING_PAGE_PAIR_SCHEMA,
+            "schema_version": UI_CORRESPONDENCE_PAIR_SCHEMA,
             "pair_id": pair_id,
             "split": "diagnostic",
             "label_status": "unreviewed",

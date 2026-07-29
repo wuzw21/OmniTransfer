@@ -4,20 +4,20 @@ from pathlib import Path
 import pytest
 
 from omnitransfer.mapping_dataset import (
-    MAPPING_PAGE_PAIR_SCHEMA,
+    UI_CORRESPONDENCE_PAIR_SCHEMA,
     adapt_ase_queries,
     adapt_gui_odyssey_human_reviews,
     adapt_gui_odyssey_rows,
-    audit_mapping_page_pairs,
-    validate_mapping_page_pair,
-    write_mapping_dataset,
+    audit_ui_correspondence_pairs,
+    validate_ui_correspondence_pair,
+    write_ui_correspondence_dataset,
 )
 from omnitransfer.schema import Candidate, Query
 
 
-def test_page_pair_schema_accepts_multiple_matches_for_train_and_test() -> None:
+def test_ui_correspondence_schema_accepts_multiple_matches_for_train_and_test() -> None:
     base = {
-        "schema_version": MAPPING_PAGE_PAIR_SCHEMA,
+        "schema_version": UI_CORRESPONDENCE_PAIR_SCHEMA,
         "pair_id": "pair-1",
         "label_status": "gold",
         "source": {
@@ -66,15 +66,56 @@ def test_page_pair_schema_accepts_multiple_matches_for_train_and_test() -> None:
         "slices": {"form_factor": "phone"},
     }
 
-    train = validate_mapping_page_pair({**base, "split": "train"})
-    test = validate_mapping_page_pair({**base, "split": "test"})
+    train = validate_ui_correspondence_pair({**base, "split": "train"})
+    test = validate_ui_correspondence_pair({**base, "split": "test"})
 
     assert train.keys() == test.keys()
     assert len(train["matches"]) == 2
     assert train["matches"][0]["target_node_ids"] == ["target-a", "target-b"]
 
 
-def test_ase_queries_are_grouped_into_one_multi_match_page_pair() -> None:
+def test_legacy_schema_is_read_but_normalized_to_ui_correspondence() -> None:
+    record = {
+        "schema_version": "omnitransfer.mapping_page_pair.v1",
+        "pair_id": "legacy-pair",
+        "split": "train",
+        "label_status": "gold",
+        "source": {
+            "page_id": "source",
+            "platform": "ios",
+            "screenshot_path": "",
+            "graph": {
+                "graph_id": "source",
+                "nodes": [{"node_id": "s", "origin_id": "s"}],
+            },
+        },
+        "target": {
+            "page_id": "target",
+            "platform": "android",
+            "screenshot_path": "",
+            "graph": {
+                "graph_id": "target",
+                "nodes": [{"node_id": "t", "origin_id": "t"}],
+            },
+        },
+        "matches": [
+            {
+                "source_node_id": "s",
+                "target_node_ids": ["t"],
+                "label": "correspondence",
+            }
+        ],
+        "partition_keys": ["legacy:app"],
+        "provenance": {"dataset": "legacy"},
+        "slices": {},
+    }
+
+    normalized = validate_ui_correspondence_pair(record)
+
+    assert normalized["schema_version"] == UI_CORRESPONDENCE_PAIR_SCHEMA
+
+
+def test_ase_queries_are_grouped_into_one_multi_match_ui_correspondence() -> None:
     common_metadata = {
         "app": "Example",
         "source_screen": "Example/iOS/0",
@@ -273,7 +314,7 @@ def test_gui_odyssey_weak_pair_uses_the_same_page_pair_schema(tmp_path: Path) ->
     assert manifest["accepted_pairs"] == 1
     assert len(records) == 1
     record = records[0]
-    assert record["schema_version"] == MAPPING_PAGE_PAIR_SCHEMA
+    assert record["schema_version"] == UI_CORRESPONDENCE_PAIR_SCHEMA
     assert record["label_status"] == "weak"
     assert record["matches"] == [
         {
@@ -293,7 +334,7 @@ def test_gui_odyssey_weak_pair_uses_the_same_page_pair_schema(tmp_path: Path) ->
 def test_dataset_audit_rejects_partition_leakage() -> None:
     def record(pair_id: str, split: str, source_page: str, partition: str) -> dict:
         return {
-            "schema_version": MAPPING_PAGE_PAIR_SCHEMA,
+            "schema_version": UI_CORRESPONDENCE_PAIR_SCHEMA,
             "pair_id": pair_id,
             "split": split,
             "label_status": "gold",
@@ -333,7 +374,7 @@ def test_dataset_audit_rejects_partition_leakage() -> None:
     ]
 
     with pytest.raises(ValueError, match="partition leakage"):
-        audit_mapping_page_pairs(rows)
+        audit_ui_correspondence_pairs(rows)
 
 
 def test_diagnostic_uses_its_frozen_reserved_split_for_leakage_audit() -> None:
@@ -342,7 +383,7 @@ def test_diagnostic_uses_its_frozen_reserved_split_for_leakage_audit() -> None:
         if reserved_split is not None:
             provenance["reserved_split"] = reserved_split
         return {
-            "schema_version": MAPPING_PAGE_PAIR_SCHEMA,
+            "schema_version": UI_CORRESPONDENCE_PAIR_SCHEMA,
             "pair_id": pair_id,
             "split": split,
             "label_status": "weak" if split == "diagnostic" else "gold",
@@ -376,13 +417,13 @@ def test_diagnostic_uses_its_frozen_reserved_split_for_leakage_audit() -> None:
             "slices": {},
         }
 
-    audit = audit_mapping_page_pairs(
+    audit = audit_ui_correspondence_pairs(
         [record("candidate", "diagnostic", "dev"), record("gold", "dev", None)]
     )
     assert audit["assignment_counts"] == {"dev": 2}
 
     with pytest.raises(ValueError, match="partition leakage"):
-        audit_mapping_page_pairs(
+        audit_ui_correspondence_pairs(
             [
                 record("candidate", "diagnostic", "test"),
                 record("gold", "dev", None),
@@ -478,13 +519,13 @@ def test_writer_emits_same_schema_for_train_and_test(tmp_path: Path) -> None:
         )
     records = adapt_ase_queries(queries)
 
-    manifest = write_mapping_dataset(records, tmp_path / "dataset")
+    manifest = write_ui_correspondence_dataset(records, tmp_path / "dataset")
 
     assert manifest["audit"]["split_counts"] == {"test": 1, "train": 1}
     train = json.loads((tmp_path / "dataset" / "train.jsonl").read_text().strip())
     test = json.loads((tmp_path / "dataset" / "test.jsonl").read_text().strip())
     assert train.keys() == test.keys()
-    assert train["schema_version"] == MAPPING_PAGE_PAIR_SCHEMA
+    assert train["schema_version"] == UI_CORRESPONDENCE_PAIR_SCHEMA
 
 
 def test_writer_streams_single_pass_records_and_cleans_leakage_parts(
@@ -492,7 +533,7 @@ def test_writer_streams_single_pass_records_and_cleans_leakage_parts(
 ) -> None:
     def record(pair_id: str, split: str, app: str) -> dict:
         return {
-            "schema_version": MAPPING_PAGE_PAIR_SCHEMA,
+            "schema_version": UI_CORRESPONDENCE_PAIR_SCHEMA,
             "pair_id": pair_id,
             "split": split,
             "label_status": "gold",
@@ -536,7 +577,7 @@ def test_writer_streams_single_pass_records_and_cleans_leakage_parts(
             consumed.append(row["pair_id"])
             yield row
 
-    manifest = write_mapping_dataset(records(), tmp_path / "streamed")
+    manifest = write_ui_correspondence_dataset(records(), tmp_path / "streamed")
 
     assert consumed == ["train-pair", "test-pair"]
     assert manifest["audit"]["records"] == 2
@@ -545,7 +586,7 @@ def test_writer_streams_single_pass_records_and_cleans_leakage_parts(
 
     leaking = tmp_path / "leaking"
     with pytest.raises(ValueError, match="partition leakage"):
-        write_mapping_dataset(
+        write_ui_correspondence_dataset(
             (
                 row
                 for row in (

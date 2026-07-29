@@ -85,14 +85,14 @@ TEMdroid/SemFinder is retained as metadata-only diagnostic data. It does not
 include the same screenshot/XML grounding richness and should not be used as the
 main visual/layout robustness dataset.
 
-## Canonical Page-Pair Evaluation
+## Canonical UI Correspondence Evaluation
 
 Every learned matcher result uses the same
-`omnitransfer.mapping_page_pair.v1` adapter as training. Raw graph files are
+`omnitransfer.ui_correspondence_pair.v1` adapter as training. Raw graph files are
 not a second evaluation format.
 
 ```bash
-PYTHONPATH=src:. python scripts/evaluate_ui_graph_matcher.py \
+PYTHONPATH=src:. python scripts/evaluate_relation_aware_matcher.py \
   --input runtime/datasets/unified_mapping/test.jsonl \
   --split test \
   --checkpoint runtime/models/relation_matcher.pt \
@@ -160,7 +160,7 @@ presented as the new learned cross-attention method.
 ## Learned Core
 
 The proposed core is the relation-aware cross-attention matcher described in
-`docs/learned_cross_attention_matcher.md`. Benchmark V2 accepts equivalent gold
+`docs/relation_aware_cross_attention_matcher.md`. Benchmark V2 accepts equivalent gold
 candidate sets and NULL targets, and reports ranking, abstention, safety, and
 latency metrics. The learned core is promoted to runtime only after the recorded
 accuracy, safety, and latency gates pass.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run page-pair matcher ablations through the one canonical trainer."""
+"""Run Relation-Aware Cross-Attention Matcher ablations."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ def main() -> None:
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    trainer = Path(__file__).with_name("train_mapping_page_pairs.py")
+    trainer = Path(__file__).with_name("train_relation_aware_matcher.py")
     runs: list[dict[str, object]] = []
     for seed in args.seeds:
         for context_nodes in args.source_context_nodes:
@@ -103,8 +103,8 @@ def main() -> None:
                     }
                 )
                 summary = {
-                    "schema_version": "omnitransfer.page_pair_grid.v2",
-                    "record_schema": "omnitransfer.mapping_page_pair.v1",
+                    "schema_version": "omnitransfer.relation_aware_matcher_grid.v1",
+                    "record_schema": "omnitransfer.ui_correspondence_pair.v1",
                     "inputs": [str(path.resolve()) for path in args.input],
                     "validation_inputs": [
                         str(path.resolve()) for path in args.validation_input

@@ -78,7 +78,7 @@ same cross-attention core. VisualWebArena and ScreenSpot-Pro remain frozen
 evaluation sources rather than training corpora.
 
 Detailed source verification, architecture mapping, and experiment protocol are
-recorded in `docs/learned_cross_attention_matcher.md`.
+recorded in `docs/relation_aware_cross_attention_matcher.md`.
 
 ## GUI Grounding
 

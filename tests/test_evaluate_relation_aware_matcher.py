@@ -1,11 +1,11 @@
 import json
 
 from omnitransfer.learned_matcher import MatcherConfig
-from scripts.evaluate_ui_graph_matcher import load_evaluation_pairs
+from scripts.evaluate_relation_aware_matcher import load_evaluation_pairs
 from tests.test_mapping_training import _record
 
 
-def test_evaluation_uses_the_same_page_pair_adapter_and_split(tmp_path) -> None:
+def test_evaluation_uses_the_same_ui_correspondence_adapter_and_split(tmp_path) -> None:
     record = _record()
     record["split"] = "test"
     record["label_status"] = "gold"

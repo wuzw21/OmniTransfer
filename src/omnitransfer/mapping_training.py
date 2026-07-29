@@ -1,4 +1,4 @@
-"""Training adapters for the unified mapping page-pair dataset."""
+"""Training adapters for the unified UI correspondence-pair dataset."""
 
 from __future__ import annotations
 
@@ -9,8 +9,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from omnitransfer.learned_matcher import MatcherConfig
-from omnitransfer.mapping_dataset import validate_mapping_page_pair
-from omnitransfer.self_supervised import TrainingPair, make_correspondence_training_pair
+from omnitransfer.mapping_dataset import validate_ui_correspondence_pair
+from omnitransfer.self_supervised import (
+    CorrespondencePair,
+    make_correspondence_training_pair,
+)
 from omnitransfer.ui_graph import (
     UIGraph,
     UINode,
@@ -19,7 +22,7 @@ from omnitransfer.ui_graph import (
 )
 
 
-def load_mapping_training_pairs(
+def load_ui_correspondence_pairs(
     paths: Iterable[str | Path],
     *,
     matcher_config: MatcherConfig | None = None,
@@ -28,14 +31,14 @@ def load_mapping_training_pairs(
     max_pairs: int = 0,
     screenshot_root: str | Path | None = None,
     allowed_splits: frozenset[str] = frozenset({"train", "diagnostic"}),
-) -> tuple[list[TrainingPair], list[UIGraph], dict[str, Any]]:
-    """Load set-valued page-pair labels through the one canonical adapter."""
+) -> tuple[list[CorrespondencePair], list[UIGraph], dict[str, Any]]:
+    """Load set-valued UI correspondence labels through the canonical adapter."""
 
     if minimum_correspondences <= 0:
         raise ValueError("minimum_correspondences must be positive")
     if max_pairs < 0:
         raise ValueError("max_pairs must be non-negative")
-    pairs: list[TrainingPair] = []
+    pairs: list[CorrespondencePair] = []
     config = matcher_config or MatcherConfig()
     graphs: dict[str, UIGraph] = {}
     skipped: Counter[str] = Counter()
@@ -60,7 +63,7 @@ def load_mapping_training_pairs(
                     continue
                 input_rows += 1
                 try:
-                    record = validate_mapping_page_pair(json.loads(line))
+                    record = validate_ui_correspondence_pair(json.loads(line))
                 except (json.JSONDecodeError, TypeError, ValueError) as exc:
                     skipped[f"invalid:{exc}"] += 1
                     continue
@@ -147,7 +150,7 @@ def load_mapping_training_pairs(
         if max_pairs and len(pairs) >= max_pairs:
             break
     manifest = {
-        "schema_version": "omnitransfer.mapping_training_adapter.v2",
+        "schema_version": "omnitransfer.ui_correspondence_adapter.v1",
         "input_rows": input_rows,
         "accepted_pairs": len(pairs),
         "accepted_graphs": len(graphs),
@@ -249,3 +252,7 @@ def _correspondence_edges(
             for target_id in match["target_node_ids"]
         ),
     }
+
+
+# Compatibility name for callers written before the RCAM naming migration.
+load_mapping_training_pairs = load_ui_correspondence_pairs

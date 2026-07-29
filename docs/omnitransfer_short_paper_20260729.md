@@ -8,7 +8,7 @@ searched and verified before publication.
 
 ```text
 frozen reference: seeded-pair-evidence-mutual-v2
-next version:      context-forced-cross-attention-v1
+next version:      relation-aware-cross-attention-matcher-v1
 next status:       design only; no result claimed
 ```
 
@@ -26,7 +26,7 @@ matcher that reaches 78.83% Top-1 and 94.54% Recall@5, with 48.82 ms p95
 new-image latency on an RTX 4090. We use this result as an empirical baseline,
 not as the final architectural claim. The next OmniTransfer model retains one
 relation-aware cross-attention matcher and strengthens its supervision with
-context-forced augmentation and same-screen semantic hard negatives, avoiding
+context-masking augmentation and same-screen semantic hard negatives, avoiding
 selector fusion, rule scores, and auxiliary execution paths.
 
 ## 1. Problem
@@ -148,7 +148,7 @@ new-image measurements exceeded 50 ms, and the maximum was 70.22 ms.
 
 ## 5. A Simpler Cross-Attention Method
 
-We name the next experiment `context-forced-cross-attention-v1`. It starts from
+We name the next experiment `relation-aware-cross-attention-matcher-v1`. It starts from
 the frozen 70.73% relation cross-attention baseline and must be evaluated
 against the 78.83% accuracy-latency reference. Creating this version does not
 replace the runtime checkpoint and does not modify the frozen baseline.
@@ -218,7 +218,7 @@ development split after training; they decide rejection but do not change the
 ranking architecture.
 
 This section is a testable hypothesis. No result in Table 2 is attributed to
-context-forced cross-attention until that model is trained and evaluated on the
+relation-aware cross-attention until that model is trained and evaluated on the
 frozen split.
 
 ## 6. Limitations

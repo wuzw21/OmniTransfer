@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate a matcher on the canonical mapping page-pair schema."""
+"""Evaluate the Relation-Aware Cross-Attention Matcher."""
 
 from __future__ import annotations
 
@@ -9,9 +9,13 @@ from pathlib import Path
 from typing import Any
 
 from omnitransfer.experiment_logging import file_sha256
-from omnitransfer.learned_matcher import LearnedGraphMatcher, MatcherConfig, parameter_count
-from omnitransfer.mapping_training import load_mapping_training_pairs
-from omnitransfer.self_supervised import TrainingPair, evaluate_correspondence_pairs
+from omnitransfer.learned_matcher import (
+    MatcherConfig,
+    RelationAwareMatcher,
+    parameter_count,
+)
+from omnitransfer.mapping_training import load_ui_correspondence_pairs
+from omnitransfer.self_supervised import CorrespondencePair, evaluate_correspondence_pairs
 
 
 def main() -> None:
@@ -19,7 +23,11 @@ def main() -> None:
     parser.add_argument("--input", nargs="+", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--split", choices=("train", "dev", "test", "diagnostic"), required=True)
+    parser.add_argument(
+        "--split",
+        choices=("train", "dev", "test", "diagnostic"),
+        required=True,
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max-pairs", type=int, default=0)
     parser.add_argument("--latency-repeats", type=int, default=2)
@@ -27,7 +35,7 @@ def main() -> None:
     parser.add_argument("--screenshot-root", type=Path)
     args = parser.parse_args()
 
-    matcher = LearnedGraphMatcher.from_checkpoint(args.checkpoint, device=args.device)
+    matcher = RelationAwareMatcher.from_checkpoint(args.checkpoint, device=args.device)
     pairs, adapter = load_evaluation_pairs(
         args.input,
         split=args.split,
@@ -44,8 +52,8 @@ def main() -> None:
         latency_repeats=args.latency_repeats,
     )
     report = {
-        "schema_version": "omnitransfer.page_pair_evaluation.v1",
-        "record_schema": "omnitransfer.mapping_page_pair.v1",
+        "schema_version": "omnitransfer.relation_aware_matcher_evaluation.v1",
+        "record_schema": "omnitransfer.ui_correspondence_pair.v1",
         "split": args.split,
         "inputs": [
             {
@@ -81,10 +89,10 @@ def load_evaluation_pairs(
     max_pairs: int = 0,
     allow_unreviewed_pseudo: bool = False,
     screenshot_root: Path | None = None,
-) -> tuple[list[TrainingPair], dict[str, Any]]:
+) -> tuple[list[CorrespondencePair], dict[str, Any]]:
     """Use the training adapter unchanged, constrained to one evaluation split."""
 
-    pairs, _, adapter = load_mapping_training_pairs(
+    pairs, _, adapter = load_ui_correspondence_pairs(
         inputs,
         matcher_config=config,
         allow_unreviewed_pseudo=allow_unreviewed_pseudo,
@@ -94,7 +102,7 @@ def load_evaluation_pairs(
         allowed_splits=frozenset({split}),
     )
     if not pairs:
-        raise SystemExit(f"No actionable {split} page pairs were accepted")
+        raise SystemExit(f"No actionable {split} correspondence pairs were accepted")
     return pairs, adapter
 
 

@@ -140,8 +140,8 @@ to know which source element from the recorded screen should be relocated.
 python -m py_compile \
   src/omnitransfer/*.py \
   scripts/import_mobileviews.py \
-  scripts/build_unified_mapping_dataset.py \
-  scripts/train_mapping_page_pairs.py \
+  scripts/build_ui_correspondence_dataset.py \
+  scripts/train_relation_aware_matcher.py \
   scripts/benchmark_matcher_latency.py \
   scripts/import_dataset.py \
   scripts/run_eval.py \
@@ -200,8 +200,8 @@ PYTHONPATH=src python scripts/import_mobileviews.py \
 ```
 
 Raw graph files are data-source artifacts, not a second training format. Build
-MobileViews page pairs first; same-page augmentation is then generated inside
-the one page-pair trainer:
+MobileViews UI correspondence pairs first; same-page augmentation is then generated inside
+the one RCAM trainer:
 
 ```bash
 PYTHONPATH=src python scripts/build_mobileviews_allowlist_pair_pool.py \
@@ -210,12 +210,12 @@ PYTHONPATH=src python scripts/build_mobileviews_allowlist_pair_pool.py \
   --output-dir runtime/datasets/mobileviews/page_pairs_train
 ```
 
-Aligned MobileViews/Mind2Web page pairs can update the same model without a
+Aligned MobileViews/Mind2Web correspondence pairs can update the same model without a
 second scoring path. Automatic diagnostic labels require explicit opt-in and
 only globally one-to-one rows enter the cross-page loss:
 
 ```bash
-PYTHONPATH=src python scripts/train_mapping_page_pairs.py \
+PYTHONPATH=src python scripts/train_relation_aware_matcher.py \
   --input runtime/datasets/mobileviews/diagnostic.jsonl \
   --allow-unreviewed-pseudo \
   --device cuda \
@@ -311,38 +311,38 @@ PYTHONPATH=src python scripts/import_webui.py \
   --split train
 ```
 
-Every additional source is adapted to `omnitransfer.mapping_page_pair.v1`
+Every additional source is adapted to `omnitransfer.ui_correspondence_pair.v1`
 before it can enter optimization. There is no graph-only pretraining command
 and no sequential domain-specific trainer.
 
-Evaluate the frozen page-pair split without changing adapters:
+Evaluate the frozen UI-correspondence split without changing adapters:
 
 ```bash
-PYTHONPATH=src:. python scripts/evaluate_ui_graph_matcher.py \
+PYTHONPATH=src:. python scripts/evaluate_relation_aware_matcher.py \
   --input runtime/datasets/unified_mapping/test.jsonl \
   --split test \
-  --checkpoint runtime/models/context_forced_cross_attention_v1.pt \
+  --checkpoint runtime/models/relation_aware_cross_attention_matcher_v1.pt \
   --device cuda \
-  --output runtime/reports/context_forced_cross_attention_v1_test.json
+  --output runtime/reports/relation_aware_cross_attention_matcher_v1_test.json
 ```
 
-Convert every source-target dataset to the same page-pair rows, then use the
-one canonical training entrypoint:
+Convert every source-target dataset to the same UI correspondence rows, then
+use the one canonical training entrypoint:
 
 ```bash
-PYTHONPATH=src python scripts/build_unified_mapping_dataset.py \
+PYTHONPATH=src python scripts/build_ui_correspondence_dataset.py \
   --ase-queries runtime/evals/vision_widget_mapping/clean_relative_xml_v1/queries.jsonl \
-  --page-pairs runtime/datasets/mobileviews/train-*.jsonl \
+  --correspondence-pairs runtime/datasets/mobileviews/train-*.jsonl \
   --output-dir runtime/datasets/unified_mapping
 
-PYTHONPATH=src python scripts/train_mapping_page_pairs.py \
+PYTHONPATH=src python scripts/train_relation_aware_matcher.py \
   --input runtime/datasets/unified_mapping/train.jsonl \
   --validation-input runtime/datasets/unified_mapping/dev.jsonl \
   --assignment-head mutual_projection \
   --context-mask-probability 0.35 \
   --epochs 3 \
   --device cuda \
-  --output runtime/models/context_forced_cross_attention_v1.pt
+  --output runtime/models/relation_aware_cross_attention_matcher_v1.pt
 ```
 
 Enforce the decoded-image RTX 4090 compute budget after model-only warmup; PNG
@@ -364,11 +364,11 @@ and frozen evaluation are in `datasets/unified_ui_registry.v1.json`.
 Run the initial multi-seed architecture grid on one frozen split:
 
 ```bash
-CUDA_VISIBLE_DEVICES=3 PYTHONPATH=src python scripts/run_learned_matcher_grid.py \
-  --input runtime/evals/vision_widget_mapping/action_transfer_queries.with_images.jsonl \
+CUDA_VISIBLE_DEVICES=3 PYTHONPATH=src python scripts/run_relation_aware_matcher_grid.py \
+  --input runtime/datasets/unified_mapping/train.jsonl \
+  --validation-input runtime/datasets/unified_mapping/dev.jsonl \
   --output-dir runtime/experiments/relation_matcher_grid \
   --seeds 17 29 41 \
-  --split-seed 17 \
   --source-context-nodes 32 48 \
   --num-layers 1 2 \
   --epochs 3 \
@@ -377,4 +377,4 @@ CUDA_VISIBLE_DEVICES=3 PYTHONPATH=src python scripts/run_learned_matcher_grid.py
 
 The method, benchmark expansion, 76-configuration experiment matrix, and
 runtime promotion gates are specified in
-`docs/learned_cross_attention_matcher.md`.
+`docs/relation_aware_cross_attention_matcher.md`.

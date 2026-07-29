@@ -43,7 +43,7 @@ class AugmentConfig:
 
 
 @dataclass(frozen=True)
-class TrainingPair:
+class CorrespondencePair:
     """Two related graph views with known correspondences and ignored rows."""
 
     graph_a: UIGraph
@@ -71,6 +71,10 @@ class TrainingPair:
         return [list(values) for values in self.encoded_b.numeric_features]
 
 
+# Compatibility name for checkpoints and downstream code predating RCAM.
+TrainingPair = CorrespondencePair
+
+
 def make_correspondence_training_pair(
     graph_a: UIGraph,
     graph_b: UIGraph,
@@ -79,7 +83,7 @@ def make_correspondence_training_pair(
     matcher_config: MatcherConfig | None = None,
     allow_empty: bool = False,
     unmatched_as_null: bool = False,
-) -> TrainingPair:
+) -> CorrespondencePair:
     """Construct partial-assignment labels from explicit cross-graph node pairs."""
 
     config = matcher_config or MatcherConfig()
@@ -120,7 +124,7 @@ def make_correspondence_training_pair(
         min(targets) if targets else unmatched_target
         for targets in positive_b_to_a
     ]
-    return TrainingPair(
+    return CorrespondencePair(
         graph_a=graph_a,
         graph_b=graph_b,
         encoded_a=encode_graph(graph_a, config=config),
@@ -214,7 +218,7 @@ def make_training_pair(
     rng: random.Random,
     config: AugmentConfig | None = None,
     matcher_config: MatcherConfig | None = None,
-) -> TrainingPair | None:
+) -> CorrespondencePair | None:
     """Construct identity correspondences between two augmented graph views."""
 
     cfg = config or AugmentConfig()
@@ -247,7 +251,7 @@ def make_training_pair(
         return None
     targets_a_to_b = tuple(index_b.get(node.origin_id, -1) for node in graph_a.nodes)
     targets_b_to_a = tuple(index_a.get(node.origin_id, -1) for node in graph_b.nodes)
-    return TrainingPair(
+    return CorrespondencePair(
         graph_a=graph_a,
         graph_b=graph_b,
         encoded_a=encode_graph(graph_a, config=model_cfg),
@@ -294,7 +298,7 @@ def build_lightglue_style_matcher(
 
 def matching_loss(
     model: Any,
-    pair: TrainingPair,
+    pair: CorrespondencePair,
     *,
     device: str = "cpu",
     matcher_config: MatcherConfig | None = None,
@@ -423,7 +427,7 @@ def matching_loss(
 
 def evaluate_correspondence_pairs(
     model: Any,
-    pairs: Iterable[TrainingPair],
+    pairs: Iterable[CorrespondencePair],
     *,
     device: str = "cpu",
     matcher_config: MatcherConfig | None = None,
@@ -614,9 +618,9 @@ def evaluate_self_supervised_matcher(
     }
 
 
-def train_mapping_matcher(
+def train_relation_aware_matcher(
     graphs: Iterable[UIGraph],
-    correspondence_pairs: Iterable[TrainingPair],
+    correspondence_pairs: Iterable[CorrespondencePair],
     *,
     model: Any | None = None,
     epochs: int = 1,
@@ -630,7 +634,7 @@ def train_mapping_matcher(
     context_mask_probability: float = 0.0,
     progress_callback: Callable[[dict[str, float]], None] | None = None,
     progress_interval: int = 1000,
-    validation_pairs: Iterable[TrainingPair] = (),
+    validation_pairs: Iterable[CorrespondencePair] = (),
 ) -> tuple[Any, list[dict[str, float]]]:
     """Train one matcher on mixed augmented-view and cross-page pairs."""
 
@@ -654,7 +658,7 @@ def train_mapping_matcher(
     )
     history: list[dict[str, float]] = []
     for epoch in range(max(1, int(epochs))):
-        training_items: list[tuple[str, TrainingPair | UIGraph]] = [
+        training_items: list[tuple[str, CorrespondencePair | UIGraph]] = [
             ("cross_page", pair) for pair in cross_page_pairs
         ]
         training_items.extend(("self_supervised", graph) for graph in graph_list)
@@ -746,6 +750,10 @@ def train_mapping_matcher(
         history.append(epoch_metrics)
     matcher.eval()
     return matcher, history
+
+
+# Compatibility name; both names resolve to the same optimizer implementation.
+train_mapping_matcher = train_relation_aware_matcher
 
 
 def _select_kept_nodes(

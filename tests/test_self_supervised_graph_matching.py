@@ -9,7 +9,7 @@ from omnitransfer.self_supervised import (
     make_correspondence_training_pair,
     make_training_pair,
     matching_loss,
-    train_mapping_matcher,
+    train_relation_aware_matcher,
 )
 from omnitransfer.learned_matcher import MatcherConfig, RELATION_FEATURE_DIM
 from omnitransfer.ui_graph import (
@@ -374,14 +374,14 @@ def test_unified_mapping_seed_controls_model_initialization() -> None:
         matcher_config=config,
     )
 
-    model_a, history_a = train_mapping_matcher(
+    model_a, history_a = train_relation_aware_matcher(
         [graph],
         [pair],
         seed=23,
         matcher_config=config,
         augment_config=augment,
     )
-    model_b, history_b = train_mapping_matcher(
+    model_b, history_b = train_relation_aware_matcher(
         [graph],
         [pair],
         seed=23,
@@ -467,7 +467,7 @@ def test_mapping_training_mixes_augmented_and_cross_page_pairs() -> None:
         matcher_config=config,
     )
 
-    _, history = train_mapping_matcher(
+    _, history = train_relation_aware_matcher(
         [source, target],
         [cross_page_pair],
         epochs=1,

@@ -7,7 +7,7 @@ import argparse
 import json
 from pathlib import Path
 
-from omnitransfer.mapping_dataset import write_mapping_dataset
+from omnitransfer.mapping_dataset import write_ui_correspondence_dataset
 from omnitransfer.mind2web_reflow import ReflowViewport, capture_mind2web_reflow_pair
 
 
@@ -50,7 +50,7 @@ def main() -> None:
         )
         records.append(record)
         stats.append({"target": target.name, **pair_stats})
-    manifest = write_mapping_dataset(
+    manifest = write_ui_correspondence_dataset(
         records,
         args.output_dir,
         metadata={

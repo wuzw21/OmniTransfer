@@ -7,7 +7,7 @@ import argparse
 import json
 from pathlib import Path
 
-from omnitransfer.mapping_dataset import write_mapping_dataset
+from omnitransfer.mapping_dataset import write_ui_correspondence_dataset
 from omnitransfer.mobileviews_trace_pairs import build_mobileviews_trace_pair_pilot
 
 
@@ -24,7 +24,7 @@ def main() -> None:
         pair_limit=args.pair_limit,
         minimum_matches=args.minimum_matches,
     )
-    manifest = write_mapping_dataset(
+    manifest = write_ui_correspondence_dataset(
         records,
         args.output_dir,
         metadata={"pilot": pilot},

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train one matcher from the canonical mapping page-pair schema."""
+"""Train the Relation-Aware Cross-Attention Matcher."""
 
 from __future__ import annotations
 
@@ -14,16 +14,16 @@ from omnitransfer.experiment_logging import (
     runtime_environment,
 )
 from omnitransfer.learned_matcher import (
-    LearnedGraphMatcher,
+    RelationAwareMatcher,
     MatcherConfig,
     parameter_count,
     save_matcher_checkpoint,
 )
-from omnitransfer.mapping_training import load_mapping_training_pairs
+from omnitransfer.mapping_training import load_ui_correspondence_pairs
 from omnitransfer.self_supervised import (
     AugmentConfig,
     evaluate_correspondence_pairs,
-    train_mapping_matcher,
+    train_relation_aware_matcher,
 )
 
 
@@ -35,7 +35,7 @@ def main() -> None:
         nargs="+",
         type=Path,
         default=(),
-        help="Gold dev page-pair JSONL files with the same record schema.",
+        help="Gold dev UI-correspondence JSONL files with the same record schema.",
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--report", type=Path)
@@ -65,7 +65,7 @@ def main() -> None:
 
     pretrained_model = None
     if args.pretrained is not None:
-        pretrained = LearnedGraphMatcher.from_checkpoint(
+        pretrained = RelationAwareMatcher.from_checkpoint(
             args.pretrained,
             device=args.device,
         )
@@ -91,7 +91,7 @@ def main() -> None:
             target_context_nodes=args.target_context_nodes,
             assignment_head=args.assignment_head or "pair_mlp",
         )
-    pairs, graphs, adapter = load_mapping_training_pairs(
+    pairs, graphs, adapter = load_ui_correspondence_pairs(
         args.input,
         matcher_config=config,
         allow_unreviewed_pseudo=args.allow_unreviewed_pseudo,
@@ -104,7 +104,7 @@ def main() -> None:
     validation_pairs = []
     validation_adapter = None
     if args.validation_input:
-        validation_pairs, _, validation_adapter = load_mapping_training_pairs(
+        validation_pairs, _, validation_adapter = load_ui_correspondence_pairs(
             args.validation_input,
             matcher_config=config,
             minimum_correspondences=1,
@@ -112,12 +112,12 @@ def main() -> None:
             allowed_splits=frozenset({"dev"}),
         )
         if not validation_pairs:
-            raise SystemExit("No gold dev page pairs were accepted")
+            raise SystemExit("No gold dev correspondence pairs were accepted")
     preview = {
         "adapter": adapter,
         "matcher_config": asdict(config),
         "pretrained": str(args.pretrained.resolve()) if args.pretrained else None,
-        "training": "one_shuffled_page_pair_optimizer",
+        "training": "one_shuffled_correspondence_optimizer",
         "context_mask_probability": args.context_mask_probability,
         "validation_adapter": validation_adapter,
     }
@@ -130,7 +130,7 @@ def main() -> None:
     metric_log = TrainingMetricLog(metrics_path)
     metric_log.start(
         {
-            "architecture": "local_relation_cross_attention_matcher",
+            "architecture": "relation_aware_cross_attention_matcher",
             "objective": "layerwise_symmetric_mutual_assignment",
             "inputs": [
                 {
@@ -163,7 +163,7 @@ def main() -> None:
             flush=True,
         )
 
-    model, history = train_mapping_matcher(
+    model, history = train_relation_aware_matcher(
         graphs,
         pairs,
         model=pretrained_model,
@@ -187,8 +187,8 @@ def main() -> None:
         matcher_config=config,
     )
     report = {
-        "schema_version": "omnitransfer.page_pair_matcher_experiment.v1",
-        "architecture": "local_relation_cross_attention_matcher",
+        "schema_version": "omnitransfer.relation_aware_matcher_experiment.v1",
+        "architecture": "relation_aware_cross_attention_matcher",
         "objective": "layerwise_symmetric_mutual_assignment",
         "inputs": [str(path.resolve()) for path in args.input],
         "pretrained": str(args.pretrained.resolve()) if args.pretrained else None,

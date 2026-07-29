@@ -1,6 +1,6 @@
 # Script Entrypoints
 
-Status: Learned matcher benchmark implemented
+Status: RCAM benchmark implemented
 
 The standalone repo keeps canonical data, training, and evaluation entrypoints.
 
@@ -42,12 +42,14 @@ The standalone repo keeps canonical data, training, and evaluation entrypoints.
   - Download a fixed Hugging Face converted-parquet release and verify every shard by the Hub-provided SHA-256.
 - `PYTHONPATH=src python scripts/import_webui.py --input ... --output ... --source-revision ... --split train`
   - Import WebUI screenshots and visible semantic element boxes into the same Unified UIGraph matcher path.
-- `PYTHONPATH=src python scripts/build_unified_mapping_dataset.py --ase-queries ... --page-pairs ... --output-dir ...`
-  - Convert ASE queries and validate MobileViews page pairs into the single `omnitransfer.mapping_page_pair.v1` schema used unchanged by train/dev/test.
-- `PYTHONPATH=src python scripts/train_mapping_page_pairs.py --input train.jsonl --validation-input dev.jsonl --output ...`
-  - The only learned matcher training entrypoint. It mixes same-page augmentation and cross-page set-valued correspondences in one optimizer loop and records appendix-ready JSONL metrics.
-- `PYTHONPATH=src:. python scripts/evaluate_ui_graph_matcher.py --input test.jsonl --split test --checkpoint ... --output ...`
-  - Evaluate Top-1, Recall@K, and warm latency through the same page-pair adapter used by training.
+- `PYTHONPATH=src python scripts/build_ui_correspondence_dataset.py --ase-queries ... --correspondence-pairs ... --output-dir ...`
+  - Convert ASE queries and validate MobileViews correspondences into the single `omnitransfer.ui_correspondence_pair.v1` schema used unchanged by train/dev/test.
+- `PYTHONPATH=src python scripts/build_ui_correspondence_review.py --input ... --output-dir ...`
+  - Render UI correspondence records through the canonical review workbench.
+- `PYTHONPATH=src python scripts/train_relation_aware_matcher.py --input train.jsonl --validation-input dev.jsonl --output ...`
+  - The only RCAM training entrypoint. It mixes same-page augmentation and cross-page set-valued correspondences in one optimizer loop and records appendix-ready JSONL metrics.
+- `PYTHONPATH=src:. python scripts/evaluate_relation_aware_matcher.py --input test.jsonl --split test --checkpoint ... --output ...`
+  - Evaluate Top-1, Recall@K, and warm latency through the same UI-correspondence adapter used by training.
 - `PYTHONPATH=src python scripts/evaluate_learned_matcher.py --input ... --checkpoint ... --eval-split test --report ... --predictions ...`
   - Legacy frozen-query checkpoint evaluation only; it is not a training path.
 - `PYTHONPATH=src:scripts python scripts/build_frozen_gui_odyssey_review.py --candidates ... --raw-pairs ... --reserved-split test --output ...`
@@ -63,8 +65,8 @@ The standalone repo keeps canonical data, training, and evaluation entrypoints.
   - Build the held-out rule-resistant slice from set-valued gold-rank, Top1, margin, and NULL disagreements without feeding selector scores to the matcher.
 - `PYTHONPATH=src python scripts/benchmark_matcher_latency.py --input ... --checkpoint ... --output ...`
   - Enforce the strict decoded-image RTX 4090 compute budget with synchronized stage timing.
-- `PYTHONPATH=src python scripts/run_learned_matcher_grid.py --input train.jsonl --validation-input dev.jsonl --output-dir ...`
-  - Run layer/context ablations by repeatedly invoking the one canonical page-pair trainer.
+- `PYTHONPATH=src python scripts/run_relation_aware_matcher_grid.py --input train.jsonl --validation-input dev.jsonl --output-dir ...`
+  - Run layer/context ablations by repeatedly invoking the one canonical RCAM trainer.
 - `PYTHONPATH=src python scripts/run_eval.py --queries ... --predictions ... --output ...`
   - Report ranking, abstention, risk-coverage, slice, and latency metrics.
 - `python scripts/run_external_baseline.py`

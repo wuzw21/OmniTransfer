@@ -11,7 +11,7 @@ import sys
 from typing import Any, Mapping
 
 
-METRIC_LOG_SCHEMA = "omnitransfer.matcher_training_metrics.v1"
+METRIC_LOG_SCHEMA = "omnitransfer.relation_aware_matcher_metrics.v1"
 
 
 class TrainingMetricLog:

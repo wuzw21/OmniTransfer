@@ -6,13 +6,15 @@ from PIL import Image
 from omnitransfer.mapping_pair_review import build_mapping_pair_review
 
 
-def test_mapping_pair_review_copies_images_and_embeds_matches(tmp_path: Path) -> None:
+def test_ui_correspondence_review_copies_images_and_embeds_matches(
+    tmp_path: Path,
+) -> None:
     source = tmp_path / "source.png"
     target = tmp_path / "target.png"
     Image.new("RGB", (100, 200), "white").save(source)
     Image.new("RGB", (200, 100), "black").save(target)
     record = {
-        "schema_version": "omnitransfer.mapping_page_pair.v1",
+        "schema_version": "omnitransfer.ui_correspondence_pair.v1",
         "pair_id": "pair-1",
         "split": "diagnostic",
         "label_status": "unreviewed",

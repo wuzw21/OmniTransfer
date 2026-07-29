@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from omnitransfer.mapping_training import load_mapping_training_pairs
+from omnitransfer.mapping_training import load_ui_correspondence_pairs
 from omnitransfer.learned_matcher import MatcherConfig
 
 
@@ -18,7 +18,7 @@ def _node(node_id: str) -> dict[str, object]:
 
 def _record() -> dict[str, object]:
     return {
-        "schema_version": "omnitransfer.mapping_page_pair.v1",
+        "schema_version": "omnitransfer.ui_correspondence_pair.v1",
         "pair_id": "pair-1",
         "split": "diagnostic",
         "label_status": "unreviewed",
@@ -74,7 +74,7 @@ def test_unreviewed_pairs_require_explicit_opt_in(tmp_path: Path) -> None:
     path = tmp_path / "diagnostic.jsonl"
     path.write_text(json.dumps(_record()) + "\n", encoding="utf-8")
 
-    pairs, graphs, manifest = load_mapping_training_pairs([path])
+    pairs, graphs, manifest = load_ui_correspondence_pairs([path])
 
     assert pairs == []
     assert graphs == []
@@ -90,7 +90,7 @@ def test_adapter_retains_set_valued_and_shared_target_labels(tmp_path: Path) -> 
     path = tmp_path / "diagnostic.jsonl"
     path.write_text(json.dumps(record) + "\n", encoding="utf-8")
 
-    pairs, graphs, manifest = load_mapping_training_pairs(
+    pairs, graphs, manifest = load_ui_correspondence_pairs(
         [path],
         allow_unreviewed_pseudo=True,
         minimum_correspondences=2,
@@ -120,7 +120,7 @@ def test_adapter_supervises_only_actionable_to_actionable_pairs(tmp_path: Path) 
     path = tmp_path / "diagnostic.jsonl"
     path.write_text(json.dumps(record) + "\n", encoding="utf-8")
 
-    pairs, _, manifest = load_mapping_training_pairs(
+    pairs, _, manifest = load_ui_correspondence_pairs(
         [path],
         allow_unreviewed_pseudo=True,
         minimum_correspondences=1,
@@ -148,7 +148,7 @@ def test_adapter_resolves_materialized_review_screenshot(tmp_path: Path) -> None
     materialized = screenshots / "digest_screen.png"
     materialized.write_bytes(b"not-decoded-during-adaptation")
 
-    pairs, _, _ = load_mapping_training_pairs(
+    pairs, _, _ = load_ui_correspondence_pairs(
         [path],
         allow_unreviewed_pseudo=True,
         screenshot_root=screenshots,
@@ -173,7 +173,7 @@ def test_adapter_bounds_local_context_around_all_matches(tmp_path: Path) -> None
     path = tmp_path / "diagnostic.jsonl"
     path.write_text(json.dumps(record) + "\n", encoding="utf-8")
 
-    pairs, _, manifest = load_mapping_training_pairs(
+    pairs, _, manifest = load_ui_correspondence_pairs(
         [path],
         matcher_config=MatcherConfig(source_context_nodes=4, target_context_nodes=5),
         allow_unreviewed_pseudo=True,
@@ -197,7 +197,7 @@ def test_adapter_keeps_every_actionable_hard_negative_beyond_context_limit(
     path = tmp_path / "diagnostic.jsonl"
     path.write_text(json.dumps(record) + "\n", encoding="utf-8")
 
-    pairs, _, _ = load_mapping_training_pairs(
+    pairs, _, _ = load_ui_correspondence_pairs(
         [path],
         matcher_config=MatcherConfig(source_context_nodes=2, target_context_nodes=2),
         allow_unreviewed_pseudo=True,
@@ -301,7 +301,7 @@ def test_adapter_does_not_lift_descendant_labels_to_actionable_ancestors(
     path = tmp_path / "anonymous-actionable-row.jsonl"
     path.write_text(json.dumps(record) + "\n", encoding="utf-8")
 
-    pairs, _, manifest = load_mapping_training_pairs(
+    pairs, _, manifest = load_ui_correspondence_pairs(
         [path],
         allow_unreviewed_pseudo=True,
         minimum_correspondences=1,

@@ -1,4 +1,4 @@
-"""Unified page-pair dataset contract for learned UI mapping."""
+"""Unified UI correspondence dataset contract for learned UI mapping."""
 
 from __future__ import annotations
 
@@ -21,7 +21,10 @@ from omnitransfer.gui_odyssey_pairs import (
 from omnitransfer.ui_graph import UIGraph, graph_from_record, graph_to_record
 
 
-MAPPING_PAGE_PAIR_SCHEMA = "omnitransfer.mapping_page_pair.v1"
+UI_CORRESPONDENCE_PAIR_SCHEMA = "omnitransfer.ui_correspondence_pair.v1"
+_LEGACY_UI_CORRESPONDENCE_PAIR_SCHEMAS = frozenset(
+    {"omnitransfer.mapping_page_pair.v1"}
+)
 _SPLITS = frozenset({"train", "dev", "test", "diagnostic"})
 _LABEL_STATUSES = frozenset({"gold", "weak", "self_supervised", "unreviewed"})
 
@@ -31,7 +34,7 @@ def adapt_ase_queries(
     *,
     asset_root: str | Path | None = None,
 ) -> list[dict[str, Any]]:
-    """Group authored ASE queries into gold multi-match page-pair records."""
+    """Group authored ASE queries into gold multi-match UI correspondence records."""
 
     resolved_assets = (
         Path(asset_root).expanduser().resolve()
@@ -49,9 +52,15 @@ def adapt_ase_queries(
         splits = {_required_query_metadata(query, "split") for query in page_queries}
         apps = {_required_query_metadata(query, "app") for query in page_queries}
         if len(splits) != 1:
-            raise ValueError(f"ASE page pair spans splits: {source_page_id} -> {target_page_id}")
+            raise ValueError(
+                "ASE correspondence pair spans splits: "
+                f"{source_page_id} -> {target_page_id}"
+            )
         if len(apps) != 1:
-            raise ValueError(f"ASE page pair spans apps: {source_page_id} -> {target_page_id}")
+            raise ValueError(
+                "ASE correspondence pair spans apps: "
+                f"{source_page_id} -> {target_page_id}"
+            )
         split = next(iter(splits))
         app = next(iter(apps))
         source_nodes = {
@@ -99,7 +108,7 @@ def adapt_ase_queries(
             evidence="ase_public_mapping_source",
         )
         record = {
-            "schema_version": MAPPING_PAGE_PAIR_SCHEMA,
+            "schema_version": UI_CORRESPONDENCE_PAIR_SCHEMA,
             "pair_id": _stable_pair_id("ase", source_page_id, target_page_id),
             "split": split,
             "label_status": "gold",
@@ -148,7 +157,7 @@ def adapt_ase_queries(
                 "form_factor": "phone",
             },
         }
-        records.append(validate_mapping_page_pair(record))
+        records.append(validate_ui_correspondence_pair(record))
     return records
 
 
@@ -195,7 +204,7 @@ def adapt_gui_odyssey_rows(
         except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
             skipped[f"invalid_pair:{exc}"] += 1
             continue
-        records.append(validate_mapping_page_pair(record))
+        records.append(validate_ui_correspondence_pair(record))
         if record["source"]["screenshot_path"] and record["target"]["screenshot_path"]:
             pairs_with_both_screenshots += 1
     return records, {
@@ -250,7 +259,7 @@ def adapt_gui_odyssey_human_reviews(
                 split=split,
                 label=label,
             )
-            records.append(validate_mapping_page_pair(record))
+            records.append(validate_ui_correspondence_pair(record))
         except (KeyError, TypeError, ValueError) as exc:
             skipped[f"invalid_review:{exc}"] += 1
             continue
@@ -266,12 +275,12 @@ def adapt_gui_odyssey_human_reviews(
     }
 
 
-def audit_mapping_page_pairs(records: list[dict[str, Any]]) -> dict[str, Any]:
+def audit_ui_correspondence_pairs(records: list[dict[str, Any]]) -> dict[str, Any]:
     """Validate rows and reject pair, page, or partition leakage across splits."""
 
     if not records:
-        raise ValueError("mapping dataset is empty")
-    normalized = [validate_mapping_page_pair(record) for record in records]
+        raise ValueError("UI correspondence dataset is empty")
+    normalized = [validate_ui_correspondence_pair(record) for record in records]
     pair_splits: dict[str, set[str]] = defaultdict(set)
     page_splits: dict[str, set[str]] = defaultdict(set)
     partition_splits: dict[str, set[str]] = defaultdict(set)
@@ -305,7 +314,7 @@ def audit_mapping_page_pairs(records: list[dict[str, Any]]) -> dict[str, Any]:
     if partition_overlap:
         raise ValueError(f"partition leakage: {_first_overlap(partition_overlap)}")
     return {
-        "schema_version": "omnitransfer.mapping_dataset_audit.v1",
+        "schema_version": "omnitransfer.ui_correspondence_audit.v1",
         "valid": True,
         "records": len(normalized),
         "matches": sum(match_counts.values()),
@@ -318,7 +327,7 @@ def audit_mapping_page_pairs(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def write_mapping_dataset(
+def write_ui_correspondence_dataset(
     records: Iterable[dict[str, Any]],
     output_dir: str | Path,
     *,
@@ -352,7 +361,7 @@ def write_mapping_dataset(
             for split in splits
         }
         for raw_record in records:
-            record = validate_mapping_page_pair(raw_record)
+            record = validate_ui_correspondence_pair(raw_record)
             split = record["split"]
             assignment_split = _assignment_split(record)
             _record_assignment(pair_splits, record["pair_id"], assignment_split, "pair id")
@@ -387,7 +396,7 @@ def write_mapping_dataset(
             for match in record["matches"]:
                 match_counts[match["label"]] += 1
         if record_count == 0:
-            raise ValueError("mapping dataset is empty")
+            raise ValueError("UI correspondence dataset is empty")
         for handle in handles.values():
             handle.close()
         handles.clear()
@@ -401,7 +410,7 @@ def write_mapping_dataset(
         raise
 
     audit = {
-        "schema_version": "omnitransfer.mapping_dataset_audit.v1",
+        "schema_version": "omnitransfer.ui_correspondence_audit.v1",
         "valid": True,
         "records": record_count,
         "matches": sum(match_counts.values()),
@@ -424,7 +433,7 @@ def write_mapping_dataset(
     for reserved_split, candidates in sorted((review_candidates or {}).items()):
         if reserved_split not in {"dev", "test"}:
             raise ValueError(f"unsupported review candidate split: {reserved_split}")
-        rows = [validate_mapping_page_pair(record) for record in candidates]
+        rows = [validate_ui_correspondence_pair(record) for record in candidates]
         if any(record["split"] != "diagnostic" for record in rows):
             raise ValueError("review candidates must use the diagnostic split")
         if any(record["label_status"] != "unreviewed" for record in rows):
@@ -439,8 +448,8 @@ def write_mapping_dataset(
         )
 
     manifest = {
-        "schema_version": "omnitransfer.mapping_dataset_manifest.v1",
-        "record_schema": MAPPING_PAGE_PAIR_SCHEMA,
+        "schema_version": "omnitransfer.ui_correspondence_dataset_manifest.v1",
+        "record_schema": UI_CORRESPONDENCE_PAIR_SCHEMA,
         "audit": audit,
         "files": files,
         "metadata": deepcopy(metadata or {}),
@@ -452,14 +461,18 @@ def write_mapping_dataset(
     return manifest
 
 
-def validate_mapping_page_pair(record: dict[str, Any]) -> dict[str, Any]:
-    """Return a normalized page-pair record or reject an invalid dataset row."""
+def validate_ui_correspondence_pair(record: dict[str, Any]) -> dict[str, Any]:
+    """Return a normalized UI correspondence record or reject an invalid dataset row."""
 
     if not isinstance(record, dict):
-        raise TypeError("mapping page pair must be an object")
+        raise TypeError("UI correspondence pair must be an object")
     value = deepcopy(record)
-    if value.get("schema_version") != MAPPING_PAGE_PAIR_SCHEMA:
-        raise ValueError("unsupported mapping page-pair schema")
+    if value.get("schema_version") not in {
+        UI_CORRESPONDENCE_PAIR_SCHEMA,
+        *_LEGACY_UI_CORRESPONDENCE_PAIR_SCHEMAS,
+    }:
+        raise ValueError("unsupported UI correspondence-pair schema")
+    value["schema_version"] = UI_CORRESPONDENCE_PAIR_SCHEMA
     _required_text(value, "pair_id")
     split = _required_text(value, "split")
     if split not in _SPLITS:
@@ -557,7 +570,7 @@ def _gui_odyssey_weak_record(
         or "unknown"
     )
     return {
-        "schema_version": MAPPING_PAGE_PAIR_SCHEMA,
+        "schema_version": UI_CORRESPONDENCE_PAIR_SCHEMA,
         "pair_id": str(row.get("pair_id") or _stable_pair_id("guiodyssey", source_page_id, target_page_id)),
         "split": split,
         "label_status": "weak",
@@ -672,7 +685,7 @@ def _gui_odyssey_human_record(
     source_device = str(source_endpoint.get("device_name") or "unknown")
     target_device = str(target_endpoint.get("device_name") or "unknown")
     return {
-        "schema_version": MAPPING_PAGE_PAIR_SCHEMA,
+        "schema_version": UI_CORRESPONDENCE_PAIR_SCHEMA,
         "pair_id": str(row.get("pair_id") or _stable_pair_id("guiodyssey-review", source_page_id, target_page_id)),
         "split": split,
         "label_status": "gold",
@@ -890,7 +903,7 @@ def _stable_pair_id(namespace: str, source_page_id: str, target_page_id: str) ->
         f"{namespace}\0{source_page_id}\0{target_page_id}".encode(),
         digest_size=10,
     ).hexdigest()
-    return f"{namespace}-page-pair-{digest}"
+    return f"{namespace}-correspondence-{digest}"
 
 
 def _form_factor(device_name: str) -> str:
@@ -978,3 +991,11 @@ def _file_manifest(path: Path, *, records: int, matches: int) -> dict[str, Any]:
         "bytes": path.stat().st_size,
         "sha256": digest.hexdigest(),
     }
+
+
+# Read-only compatibility names for artifacts produced before the RCAM naming
+# migration. Validation always normalizes legacy rows to the canonical schema.
+MAPPING_PAGE_PAIR_SCHEMA = UI_CORRESPONDENCE_PAIR_SCHEMA
+validate_mapping_page_pair = validate_ui_correspondence_pair
+audit_mapping_page_pairs = audit_ui_correspondence_pairs
+write_mapping_dataset = write_ui_correspondence_dataset

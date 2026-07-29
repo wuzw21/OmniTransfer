@@ -1,4 +1,4 @@
-# Context-Forced Cross-Attention V1
+# Relation-Aware Cross-Attention Matcher: Experiment V1
 
 Status: implementation and unified-data pipeline complete; formal training not started
 
@@ -57,7 +57,7 @@ one round of cross-screen refinement while preserving the 50 ms target. A
 Every dataset and every split uses:
 
 ```text
-omnitransfer.mapping_page_pair.v1
+omnitransfer.ui_correspondence_pair.v1
 pair_id, split, label_status
 source {page_id, platform, screenshot_path, graph}
 target {page_id, platform, screenshot_path, graph}
@@ -77,7 +77,7 @@ not materialize the multi-gigabyte MobileViews corpus twice.
 The only learned matcher entrypoint is:
 
 ```text
-scripts/train_mapping_page_pairs.py
+scripts/train_relation_aware_matcher.py
 ```
 
 The removed query-only, graph-only pretraining, and GUIOdyssey mixed trainers
@@ -102,16 +102,16 @@ The architecture stays fixed. V1 changes only supervision:
 ## Frozen Data
 
 ```text
-record schema: omnitransfer.mapping_page_pair.v1
-ASE records:   1,052 page pairs / 6,698 match rows
-train:         639 page pairs / 4,092 match rows / 32 Apps
-dev:           173 page pairs / 1,014 match rows / 8 Apps
-test:          240 page pairs / 1,592 match rows / 10 Apps
+record schema: omnitransfer.ui_correspondence_pair.v1
+ASE records:   1,052 correspondence pairs / 6,698 match rows
+train:         639 correspondence pairs / 4,092 match rows / 32 Apps
+dev:           173 correspondence pairs / 1,014 match rows / 8 Apps
+test:          240 correspondence pairs / 1,592 match rows / 10 Apps
 overlap:       zero pair, page, and partition-key overlap
 GUIOdyssey:    false
 ```
 
-The actionable training adapter currently accepts 590 ASE train page pairs and
+The actionable training adapter currently accepts 590 ASE train correspondence pairs and
 2,184 actionable edges. It retains 522 set-valued rows. Non-actionable target
 labels remain context and are never promoted into synthetic action nodes.
 
@@ -137,7 +137,7 @@ measurements. Low confidence or low margin returns transfer failure to the VLM.
 ## Appendix Log Contract
 
 Every run writes `*.metrics.jsonl` with schema
-`omnitransfer.matcher_training_metrics.v1`:
+`omnitransfer.relation_aware_matcher_metrics.v1`:
 
 ```text
 run_start:
@@ -170,7 +170,7 @@ Only three comparisons are required:
 ```text
 base cross-attention
 + all actionable hard negatives
-+ context-forced masking
++ context masking
 ```
 
 This keeps the causal question identifiable: whether forcing local contextual

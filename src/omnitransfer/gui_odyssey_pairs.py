@@ -11,7 +11,7 @@ from typing import Any
 from omnitransfer.gui_odyssey import graph_from_gui_odyssey_step
 from omnitransfer.learned_matcher import MatcherConfig
 from omnitransfer.self_supervised import (
-    TrainingPair,
+    CorrespondencePair,
     make_correspondence_training_pair,
 )
 from omnitransfer.ui_graph import UIGraph, UINode
@@ -31,7 +31,7 @@ def load_gui_odyssey_human_review_pairs(
     *,
     screenshot_dir: str | Path | None = None,
     matcher_config: MatcherConfig | None = None,
-) -> tuple[list[TrainingPair], dict[str, Any]]:
+) -> tuple[list[CorrespondencePair], dict[str, Any]]:
     """Load exported human node correspondences as formal gold pairs."""
 
     path = Path(review_path).expanduser().resolve()
@@ -45,7 +45,7 @@ def load_gui_odyssey_human_review_pairs(
         if screenshot_dir is not None
         else path.parent
     )
-    training_pairs: list[TrainingPair] = []
+    training_pairs: list[CorrespondencePair] = []
     labels: Counter[str] = Counter()
     skipped: Counter[str] = Counter()
     input_rows = 0
@@ -116,7 +116,7 @@ def load_gui_odyssey_training_pairs(
     max_pairs: int = 0,
     require_bbox_contains_point: bool = True,
     matcher_config: MatcherConfig | None = None,
-) -> tuple[list[TrainingPair], dict[str, Any]]:
+) -> tuple[list[CorrespondencePair], dict[str, Any]]:
     """Load weak point correspondences as partial-assignment graph pairs."""
 
     pairs = Path(pair_path).expanduser().resolve()
@@ -140,7 +140,7 @@ def make_gui_odyssey_training_pairs(
     max_pairs: int = 0,
     require_bbox_contains_point: bool = True,
     matcher_config: MatcherConfig | None = None,
-) -> tuple[list[TrainingPair], dict[str, Any]]:
+) -> tuple[list[CorrespondencePair], dict[str, Any]]:
     """Convert selected weak pair rows through the canonical graph adapter."""
 
     if max_pairs < 0:
@@ -150,7 +150,7 @@ def make_gui_odyssey_training_pairs(
         Path(screenshot_dir).expanduser().resolve() if screenshot_dir is not None else None
     )
     episode_cache: dict[str, dict[str, Any]] = {}
-    training_pairs: list[TrainingPair] = []
+    training_pairs: list[CorrespondencePair] = []
     skipped: Counter[str] = Counter()
     input_rows = 0
     pairs_with_both_screenshots = 0
@@ -210,7 +210,7 @@ def _make_weak_gui_odyssey_pair(
     episode_cache: dict[str, dict[str, Any]],
     require_bbox_contains_point: bool,
     matcher_config: MatcherConfig | None,
-) -> TrainingPair:
+) -> CorrespondencePair:
     source_episode, source_step = _resolve_endpoint(
         row.get("source"), annotations=annotations, cache=episode_cache
     )

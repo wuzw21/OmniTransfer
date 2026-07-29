@@ -4,7 +4,7 @@ import random
 import pytest
 
 from omnitransfer.learned_matcher import (
-    LearnedGraphMatcher,
+    RelationAwareMatcher,
     MatcherConfig,
     NUMERIC_FEATURE_DIM,
     RELATION_FEATURE_DIM,
@@ -205,7 +205,7 @@ def test_mutual_projection_reports_one_assignment_per_attention_layer() -> None:
     assert torch.equal(output["affinity"], output["affinities_by_layer"][-1])
 
 
-def test_context_forced_input_keeps_class_action_and_relations(tmp_path) -> None:
+def test_context_masking_input_keeps_class_action_and_relations(tmp_path) -> None:
     torch = pytest.importorskip("torch")
     image_module = pytest.importorskip("PIL.Image")
     screenshot = tmp_path / "screen.png"
@@ -255,7 +255,7 @@ def test_inference_adapter_rejects_low_pair_confidence() -> None:
                 "affinity": affinity,
             }
 
-    result = LearnedGraphMatcher(LowConfidenceModel()).predict(
+    result = RelationAwareMatcher(LowConfidenceModel()).predict(
         source,
         target,
         source_node_id="delete",
@@ -286,7 +286,7 @@ def test_inference_ranks_only_actionable_target_nodes() -> None:
                 "affinity": logits_ab,
             }
 
-    result = LearnedGraphMatcher(ContextBiasedModel()).predict(
+    result = RelationAwareMatcher(ContextBiasedModel()).predict(
         source,
         target,
         source_node_id="delete",
@@ -392,13 +392,18 @@ def test_train_only_visual_transform_changes_local_appearance(tmp_path) -> None:
 
 
 def test_visual_checkpoint_round_trip(tmp_path) -> None:
-    pytest.importorskip("torch")
+    torch = pytest.importorskip("torch")
     config = MatcherConfig(hidden_dim=32, num_heads=4, num_layers=1, dropout=0.0)
     model = build_relation_aware_matcher(config)
     checkpoint = tmp_path / "matcher.pt"
 
     save_matcher_checkpoint(checkpoint, model, config=config, metadata={"mock": True})
-    restored = LearnedGraphMatcher.from_checkpoint(checkpoint)
+    restored = RelationAwareMatcher.from_checkpoint(checkpoint)
+    payload = torch.load(checkpoint, map_location="cpu")
 
+    assert (
+        payload["schema_version"]
+        == "omnitransfer.relation_aware_cross_attention_matcher.v1"
+    )
     assert restored.config == config
     assert parameter_count(restored.model) == parameter_count(model)

@@ -272,7 +272,7 @@ def main() -> None:
             "actions_and_instructions": "label_metadata_only",
             "correspondence": "same_node_under_independent_train_only_augmentations",
             "test": "official_frozen_episode_split_with_published_subsplits",
-            "inference": "same_learned_cross_attention_matcher_no_shortcuts",
+            "inference": "relation_aware_cross_attention_matcher_no_shortcuts",
         },
     }
     (temporary / "manifest.json").write_text(

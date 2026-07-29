@@ -1,4 +1,6 @@
-# Local Relation Cross-Attention Matcher
+# Relation-Aware Cross-Attention Matcher
+
+We refer to the method as **RCAM**.
 
 ## Core Idea
 
@@ -20,7 +22,7 @@ There is one matcher, one forward path, and one training objective.
 Every training example has the same representation:
 
 ```text
-TrainingPair(source_graph, target_graph, correspondences)
+CorrespondencePair(source_graph, target_graph, correspondences)
 ```
 
 The pair can come from either of two sources:
@@ -83,10 +85,11 @@ target <- attend(target, source)
 ```
 
 The score for source node `i` and target node `j` is learned only from their
-contextual descriptors. There is no direct cross-page geometry input:
+contextual descriptors. A shared low-dimensional projection produces the dense
+affinity matrix; there is no direct cross-page geometry input:
 
 ```text
-S_ij = MLP([h_i, h_j, |h_i-h_j|, h_i*h_j])
+S_ij = <W_s h_i, W_t h_j> / sqrt(d)
 ```
 
 The default model uses hidden size 64, two layers, four heads, at least 48 source
@@ -122,7 +125,7 @@ matching results report positive Top-1 and Recall@K.
 ## Data Boundary
 
 MobileViews is the unified training, validation, and primary test source.
-Canonical App identity is split before page-pair construction, so train, dev,
+Canonical App identity is split before UI-correspondence construction, so train, dev,
 and test share no App, page, pair, or partition identity.
 
 Self-supervised proposals may enter only the training split. Formal dev and

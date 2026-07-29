@@ -458,12 +458,12 @@ def matcher_inputs(
     source_token_rows = list(encoded_source.token_ids)
     target_token_rows = list(encoded_target.token_ids)
     for index in source_masked:
-        source_token_rows[index] = _context_forced_token_ids(
+        source_token_rows[index] = _masked_context_token_ids(
             source.nodes[index],
             config=cfg,
         )
     for index in target_masked:
-        target_token_rows[index] = _context_forced_token_ids(
+        target_token_rows[index] = _masked_context_token_ids(
             target.nodes[index],
             config=cfg,
         )
@@ -535,7 +535,7 @@ def matcher_inputs(
     )
 
 
-class LearnedGraphMatcher:
+class RelationAwareMatcher:
     """Inference adapter that abstains instead of replaying source coordinates."""
 
     def __init__(
@@ -557,7 +557,7 @@ class LearnedGraphMatcher:
         path: str | Path,
         *,
         device: str = "cpu",
-    ) -> "LearnedGraphMatcher":
+    ) -> "RelationAwareMatcher":
         torch = _require_torch()
         payload = torch.load(Path(path), map_location=device)
         config = MatcherConfig(**dict(payload["matcher_config"]))
@@ -650,6 +650,10 @@ class LearnedGraphMatcher:
         )
 
 
+# Compatibility name for callers and checkpoints predating the RCAM naming.
+LearnedGraphMatcher = RelationAwareMatcher
+
+
 def _is_actionable(node: UINode) -> bool:
     return bool(node.enabled and (node.clickable or node.editable or node.scrollable))
 
@@ -674,7 +678,7 @@ def save_matcher_checkpoint(
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "schema_version": "omnitransfer_relation_matcher_v3",
+            "schema_version": "omnitransfer.relation_aware_cross_attention_matcher.v1",
             "matcher_config": asdict(config),
             "state_dict": model.state_dict(),
             "metadata": dict(metadata or {}),
@@ -876,7 +880,7 @@ def _node_token_ids(node: UINode, *, config: MatcherConfig) -> tuple[int, ...]:
     return tuple(token_ids + [0] * (config.max_tokens - len(token_ids)))
 
 
-def _context_forced_token_ids(
+def _masked_context_token_ids(
     node: UINode,
     *,
     config: MatcherConfig,

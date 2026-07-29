@@ -13,7 +13,7 @@ from omnitransfer.benchmark import (
     partition_queries_by_declared_split,
 )
 from omnitransfer.importers import load_queries
-from omnitransfer.learned_matcher import LearnedGraphMatcher
+from omnitransfer.learned_matcher import RelationAwareMatcher
 
 
 def main() -> None:
@@ -32,7 +32,7 @@ def main() -> None:
     queries = load_queries(args.input)
     if args.split != "all":
         queries = partition_queries_by_declared_split(queries)[args.split]
-    matcher = LearnedGraphMatcher.from_checkpoint(args.checkpoint, device=args.device)
+    matcher = RelationAwareMatcher.from_checkpoint(args.checkpoint, device=args.device)
     summary = benchmark_image_latency(
         matcher.model,
         queries,
