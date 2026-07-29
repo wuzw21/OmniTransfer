@@ -193,6 +193,43 @@ A valid comparison requires retraining from a pool that excludes every
 historical ASE dev/test record before optimization, followed by evaluation on
 the untouched declared split with one frozen metric contract.
 
+## Development-Domain Split Diagnostic
+
+The aggregate 94.91% dev result was decomposed by dataset without changing the
+checkpoint, adapter, or metric. This confirms that the aggregate is dominated
+by MobileViews rather than representing uniform cross-platform performance.
+
+| Dev source | Accepted pairs | Positive rows | Top-1 | R@3 | R@5 |
+|---|---:|---:|---:|---:|---:|
+| MobileViews self-supervised | 2,397 | 39,933 | 95.58% | 98.52% | 99.26% |
+| ASE gold | 104 | 702 | 56.84% | 79.34% | 88.32% |
+| Aggregate | 2,501 | 40,635 | 94.91% | 98.19% | 99.07% |
+
+MobileViews contributes 98.27% of the evaluated positive rows. The training
+cross-page stream has the same imbalance: 25,729 MobileViews pairs versus 765
+ASE pairs, or 97.11% versus 2.89%. Effective ASE supervision is smaller still:
+the actionable adapter filtered 484 of 838 explicit ASE dev correspondences,
+compared with 1,093 of 38,546 MobileViews correspondences.
+
+The correspondence topology also differs. MobileViews dev retains 21,816
+shared-target rows among 37,453 accepted correspondences, whereas ASE dev
+retains only 2 among 354. Thus the aggregate combines a dominant
+same-corpus, Android-to-Android, self-supervised many-to-many task with a small
+strict iOS-to-Android gold task. Page and component overlap are zero, but the
+MobileViews train/dev rows share the collection process, platform, Apps, XML
+conventions, label generator, and correspondence topology; this is the
+same-distribution sense used in the analysis.
+
+```text
+run directory:
+  /home/wuzewen/omnitransfer_eval_20260620/runs/
+  omnitransfer_domain_split_diagnostic_20260729_v1
+ase_dev.report.json:
+  SHA-256 2dea654785a73b4c223d5ae251f6884aa9b0410025f638a18af9704bd3c1ca7a
+mobileviews_dev.report.json:
+  SHA-256 024dbc873906ff153a6a644b27db1145db006fe4e589b6734f70530f3eb9ec75
+```
+
 ## Three-Epoch Ablation
 
 `mask` is the probability that a supervised actionable node loses its own
