@@ -31,6 +31,7 @@ def load_ui_correspondence_pairs(
     max_pairs: int = 0,
     screenshot_root: str | Path | None = None,
     allowed_splits: frozenset[str] = frozenset({"train", "diagnostic"}),
+    allowed_reserved_splits: frozenset[str] | None = None,
 ) -> tuple[list[CorrespondencePair], list[UIGraph], dict[str, Any]]:
     """Load set-valued UI correspondence labels through the canonical adapter."""
 
@@ -38,6 +39,11 @@ def load_ui_correspondence_pairs(
         raise ValueError("minimum_correspondences must be positive")
     if max_pairs < 0:
         raise ValueError("max_pairs must be non-negative")
+    if allowed_reserved_splits is not None and not allowed_reserved_splits <= {
+        "dev",
+        "test",
+    }:
+        raise ValueError("reserved splits may contain only dev and test")
     pairs: list[CorrespondencePair] = []
     config = matcher_config or MatcherConfig()
     graphs: dict[str, UIGraph] = {}
@@ -71,6 +77,13 @@ def load_ui_correspondence_pairs(
                 if record["split"] not in allowed_splits:
                     skipped[f"split:{record['split']}"] += 1
                     continue
+                if allowed_reserved_splits is not None:
+                    reserved_split = str(
+                        record["provenance"].get("reserved_split") or "missing"
+                    )
+                    if reserved_split not in allowed_reserved_splits:
+                        skipped[f"reserved_split:{reserved_split}"] += 1
+                        continue
                 if label_status == "unreviewed" and not allow_unreviewed_pseudo:
                     skipped["unreviewed_requires_opt_in"] += 1
                     continue
@@ -162,6 +175,11 @@ def load_ui_correspondence_pairs(
         "allow_unreviewed_pseudo": allow_unreviewed_pseudo,
         "minimum_correspondences": minimum_correspondences,
         "allowed_splits": sorted(allowed_splits),
+        "allowed_reserved_splits": (
+            sorted(allowed_reserved_splits)
+            if allowed_reserved_splits is not None
+            else None
+        ),
         "screenshot_root": str(assets) if assets is not None else None,
         "datasets": dict(sorted(datasets.items())),
         "label_statuses": dict(sorted(labels.items())),
@@ -232,9 +250,7 @@ def _correspondence_edges(
     record: dict[str, Any],
 ) -> tuple[list[tuple[str, str]], dict[str, int]]:
     correspondence_rows = [
-        match
-        for match in record["matches"]
-        if match["label"] == "correspondence"
+        match for match in record["matches"] if match["label"] == "correspondence"
     ]
     correspondences = [
         (match["source_node_id"], target_id)

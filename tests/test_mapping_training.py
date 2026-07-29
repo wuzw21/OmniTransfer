@@ -81,6 +81,33 @@ def test_unreviewed_pairs_require_explicit_opt_in(tmp_path: Path) -> None:
     assert manifest["skipped"] == {"unreviewed_requires_opt_in": 1}
 
 
+def test_adapter_filters_diagnostic_rows_by_reserved_split(tmp_path: Path) -> None:
+    dev = _record()
+    dev["pair_id"] = "pair-dev"
+    dev["provenance"]["reserved_split"] = "dev"
+    test = _record()
+    test["pair_id"] = "pair-test"
+    test["source"]["page_id"] = "source-test"
+    test["target"]["page_id"] = "target-test"
+    test["provenance"]["reserved_split"] = "test"
+    path = tmp_path / "diagnostic.jsonl"
+    path.write_text(
+        "\n".join((json.dumps(dev), json.dumps(test))) + "\n",
+        encoding="utf-8",
+    )
+
+    pairs, _, manifest = load_ui_correspondence_pairs(
+        [path],
+        allow_unreviewed_pseudo=True,
+        allowed_reserved_splits=frozenset({"test"}),
+    )
+
+    assert len(pairs) == 1
+    assert pairs[0].graph_a.graph_id == "source-test"
+    assert manifest["allowed_reserved_splits"] == ["test"]
+    assert manifest["skipped"] == {"reserved_split:dev": 1}
+
+
 def test_adapter_retains_set_valued_and_shared_target_labels(tmp_path: Path) -> None:
     record = _record()
     record["matches"].append(

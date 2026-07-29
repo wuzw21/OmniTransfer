@@ -15,7 +15,10 @@ from omnitransfer.learned_matcher import (
     parameter_count,
 )
 from omnitransfer.mapping_training import load_ui_correspondence_pairs
-from omnitransfer.self_supervised import CorrespondencePair, evaluate_correspondence_pairs
+from omnitransfer.self_supervised import (
+    CorrespondencePair,
+    evaluate_correspondence_pairs,
+)
 
 
 def main() -> None:
@@ -32,6 +35,14 @@ def main() -> None:
     parser.add_argument("--max-pairs", type=int, default=0)
     parser.add_argument("--latency-repeats", type=int, default=2)
     parser.add_argument("--allow-unreviewed-pseudo", action="store_true")
+    parser.add_argument(
+        "--reserved-split",
+        choices=("dev", "test"),
+        help=(
+            "Evaluate only diagnostic review candidates assigned to this "
+            "frozen held-out split."
+        ),
+    )
     parser.add_argument("--screenshot-root", type=Path)
     args = parser.parse_args()
 
@@ -43,6 +54,7 @@ def main() -> None:
         max_pairs=args.max_pairs,
         allow_unreviewed_pseudo=args.allow_unreviewed_pseudo,
         screenshot_root=args.screenshot_root,
+        reserved_split=args.reserved_split,
     )
     metrics = evaluate_correspondence_pairs(
         matcher.model,
@@ -89,6 +101,7 @@ def load_evaluation_pairs(
     max_pairs: int = 0,
     allow_unreviewed_pseudo: bool = False,
     screenshot_root: Path | None = None,
+    reserved_split: str | None = None,
 ) -> tuple[list[CorrespondencePair], dict[str, Any]]:
     """Use the training adapter unchanged, constrained to one evaluation split."""
 
@@ -100,6 +113,9 @@ def load_evaluation_pairs(
         max_pairs=max_pairs,
         screenshot_root=screenshot_root,
         allowed_splits=frozenset({split}),
+        allowed_reserved_splits=(
+            frozenset({reserved_split}) if reserved_split is not None else None
+        ),
     )
     if not pairs:
         raise SystemExit(f"No actionable {split} correspondence pairs were accepted")
