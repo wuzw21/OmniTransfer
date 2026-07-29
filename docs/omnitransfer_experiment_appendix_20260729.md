@@ -56,9 +56,10 @@ an isolated hardware benchmark.
 
 ## Full-Scale Training Record
 
-The selected configuration was launched on the complete unified training split.
-At the time this record was frozen (`2026-07-29T13:23:40Z`), the process was
-healthy and still training; no final accuracy is claimed in this section.
+The selected configuration completed on the complete unified training split at
+`2026-07-29T14:35:04Z`. The reported score is a development result: most
+MobileViews correspondences are self-supervised, so it is not a held-out
+human-gold test claim.
 
 ```text
 code commit: e1bb5ec
@@ -110,10 +111,38 @@ The exact launch command is preserved in the first `run_start` event of
 | 500 | 0.817922 | 347 | 153 | 50,960 |
 | 750 | 0.853295 | 513 | 237 | 57,709 |
 
-The run directory is the source of truth for all later windows and final
-artifacts. `metrics.jsonl` is append-only during training; `report.json` and
-`checkpoint.pt` are created only after the complete epoch and evaluation
-finish.
+The completed epoch contained 40,134 optimizer updates: 26,494 cross-page
+pairs and 13,640 same-page augmented pairs, with 2,248,472 positive labels.
+The epoch-average loss was `0.473681`.
+
+Evaluation covers both directions of 2,501 dev pairs: 5,002 directional
+examples and 40,635 positive rows.
+
+| Metric | Result |
+|---|---:|
+| Top-1 / Recall@1 | 94.91% |
+| Recall@3 | 98.19% |
+| Recall@5 | 99.07% |
+| warm model p50 / p95 | 4.08 / 5.99 ms |
+| warm end-to-end p50 / p95 | 17.42 / 27.94 ms |
+| model calls under 50 ms | 100.00% |
+| end-to-end calls under 50 ms | 99.44% |
+
+The checkpoint has 579,926 parameters:
+
+```text
+checkpoint.pt:
+  SHA-256 11e3aa9a952bb084270e945c70305279722ae81a4191d6f0fddff073d0e2149a
+report.json:
+  SHA-256 6a3d07688d5f67f36f4935736d56bd8827904bcc3eb086fb2b892cd6ad9e8867
+metrics.jsonl:
+  SHA-256 7b4845f0786e6161c6f00f2af446673610771073d26b6e6c03ff375d5f06a667
+train.log:
+  SHA-256 415d5fb643209e6b7a5644aa1c9c656eacb94b366799dccc038102a6ae2e50c5
+```
+
+The run directory is the source of truth for the complete append-only
+trajectory and final artifacts.
 
 ## Three-Epoch Ablation
 
