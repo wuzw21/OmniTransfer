@@ -54,6 +54,67 @@ The server also hosted unrelated VLLM processes during latency measurement.
 The reported latency is therefore a conservative development measurement, not
 an isolated hardware benchmark.
 
+## Full-Scale Training Record
+
+The selected configuration was launched on the complete unified training split.
+At the time this record was frozen (`2026-07-29T13:23:40Z`), the process was
+healthy and still training; no final accuracy is claimed in this section.
+
+```text
+code commit: e1bb5ec
+server release:
+  /home/wuzewen/omnitransfer_eval_20260620/releases/
+  omnitransfer_contextual_pair_20260729_v2
+run directory:
+  /home/wuzewen/omnitransfer_eval_20260620/runs/
+  omnitransfer_full_contextual_pair_cuda3_seed17_20260729_v1
+launch PID: 606546
+device: cuda:3 (NVIDIA GeForce RTX 4090)
+seed: 17
+epochs: 1
+learning rate: 3e-4
+progress interval: 250 optimizer updates
+assignment head: pair_mlp
+context mask probability: 0.05
+visual crop dropout probability: 0.50
+```
+
+The immutable full inputs are:
+
+```text
+train.jsonl:
+  /home/wuzewen/Projects/Omni/OmniTransfer/runs/
+  ui-correspondence-mixed-within-app-v3-20260729/train.jsonl
+  SHA-256 81db4605997ab243984362022c68e64e31c5bda70bd737371efbf06aebd00448
+
+dev.jsonl:
+  /home/wuzewen/Projects/Omni/OmniTransfer/runs/
+  ui-correspondence-mixed-within-app-v3-20260729/dev.jsonl
+  SHA-256 9e00134a1cffb827f52fdf82bc3fc3f8a4c3fc4713abec02f68050429e39162a
+```
+
+The training adapter accepted 26,494 cross-page pairs (25,729 MobileViews
+self-supervised and 765 ASE gold), 13,713 unique graphs for same-page
+augmentation, and 928,468 actionable correspondences. It filtered 23,801
+non-actionable correspondences and skipped 81 rows with too few actionable
+correspondences. The dev adapter accepted 2,501 pairs and 37,807 actionable
+correspondences. Stable ids are label-only; raw resource ids and absolute
+positions are absent from the model input.
+
+The exact launch command is preserved in the first `run_start` event of
+`metrics.jsonl`. The first three 250-update windows were:
+
+| Updates | Running loss | Cross-page | Same-page augmented | Positive labels |
+|---:|---:|---:|---:|---:|
+| 250 | 1.202553 | 174 | 76 | 39,588 |
+| 500 | 0.817922 | 347 | 153 | 50,960 |
+| 750 | 0.853295 | 513 | 237 | 57,709 |
+
+The run directory is the source of truth for all later windows and final
+artifacts. `metrics.jsonl` is append-only during training; `report.json` and
+`checkpoint.pt` are created only after the complete epoch and evaluation
+finish.
+
 ## Three-Epoch Ablation
 
 `mask` is the probability that a supervised actionable node loses its own
