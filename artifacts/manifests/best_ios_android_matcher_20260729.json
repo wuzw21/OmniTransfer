@@ -1,0 +1,109 @@
+{
+  "schema_version": "omnitransfer.best_model_record.v1",
+  "recorded_at": "2026-07-29",
+  "status": "frozen_accuracy_latency_reference",
+  "preservation_mode": "documentation_and_hashes_only",
+  "next_version": {
+    "name": "context_forced_cross_attention_v1",
+    "status": "design_only_not_trained",
+    "baseline_to_exceed_top1": 0.7883165829145728
+  },
+  "selection_rule": {
+    "constraint": "new_image_p95_ms < 50",
+    "objective": "maximize_top1_on_clean_app_disjoint_ios_to_android_test",
+    "strict_every_sample_under_50ms": false
+  },
+  "model": {
+    "name": "seeded_pair_evidence_mutual_v2",
+    "architecture": "explicit_pair_evidence_mutual_assignment",
+    "parameter_count": 670459,
+    "training_seed": 17,
+    "epochs": 3
+  },
+  "versioned_release": {
+    "host": "baldursgate",
+    "ssh_alias": "9207",
+    "path": "/home/wuzewen/Projects/Omni/OmniTransfer/releases/pair_evidence_mutual_v2_e3e9e2f0_20260722",
+    "checkpoint": {
+      "relative_path": "results/seeded_visual_seed17.pt",
+      "bytes": 2725021,
+      "sha256": "e2c879b5046c86e7493f3eb18c46a24bbe180ae5c483e779a53097384fdc4ad5"
+    },
+    "dev_report": {
+      "relative_path": "results/seeded_visual_seed17.dev.json",
+      "sha256": "2ed5070d9e894ad01e17d2c6157d1d05b549ddf9c7f603374f99322bc8c3b0d2"
+    },
+    "test_report": {
+      "relative_path": "results/seeded_visual_seed17.test.json",
+      "sha256": "8e318eac1f06e28cc390baf1cfcf1673d839d2d757bda33dc27ab6e7836a37a2"
+    }
+  },
+  "dataset": {
+    "name": "ASE_2023_vision_based_widget_mapping_clean_relative_xml_v1",
+    "direction": "iOS_to_Android",
+    "original_gold_mappings": 6730,
+    "screens": 2104,
+    "screen_pairs": 1052,
+    "split_seed": 17,
+    "split_counts": {
+      "train": 4124,
+      "dev": 1014,
+      "test": 1592
+    },
+    "split_app_counts": {
+      "train": 32,
+      "dev": 8,
+      "test": 10
+    },
+    "app_overlap_count": 0,
+    "canonical_clean_queries_sha256": "44603651c4f0b792a5cc1ab991249d87269ee3fb14f49ec4c37f1a96adab5b32",
+    "derived_model_input_sha256": "cb940b5abb8d027cee0cfc7b402e56aacbbf107c019cb5840f59e17c69afc39e"
+  },
+  "dev_metrics": {
+    "top1": 0.7830374753451677,
+    "recall_at_3": 0.9112426035502958,
+    "recall_at_5": 0.9487179487179487
+  },
+  "test_metrics": {
+    "top1": 0.7883165829145728,
+    "recall_at_3": 0.9108040201005025,
+    "recall_at_5": 0.9453517587939698,
+    "mean_reciprocal_rank": 0.857253943160029,
+    "coverage": 0.9993718592964824,
+    "selective_accuracy": 0.7888120678818353
+  },
+  "new_image_latency_ms": {
+    "samples": 100,
+    "p50": 30.827302020043135,
+    "p95": 48.82219200953841,
+    "max": 70.21995773538947,
+    "under_50ms_rate": 0.95,
+    "model_p95": 8.351971860975027,
+    "input_p95": 34.54193193465471
+  },
+  "comparison_notes": {
+    "highest_raw_top1_checkpoint": {
+      "top1": 0.7902010050251256,
+      "new_image_p95_ms": 51.833546720445156,
+      "selected": false,
+      "reason": "misses_the_p95_latency_constraint"
+    },
+    "relation_cross_attention_clean_baseline": {
+      "top1": 0.707286432160804,
+      "recall_at_5": 0.9139447236180904,
+      "new_image_p95_ms": 50.210035871714354
+    },
+    "pair_confidence_no_null_runtime_variant": {
+      "ranking_recall_at_1": 0.7744974874371859,
+      "execution_coverage": 0.8291457286432161,
+      "selective_accuracy": 0.8553030303030303,
+      "overall_executed_correct_fraction": 0.7091708542713567
+    }
+  },
+  "claim_boundary": [
+    "This record freezes the strongest accuracy-latency reference, not the final paper architecture.",
+    "The benchmark contains positive correspondence labels and does not establish learned NULL recall.",
+    "The p95 latency target is met, but 5 percent of measured new-image runs exceeded 50 ms.",
+    "The proposed shortcut-free cross-attention enhancement remains unvalidated until retrained on the clean split."
+  ]
+}
