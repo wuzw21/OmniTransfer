@@ -205,6 +205,7 @@ def adapt_bmoca_trace_corpus(
 
     state_catalogs: dict[str, dict[str, dict[str, Any]]] = {}
     graph_cache: dict[tuple[str, str], UIGraph] = {}
+    executed_anchor_ids_by_graph: dict[str, set[str]] = defaultdict(set)
 
     def trace_state(run_id: str, state_id: str) -> dict[str, Any]:
         trace = trace_by_run.get(run_id)
@@ -299,6 +300,7 @@ def adapt_bmoca_trace_corpus(
                 if node.node_id == source_node.node_id
             )
             executed_nodes_marked_actionable += 1
+        executed_anchor_ids_by_graph[source_graph.graph_id].add(source_node.node_id)
         if not _is_actionable_ui_node(target_node):
             target_graph = _mark_bmoca_executed_node_actionable(
                 target_graph, target_node.node_id
@@ -310,6 +312,7 @@ def adapt_bmoca_trace_corpus(
                 if node.node_id == target_node.node_id
             )
             executed_nodes_marked_actionable += 1
+        executed_anchor_ids_by_graph[target_graph.graph_id].add(target_node.node_id)
 
         group_key = (source_graph.graph_id, target_graph.graph_id)
         group = grouped.setdefault(
@@ -349,6 +352,10 @@ def adapt_bmoca_trace_corpus(
     for (source_page_id, target_page_id), group in sorted(grouped.items()):
         source_graph = graph_cache[group["source_graph_key"]]
         target_graph = graph_cache[group["target_graph_key"]]
+        for node_id in sorted(executed_anchor_ids_by_graph[source_graph.graph_id]):
+            source_graph = _mark_bmoca_executed_node_actionable(source_graph, node_id)
+        for node_id in sorted(executed_anchor_ids_by_graph[target_graph.graph_id]):
+            target_graph = _mark_bmoca_executed_node_actionable(target_graph, node_id)
         source_record = graph_to_record(source_graph)
         target_record = graph_to_record(target_graph)
         source_endpoint = group["source_endpoint"]

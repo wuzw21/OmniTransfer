@@ -210,8 +210,12 @@ def test_bmoca_trace_corpus_groups_actions_and_binds_full_xml_nodes(
     corpus = tmp_path / "bmoca"
     source_trace = corpus / "traces" / "trace-source"
     target_trace = corpus / "traces" / "trace-target"
+    source_trace_2 = corpus / "traces" / "trace-source-2"
+    target_trace_2 = corpus / "traces" / "trace-target-2"
     source_trace.mkdir(parents=True)
     target_trace.mkdir(parents=True)
+    source_trace_2.mkdir(parents=True)
+    target_trace_2.mkdir(parents=True)
     source_xml = """
     <hierarchy width="1080" height="1920">
       <android.widget.FrameLayout bounds="[0,0][1080,1920]">
@@ -266,6 +270,18 @@ def test_bmoca_trace_corpus_groups_actions_and_binds_full_xml_nodes(
         ),
         encoding="utf-8",
     )
+    (source_trace_2 / "transfer_states.json").write_text(
+        (source_trace / "transfer_states.json")
+        .read_text(encoding="utf-8")
+        .replace("run-source", "run-source-2"),
+        encoding="utf-8",
+    )
+    (target_trace_2 / "transfer_states.json").write_text(
+        (target_trace / "transfer_states.json")
+        .read_text(encoding="utf-8")
+        .replace("run-target", "run-target-2"),
+        encoding="utf-8",
+    )
     (corpus / "manifest.json").write_text(
         json.dumps(
             {
@@ -287,6 +303,24 @@ def test_bmoca_trace_corpus_groups_actions_and_binds_full_xml_nodes(
                         "run_id": "run-target",
                         "state_catalog": {
                             "path": "traces/trace-target/transfer_states.json"
+                        },
+                    },
+                    {
+                        "trace_id": "trace-source-2",
+                        "task_id": "task/example",
+                        "environment_id": "100",
+                        "run_id": "run-source-2",
+                        "state_catalog": {
+                            "path": "traces/trace-source-2/transfer_states.json"
+                        },
+                    },
+                    {
+                        "trace_id": "trace-target-2",
+                        "task_id": "task/example",
+                        "environment_id": "101",
+                        "run_id": "run-target-2",
+                        "state_catalog": {
+                            "path": "traces/trace-target-2/transfer_states.json"
                         },
                     },
                 ],
@@ -335,7 +369,7 @@ def test_bmoca_trace_corpus_groups_actions_and_binds_full_xml_nodes(
             "pair_id": "pair-alpha",
             "bidirectional": True,
             "source": endpoint(
-                "run-source",
+                "run-source-2",
                 "source-page",
                 node_id="e2",
                 bounds=[10, 20, 210, 120],
@@ -344,7 +378,7 @@ def test_bmoca_trace_corpus_groups_actions_and_binds_full_xml_nodes(
                 resource_id="alpha",
             ),
             "target": endpoint(
-                "run-target",
+                "run-target-2",
                 "target-page",
                 node_id="e2",
                 bounds=[20, 30, 220, 130],
