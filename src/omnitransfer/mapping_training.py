@@ -237,6 +237,17 @@ def _resolve_screenshot_path(value: str, *, screenshot_root: Path | None) -> str
     original = Path(value).expanduser()
     if original.is_file() or screenshot_root is None or not value:
         return str(original)
+    if not original.is_absolute():
+        relative = screenshot_root / original
+        if relative.is_file():
+            return str(relative)
+    for marker in ("traces", "screenshots"):
+        if marker not in original.parts:
+            continue
+        suffix = Path(*original.parts[original.parts.index(marker) :])
+        materialized = screenshot_root / suffix
+        if materialized.is_file():
+            return str(materialized)
     exact = screenshot_root / original.name
     if exact.is_file():
         return str(exact)

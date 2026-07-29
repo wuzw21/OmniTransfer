@@ -184,6 +184,28 @@ def test_adapter_resolves_materialized_review_screenshot(tmp_path: Path) -> None
     assert pairs[0].graph_a.metadata["screenshot_path"] == str(materialized)
 
 
+def test_adapter_resolves_portable_trace_screenshot_suffix(tmp_path: Path) -> None:
+    record = _record()
+    record["matches"] = record["matches"][:2]
+    record["source"]["screenshot_path"] = (
+        "/Users/example/corpus/traces/trace-a/screenshots/state.png"
+    )
+    path = tmp_path / "diagnostic.jsonl"
+    path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    corpus = tmp_path / "corpus"
+    materialized = corpus / "traces" / "trace-a" / "screenshots" / "state.png"
+    materialized.parent.mkdir(parents=True)
+    materialized.write_bytes(b"not-decoded-during-adaptation")
+
+    pairs, _, _ = load_ui_correspondence_pairs(
+        [path],
+        allow_unreviewed_pseudo=True,
+        screenshot_root=corpus,
+    )
+
+    assert pairs[0].graph_a.metadata["screenshot_path"] == str(materialized)
+
+
 def test_adapter_bounds_local_context_around_all_matches(tmp_path: Path) -> None:
     record = _record()
     record["matches"] = record["matches"][:2]
