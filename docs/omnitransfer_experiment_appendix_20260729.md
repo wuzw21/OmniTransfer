@@ -144,6 +144,55 @@ train.log:
 The run directory is the source of truth for the complete append-only
 trajectory and final artifacts.
 
+## ASE Frozen-Test Contamination Diagnostic
+
+The full-scale checkpoint was also evaluated against the preserved ASE 2023
+test declaration of 240 screen pairs and 1,592 authored mappings. This result
+is **not formal**. The mixed within-App V3 split reassigned the original ASE
+records before training: 191 of the 240 frozen-test screen pairs entered the
+new training split, 27 entered dev, and only 22 remained in test. Consequently,
+this checkpoint must not be promoted using the historical ASE test.
+
+The diagnostic uses the canonical actionable-correspondence adapter and scores
+both source-to-target and target-to-source directions. It is therefore also not
+numerically identical to the historical one-direction 1,592-query protocol.
+
+```text
+run directory:
+  /home/wuzewen/omnitransfer_eval_20260620/runs/
+  omnitransfer_ase_frozen_contaminated_diagnostic_20260729_v1
+input test.jsonl:
+  SHA-256 7a629d112ae83723259fe7c2881bb63ae4a432197e9687adbdde45862e9b6113
+checkpoint.pt:
+  SHA-256 11e3aa9a952bb084270e945c70305279722ae81a4191d6f0fddff073d0e2149a
+report.json:
+  SHA-256 1b3871347aa221c6346973a0574d3585e6e5c87480204670684636b86cca2ebe
+```
+
+The adapter accepted 226 of 240 screen pairs, 763 actionable
+correspondences, and 1,524 bidirectional positive rows. Fourteen screen pairs
+contained no accepted actionable correspondence; 1,100 non-actionable
+candidate correspondences were filtered.
+
+| Slice by V3 reassignment | Frozen-test screen pairs | Evaluated positive rows | Top-1 |
+|---|---:|---:|---:|
+| reassigned to V3 train | 191 | 1,200 | 61.75% |
+| reassigned to V3 dev | 27 | 172 | 67.44% |
+| reassigned to V3 test | 22 | 152 | 65.13% |
+| complete contaminated diagnostic | 240 | 1,524 | 62.73% |
+
+The complete diagnostic has Recall@3 `83.27%`, Recall@5 `91.93%`, warm model
+p95 `5.87 ms`, and warm end-to-end p95 `33.43 ms`. Even the train-overlap
+slice is low, so the result is not explained by unseen-pair generalization
+alone. The full training stream was dominated by MobileViews (25,729 accepted
+cross-page pairs versus 765 ASE pairs), while the ASE task is strict
+iOS-to-Android matching. This is evidence of objective/domain imbalance, not a
+valid replacement for the old formal score.
+
+A valid comparison requires retraining from a pool that excludes every
+historical ASE dev/test record before optimization, followed by evaluation on
+the untouched declared split with one frozen metric contract.
+
 ## Three-Epoch Ablation
 
 `mask` is the probability that a supervised actionable node loses its own
