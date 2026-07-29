@@ -3,7 +3,8 @@ from types import SimpleNamespace
 import pytest
 
 import omnitransfer.runtime as runtime
-from omnitransfer import action_transfer, describe_action_target
+from omnitransfer import action_transfer
+from omnitransfer.runtime import describe_action_target
 
 
 SOURCE_XML = """<hierarchy><node bounds="[0,0][200,100]"><node resource-id="com.example:id/submit" text="Submit" class="android.widget.Button" clickable="true" bounds="[10,10][110,70]" /></node></hierarchy>"""
@@ -59,9 +60,24 @@ def test_action_transfer_uses_matcher_and_projects_source_offset() -> None:
     )
 
     assert result["mapped"] is True
-    assert result["mapping_mode"] == "mutual_graph_matcher_v2"
+    assert result["mapping_mode"] == "mutual_graph_matcher_no_null_v3"
     assert (result["new_x"], result["new_y"]) == (280.0, 260.0)
     assert result["target_bbox"] == [200.0, 220.0, 360.0, 300.0]
+
+
+def test_action_transfer_prefers_actionable_child_with_same_bounds() -> None:
+    source_xml = """<hierarchy bounds="[0,0][720,1280]"><node class="android.widget.FrameLayout" bounds="[104,562][608,675]"><node text="First name" class="android.widget.EditText" clickable="true" enabled="true" bounds="[104,562][608,675]" /></node></hierarchy>"""
+    target_xml = """<hierarchy bounds="[0,0][720,1280]"><node class="android.widget.FrameLayout" bounds="[104,551][608,691]"><node text="First name" class="android.widget.EditText" clickable="true" enabled="true" bounds="[104,551][608,691]" /></node></hierarchy>"""
+
+    result = action_transfer(
+        source_xml=source_xml,
+        target_xml=target_xml,
+        source_point=(356, 618.5),
+    )
+
+    assert result["mapped"] is True
+    assert result["src_element"]["class"] == "android.widget.EditText"
+    assert result["target_bbox"] == [104.0, 551.0, 608.0, 691.0]
 
 
 def test_semantic_transfer_ignores_android_display_size() -> None:
@@ -178,7 +194,7 @@ def test_action_transfer_allows_matcher_to_disambiguate_duplicate_identity(
     )
 
     assert result["mapped"] is True
-    assert result["mapping_mode"] == "mutual_graph_matcher_v2"
+    assert result["mapping_mode"] == "mutual_graph_matcher_no_null_v3"
     assert result["target_bbox"] == [200.0, 220.0, 360.0, 300.0]
     assert sum(
         candidate["resource_id"] == "com.example:id/submit"
@@ -200,7 +216,7 @@ def test_action_transfer_fails_closed_when_matcher_cannot_disambiguate() -> None
     )
 
     assert result["mapped"] is False
-    assert result["mapping_mode"] == "mutual_graph_matcher_v2"
+    assert result["mapping_mode"] == "mutual_graph_matcher_no_null_v3"
     assert result["reason"] == "learned_low_confidence"
     assert sum(
         candidate["resource_id"] == "com.example:id/submit"
@@ -213,7 +229,7 @@ def test_action_transfer_requires_source_anchor() -> None:
 
     assert result == {
         "mapped": False,
-        "mapping_mode": "mutual_graph_matcher_v2",
+        "mapping_mode": "mutual_graph_matcher_no_null_v3",
         "reason": "source_target_missing",
     }
 
@@ -232,7 +248,7 @@ def test_action_transfer_requires_full_source_graph() -> None:
 
     expected = {
         "mapped": False,
-        "mapping_mode": "mutual_graph_matcher_v2",
+        "mapping_mode": "mutual_graph_matcher_no_null_v3",
         "reason": "source_graph_required",
     }
     assert coordinate_result == expected
@@ -265,7 +281,7 @@ def test_action_transfer_rejects_unbounded_anchor_offset() -> None:
 
     assert result == {
         "mapped": False,
-        "mapping_mode": "mutual_graph_matcher_v2",
+        "mapping_mode": "mutual_graph_matcher_no_null_v3",
         "reason": "source_point_or_offset_required",
     }
 

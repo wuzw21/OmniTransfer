@@ -1,7 +1,8 @@
 from types import SimpleNamespace
 
 import omnitransfer.runtime as runtime
-from omnitransfer import action_transfer, runtime_preflight
+from omnitransfer import action_transfer
+from omnitransfer.runtime import runtime_preflight
 
 
 SOURCE_XML = """<hierarchy bounds="[0,0][200,400]"><node text="Connected devices" class="android.widget.TextView" clickable="true" bounds="[20,100][180,160]" /></hierarchy>"""
@@ -34,7 +35,7 @@ def test_action_transfer_uses_mutual_matcher_for_full_graphs(monkeypatch) -> Non
     assert len(calls) == 1
     assert calls[0][2]["source_node_id"] == "0.0"
     assert result["mapped"] is True
-    assert result["mapping_mode"] == "mutual_graph_matcher_v2"
+    assert result["mapping_mode"] == "mutual_graph_matcher_no_null_v3"
     assert result["target_bbox"] == [40.0, 300.0, 360.0, 400.0]
     assert result["score"] == 0.91
     assert result["margin"] == 0.42
@@ -53,7 +54,7 @@ def test_action_transfer_fails_closed_when_matcher_is_unavailable(monkeypatch) -
     )
 
     assert result["mapped"] is False
-    assert result["mapping_mode"] == "mutual_graph_matcher_v2"
+    assert result["mapping_mode"] == "mutual_graph_matcher_no_null_v3"
     assert result["reason"] == "matcher_unavailable"
     assert "checkpoint missing" in result["error"]
 
@@ -92,7 +93,7 @@ def test_action_transfer_never_replays_relative_source_coordinates() -> None:
 
     assert result == {
         "mapped": False,
-        "mapping_mode": "mutual_graph_matcher_v2",
+        "mapping_mode": "mutual_graph_matcher_no_null_v3",
         "reason": "source_graph_required",
     }
 

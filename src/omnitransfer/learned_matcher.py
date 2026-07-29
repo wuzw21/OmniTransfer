@@ -18,6 +18,17 @@ from omnitransfer.ui_graph import BBox, UIGraph, UINode, local_context_graph
 # channels are reserved zeros and contain no geometry.
 NUMERIC_FEATURE_DIM = 18
 RELATION_FEATURE_DIM = 18
+RCAM_FEATURE_SCHEMA_ID = "rcam-node-context-v1"
+PEMM_V3_FEATURE_SCHEMA_ID = "pemm-v3-node-context-v1"
+PEMM_V3_FEATURE_SCHEMA_SPEC = (
+    "tokens=text,content_desc,resource_id,class,action_type,parent_text,"
+    "screen_region,sibling_texts,nearby_texts;"
+    "numeric=action_state,normalized_bbox,depth,child_count,parent_presence;"
+    "relations=within_graph_tree_layout,cross_graph_normalized_geometry"
+)
+PEMM_V3_FEATURE_SCHEMA_SHA256 = hashlib.sha256(
+    PEMM_V3_FEATURE_SCHEMA_SPEC.encode("utf-8")
+).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -78,17 +89,26 @@ def encode_graph(
     graph: UIGraph,
     *,
     config: MatcherConfig | None = None,
+    feature_schema_id: str = RCAM_FEATURE_SCHEMA_ID,
 ) -> EncodedGraph:
     """Encode UI attributes and pairwise relations without fixed match weights."""
 
     cfg = config or MatcherConfig()
+    if feature_schema_id == RCAM_FEATURE_SCHEMA_ID:
+        token_encoder = _node_token_ids
+        numeric_encoder = _node_numeric_features
+    elif feature_schema_id == PEMM_V3_FEATURE_SCHEMA_ID:
+        token_encoder = _pemm_v3_node_token_ids
+        numeric_encoder = _pemm_v3_node_numeric_features
+    else:
+        raise ValueError(f"unsupported matcher feature schema: {feature_schema_id}")
     return EncodedGraph(
         graph_id=graph.graph_id,
         node_ids=tuple(node.node_id for node in graph.nodes),
         origin_ids=tuple(node.origin_id for node in graph.nodes),
-        token_ids=tuple(_node_token_ids(node, config=cfg) for node in graph.nodes),
+        token_ids=tuple(token_encoder(node, config=cfg) for node in graph.nodes),
         numeric_features=tuple(
-            _node_numeric_features(node, graph) for node in graph.nodes
+            numeric_encoder(node, graph) for node in graph.nodes
         ),
         relation_features=_relation_features(graph),
     )
@@ -97,18 +117,26 @@ def encode_graph(
 def cross_relation_features(
     source: UIGraph,
     target: UIGraph,
+    *,
+    feature_schema_id: str = RCAM_FEATURE_SCHEMA_ID,
 ) -> Any:
-    """Return a geometry-free source-target relation tensor.
+    """Return cross-page relations under an explicit feature contract."""
 
-    Layout enters the matcher only as relations among nodes on the same page.
-    Cross-page absolute position and size are deliberately unavailable to the
-    pair head so they cannot become transfer shortcuts.
-    """
-
-    np = _require_numpy()
-    return np.zeros(
-        (len(source.nodes), len(target.nodes), RELATION_FEATURE_DIM),
-        dtype=np.float32,
+    if feature_schema_id not in {
+        RCAM_FEATURE_SCHEMA_ID,
+        PEMM_V3_FEATURE_SCHEMA_ID,
+    }:
+        raise ValueError(f"unsupported matcher feature schema: {feature_schema_id}")
+    source_context = _relation_context(source)
+    target_context = _relation_context(target)
+    same_graph = source is target or source.graph_id == target.graph_id
+    return _relation_matrix(
+        source_context,
+        target_context,
+        same_graph=same_graph,
+        include_cross_graph_geometry=(
+            feature_schema_id == PEMM_V3_FEATURE_SCHEMA_ID
+        ),
     )
 
 
@@ -434,6 +462,7 @@ def matcher_inputs(
     device: str | Any = "cpu",
     source_context_mask_indices: Iterable[int] = (),
     target_context_mask_indices: Iterable[int] = (),
+    feature_schema_id: str = RCAM_FEATURE_SCHEMA_ID,
 ) -> tuple[Any, ...]:
     """Convert two UI graphs to tensors accepted by the learned matcher.
 
@@ -443,8 +472,16 @@ def matcher_inputs(
 
     torch = _require_torch()
     cfg = config or MatcherConfig()
-    encoded_source = encode_graph(source, config=cfg)
-    encoded_target = encode_graph(target, config=cfg)
+    encoded_source = encode_graph(
+        source,
+        config=cfg,
+        feature_schema_id=feature_schema_id,
+    )
+    encoded_target = encode_graph(
+        target,
+        config=cfg,
+        feature_schema_id=feature_schema_id,
+    )
     source_masked = _validated_mask_indices(
         source_context_mask_indices,
         node_count=len(source.nodes),
@@ -498,7 +535,11 @@ def matcher_inputs(
         device=device,
     )
     pair_relations = torch.as_tensor(
-        cross_relation_features(source, target),
+        cross_relation_features(
+            source,
+            target,
+            feature_schema_id=feature_schema_id,
+        ),
         dtype=torch.float32,
         device=device,
     )
@@ -537,6 +578,8 @@ def matcher_inputs(
 
 class RelationAwareMatcher:
     """Inference adapter that abstains instead of replaying source coordinates."""
+
+    feature_schema_id = RCAM_FEATURE_SCHEMA_ID
 
     def __init__(
         self,
@@ -613,6 +656,7 @@ class RelationAwareMatcher:
             target,
             config=self.config,
             device=self.device,
+            feature_schema_id=self.feature_schema_id,
         )
         with torch.no_grad():
             output = self.model(*inputs)
@@ -880,6 +924,55 @@ def _node_token_ids(node: UINode, *, config: MatcherConfig) -> tuple[int, ...]:
     return tuple(token_ids + [0] * (config.max_tokens - len(token_ids)))
 
 
+def _pemm_v3_node_token_ids(
+    node: UINode,
+    *,
+    config: MatcherConfig,
+) -> tuple[int, ...]:
+    """Reproduce the exact token contract used to train PEMM v3."""
+
+    pieces: list[str] = ["node"]
+    fields: list[tuple[str, str]] = [
+        ("text", node.text),
+        ("desc", node.content_desc),
+        ("resource", node.resource_id),
+        ("class", node.class_name),
+    ]
+    metadata = node.metadata or {}
+    for field_name in ("action_type", "parent_text", "screen_region"):
+        fields.append((field_name, str(metadata.get(field_name) or "")))
+    for field_name in ("sibling_texts", "nearby_texts"):
+        values = metadata.get(field_name) or ()
+        if isinstance(values, str):
+            values = (values,)
+        fields.append((field_name, " ".join(str(value) for value in values)))
+    for field_name, value in fields:
+        normalized = _normalize_text(value)
+        if not normalized:
+            continue
+        pieces.append(f"field:{field_name}")
+        words = re.findall(r"[a-z0-9]+", normalized)
+        for word in words:
+            pieces.append(f"{field_name}:word:{word}")
+            if len(word) >= 3:
+                padded = f"^{word}$"
+                pieces.extend(
+                    f"{field_name}:ngram:{padded[index : index + 3]}"
+                    for index in range(len(padded) - 2)
+                )
+    token_ids: list[int] = []
+    seen: set[int] = set()
+    for piece in pieces:
+        token_id = _token_bucket(piece, config.vocab_size)
+        if token_id in seen:
+            continue
+        seen.add(token_id)
+        token_ids.append(token_id)
+        if len(token_ids) >= config.max_tokens:
+            break
+    return tuple(token_ids + [0] * (config.max_tokens - len(token_ids)))
+
+
 def _masked_context_token_ids(
     node: UINode,
     *,
@@ -911,6 +1004,55 @@ def _node_numeric_features(node: UINode, graph: UIGraph) -> tuple[float, ...]:
         float(node.scrollable),
         float(node.enabled),
         *(0.0 for _ in range(NUMERIC_FEATURE_DIM - 4)),
+    )
+    if len(values) != NUMERIC_FEATURE_DIM:
+        raise AssertionError("unexpected numeric feature dimension")
+    return values
+
+
+def _pemm_v3_node_numeric_features(
+    node: UINode,
+    graph: UIGraph,
+) -> tuple[float, ...]:
+    """Reproduce the exact numeric contract used to train PEMM v3."""
+
+    bbox = _normalized_bbox(node.bbox, graph)
+    if bbox is None:
+        x1 = y1 = x2 = y2 = center_x = center_y = 0.0
+        width = height = area = aspect = 0.0
+        has_bbox = 0.0
+    else:
+        x1, y1, x2, y2 = bbox
+        width = max(0.0, x2 - x1)
+        height = max(0.0, y2 - y1)
+        center_x = x1 + width / 2.0
+        center_y = y1 + height / 2.0
+        area = width * height
+        aspect = _clip(
+            math.log(max(width, 1e-6) / max(height, 1e-6)) / 4.0,
+            -1.0,
+            1.0,
+        )
+        has_bbox = 1.0
+    values = (
+        float(node.clickable),
+        float(node.editable),
+        float(node.scrollable),
+        float(node.enabled),
+        has_bbox,
+        x1,
+        y1,
+        x2,
+        y2,
+        center_x,
+        center_y,
+        width,
+        height,
+        area,
+        aspect,
+        min(float(node.depth) / 32.0, 1.0),
+        min(float(len(node.child_ids)) / 16.0, 1.0),
+        float(node.parent_id is not None),
     )
     if len(values) != NUMERIC_FEATURE_DIM:
         raise AssertionError("unexpected numeric feature dimension")
@@ -992,6 +1134,7 @@ def _relation_matrix(
     target_context: _RelationContext,
     *,
     same_graph: bool,
+    include_cross_graph_geometry: bool = False,
 ) -> Any:
     np = _require_numpy()
     source_count = len(source_context.graph.nodes)
@@ -1000,7 +1143,7 @@ def _relation_matrix(
         (source_count, target_count, RELATION_FEATURE_DIM),
         dtype=np.float32,
     )
-    if not same_graph:
+    if not same_graph and not include_cross_graph_geometry:
         return values
     source_centers = np.asarray(source_context.centers, dtype=np.float32)
     target_centers = np.asarray(target_context.centers, dtype=np.float32)

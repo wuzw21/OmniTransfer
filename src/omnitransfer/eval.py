@@ -141,6 +141,8 @@ def ranking_metrics(
 
 
 def _prediction_confidence(prediction: Prediction) -> float:
+    if prediction.metadata.get("match_confidence") is not None:
+        return float(prediction.metadata["match_confidence"])
     if prediction.selected_candidate_id is None:
         if prediction.metadata.get("null_probability") is not None:
             return float(prediction.metadata["null_probability"])

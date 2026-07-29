@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from omnitransfer.benchmark import matcher_inputs
-from omnitransfer.learned_matcher import MatcherConfig
+from omnitransfer.learned_matcher import MatcherConfig, PEMM_V3_FEATURE_SCHEMA_ID
 from omnitransfer.mutual_matcher import (
     MutualGraphMatcher,
     build_mutual_assignment_matcher,
@@ -22,31 +22,21 @@ torch = pytest.importorskip("torch", exc_type=ImportError)
 
 def test_single_matrix_produces_bidirectional_correspondence() -> None:
     affinity = torch.tensor([[6.0, 0.0], [0.0, 6.0]])
-    source_null = torch.tensor([-6.0, -6.0])
-    target_null = torch.tensor([-6.0, -6.0])
 
-    logits_ab, logits_ba = mutual_assignment_logits(
-        affinity,
-        source_null_logits=source_null,
-        target_null_logits=target_null,
-    )
+    logits_ab, logits_ba = mutual_assignment_logits(affinity)
 
-    assert logits_ab.shape == (2, 3)
-    assert logits_ba.shape == (2, 3)
-    assert logits_ab[:, :-1].argmax(dim=1).tolist() == [0, 1]
-    assert logits_ba[:, :-1].argmax(dim=1).tolist() == [0, 1]
-    assert torch.allclose(logits_ab[:, :-1], logits_ba[:, :-1].T)
+    assert logits_ab.shape == (2, 2)
+    assert logits_ba.shape == (2, 2)
+    assert logits_ab.argmax(dim=1).tolist() == [0, 1]
+    assert logits_ba.argmax(dim=1).tolist() == [0, 1]
+    assert torch.allclose(logits_ab, logits_ba.T)
 
 
-def test_null_is_part_of_the_same_assignment_matrix() -> None:
-    logits_ab, logits_ba = mutual_assignment_logits(
-        torch.zeros((1, 1)),
-        source_null_logits=torch.tensor([10.0]),
-        target_null_logits=torch.tensor([10.0]),
-    )
+def test_assignment_matrix_has_no_null_column() -> None:
+    logits_ab, logits_ba = mutual_assignment_logits(torch.zeros((1, 1)))
 
-    assert logits_ab[0, -1] > logits_ab[0, 0]
-    assert logits_ba[0, -1] > logits_ba[0, 0]
+    assert logits_ab.shape == (1, 1)
+    assert logits_ba.shape == (1, 1)
 
 
 def test_model_forward_preserves_one_matrix_bidirectional_invariant() -> None:
@@ -64,13 +54,13 @@ def test_model_forward_preserves_one_matrix_bidirectional_invariant() -> None:
     model = build_mutual_assignment_matcher(config)
     output = model(*matcher_inputs(source, target, config=config, device="cpu"))
 
-    assert output["logits_ab"].shape == (2, 3)
-    assert output["logits_ba"].shape == (2, 3)
+    assert output["logits_ab"].shape == (2, 2)
+    assert output["logits_ba"].shape == (2, 2)
     assert torch.isfinite(output["logits_ab"]).all()
     assert torch.isfinite(output["logits_ba"]).all()
     assert torch.allclose(
-        output["logits_ab"][:, :-1],
-        output["logits_ba"][:, :-1].T,
+        output["logits_ab"],
+        output["logits_ba"].T,
     )
 
 
@@ -212,9 +202,15 @@ def test_numpy_checkpoint_matches_pytorch_xml_inference(tmp_path) -> None:
         config=config,
     )
 
-    expected = model(*matcher_inputs(source, target, config=config, device="cpu"))[
-        "logits_ab"
-    ].detach()
+    expected = model(
+        *matcher_inputs(
+            source,
+            target,
+            config=config,
+            device="cpu",
+            feature_schema_id=PEMM_V3_FEATURE_SCHEMA_ID,
+        )
+    )["logits_ab"].detach()
     matcher = NumpyMutualGraphMatcher.from_checkpoint(checkpoint)
     actual = torch.from_numpy(matcher._forward(source, target)["logits_ab"])
 

@@ -16,7 +16,11 @@ from omnitransfer.benchmark import (
     split_queries_by_group,
 )
 from omnitransfer.importers import load_queries
-from omnitransfer.learned_matcher import parameter_count
+from omnitransfer.learned_matcher import (
+    PEMM_V3_FEATURE_SCHEMA_ID,
+    PEMM_V3_FEATURE_SCHEMA_SHA256,
+    parameter_count,
+)
 from omnitransfer.mutual_matcher import MutualGraphMatcher
 
 
@@ -30,8 +34,8 @@ def main() -> None:
     parser.add_argument("--split-seed", type=int, default=17)
     parser.add_argument("--eval-split", choices=("dev", "test"), required=True)
     parser.add_argument("--limit-eval", type=int, default=0)
-    parser.add_argument("--min-probability", type=float, default=0.0)
-    parser.add_argument("--min-margin", type=float, default=0.0)
+    parser.add_argument("--min-probability", type=float, default=0.5)
+    parser.add_argument("--min-margin", type=float, default=0.15)
     parser.add_argument("--latency-budget-ms", type=float, default=50.0)
     parser.add_argument("--latency-images", type=int, default=100)
     parser.add_argument("--fail-on-latency", action="store_true")
@@ -50,6 +54,7 @@ def main() -> None:
         device=args.device,
         budget_ms=args.latency_budget_ms,
         max_images=args.latency_images,
+        feature_schema_id=PEMM_V3_FEATURE_SCHEMA_ID,
     )
     predictions = predict_queries(
         matcher.model,
@@ -58,14 +63,15 @@ def main() -> None:
         device=args.device,
         min_probability=args.min_probability,
         min_margin=args.min_margin,
+        feature_schema_id=PEMM_V3_FEATURE_SCHEMA_ID,
     )
     metrics = {
         name: asdict(summary)
         for name, summary in evaluate_slices(eval_queries, predictions).items()
     }
     report = {
-        "schema_version": "omnitransfer_frozen_mutual_matcher_evaluation_v2",
-        "architecture": "explicit_pair_evidence_mutual_assignment",
+        "schema_version": "omnitransfer_frozen_mutual_matcher_evaluation_v3",
+        "architecture": "explicit_pair_evidence_mutual_assignment_no_null",
         "input": str(args.input.resolve()),
         "input_sha256": _sha256(args.input),
         "checkpoint": str(args.checkpoint.resolve()),
@@ -76,6 +82,8 @@ def main() -> None:
         "eval_queries": len(eval_queries),
         "matcher_config": asdict(matcher.config),
         "parameter_count": parameter_count(matcher.model),
+        "feature_schema_id": PEMM_V3_FEATURE_SCHEMA_ID,
+        "feature_schema_sha256": PEMM_V3_FEATURE_SCHEMA_SHA256,
         "thresholds": {
             "min_probability": args.min_probability,
             "min_margin": args.min_margin,

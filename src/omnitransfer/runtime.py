@@ -9,26 +9,32 @@ import os
 from pathlib import Path
 from typing import Any
 
+from omnitransfer.learned_matcher import (
+    PEMM_V3_FEATURE_SCHEMA_ID,
+    PEMM_V3_FEATURE_SCHEMA_SHA256,
+)
 from omnitransfer.mutual_matcher import MutualGraphMatcher
 from omnitransfer.numpy_matcher import NumpyMutualGraphMatcher
 from omnitransfer.ui_graph import UIGraph, UINode, graph_from_record
 
-
 _MIN_ANCHOR_OFFSET = -1.0
 _MAX_ANCHOR_OFFSET = 2.0
-_MATCHER_MODE = "mutual_graph_matcher_v2"
+_MATCHER_RELEASE = "pair-evidence-mutual-matcher-v3.0.1"
+_MATCHER_MODE = "mutual_graph_matcher_no_null_v3"
+_DEFAULT_MATCHER_MIN_PROBABILITY = 0.5
+_DEFAULT_MATCHER_MIN_MARGIN = 0.15
 _DEFAULT_MATCHER_CHECKPOINT = (
     Path(__file__).resolve().parent
     / "checkpoints"
-    / "pair_evidence_mutual_v2_e3e9e2f0_20260722"
-    / "seeded_visual_seed17.pt"
+    / "pair_evidence_mutual_no_null_v3_20260723"
+    / "no_null_seed17.pt"
 )
 _DEFAULT_MATCHER_SHA256 = (
-    "e2c879b5046c86e7493f3eb18c46a24bbe180ae5c483e779a53097384fdc4ad5"
+    "61beec6da26f7aab7c51fd778ea22b5cfc956ca0cb658f1e91f4e8debc6f95b8"
 )
 _DEFAULT_NUMPY_MATCHER_CHECKPOINT = _DEFAULT_MATCHER_CHECKPOINT.with_suffix(".npz")
 _DEFAULT_NUMPY_MATCHER_SHA256 = (
-    "700de8fac2ba5f8e723ed2e812704f33de62dead3051b9d0279369a70f07ae37"
+    "6e5668343419da38776e1f32ad9da610abc323637d8f6c6df38fb72ddec062b8"
 )
 
 
@@ -113,18 +119,20 @@ def action_transfer(
     )
     try:
         matcher = _get_matcher()
+        matcher_metadata = _matcher_metadata(matcher)
         match = matcher.predict(
             source,
             target,
             source_node_id=source_node.node_id,
             candidate_node_ids=candidates,
-            min_probability=_matcher_threshold("OMNITRANSFER_MATCHER_MIN_PROBABILITY"),
-            min_margin=_matcher_threshold("OMNITRANSFER_MATCHER_MIN_MARGIN"),
+            min_probability=_DEFAULT_MATCHER_MIN_PROBABILITY,
+            min_margin=_DEFAULT_MATCHER_MIN_MARGIN,
         )
     except Exception as error:
         return {
             "mapped": False,
             "mapping_mode": _MATCHER_MODE,
+            "matcher_release": _MATCHER_RELEASE,
             "reason": "matcher_unavailable",
             "error": str(error) or type(error).__name__,
             "src_element": _node_dict(source_node),
@@ -142,8 +150,11 @@ def action_transfer(
             "source_size": _graph_size(source),
             "target_size": _graph_size(target),
             "score": float(match.probability),
+            "pair_confidence": float(match.probability),
+            "rank_probability": _top_rank_probability(ranked),
             "margin": float(match.margin),
             "top_candidates": _candidate_dicts(ranked, top_k),
+            **matcher_metadata,
         }
     return _mapped_result(
         source=source,
@@ -159,6 +170,7 @@ def action_transfer(
         action_type=action_type,
         source_activity_name=source_activity_name,
         target_activity_name=target_activity_name,
+        matcher_metadata=matcher_metadata,
     )
 
 
@@ -177,9 +189,10 @@ def _mapped_result(
     action_type: str,
     source_activity_name: str | None,
     target_activity_name: str | None,
+    matcher_metadata: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     target_point = _project_offset(offset, target_node.bbox or (0.0, 0.0, 0.0, 0.0))
-    return {
+    result = {
         "mapped": True,
         "mapping_mode": mapping_mode,
         "new_x": target_point[0],
@@ -191,22 +204,24 @@ def _mapped_result(
         "target_bbox": list(target_node.bbox),
         "target_center": list(_center(target_node.bbox)),
         "score": score,
+        "pair_confidence": score,
+        "rank_probability": _top_rank_probability(ranked),
         "margin": margin,
         "top_candidates": _candidate_dicts(ranked, top_k),
         "action_type": action_type,
         "source_activity_name": str(source_activity_name or ""),
         "target_activity_name": str(target_activity_name or ""),
     }
+    if matcher_metadata:
+        result.update(matcher_metadata)
+    return result
 
 
 def _get_matcher() -> MutualGraphMatcher:
-    configured = str(os.environ.get("OMNITRANSFER_MATCHER_CHECKPOINT") or "").strip()
-    checkpoint = Path(configured).expanduser() if configured else _DEFAULT_MATCHER_CHECKPOINT
     device = str(os.environ.get("OMNITRANSFER_MATCHER_DEVICE") or "cpu").strip()
-    numpy_checkpoint = checkpoint if checkpoint.suffix == ".npz" else checkpoint.with_suffix(".npz")
     return _load_matcher(
-        str(checkpoint.resolve()),
-        str(numpy_checkpoint.resolve()),
+        str(_DEFAULT_MATCHER_CHECKPOINT.resolve()),
+        str(_DEFAULT_NUMPY_MATCHER_CHECKPOINT.resolve()),
         device,
     )
 
@@ -253,6 +268,18 @@ def matcher_backend() -> str:
     return str(getattr(matcher, "backend", "pytorch"))
 
 
+def runtime_matcher_manifest() -> dict[str, Any]:
+    """Describe the immutable matcher used by the replay-time API."""
+
+    matcher = _get_matcher()
+    return {
+        **_matcher_metadata(matcher),
+        "mapping_mode": _MATCHER_MODE,
+        "min_pair_confidence": _DEFAULT_MATCHER_MIN_PROBABILITY,
+        "min_rank_margin": _DEFAULT_MATCHER_MIN_MARGIN,
+    }
+
+
 def runtime_preflight() -> dict[str, Any]:
     """Load the matcher and execute a deterministic end-to-end mapping."""
 
@@ -282,14 +309,30 @@ def runtime_preflight() -> dict[str, Any]:
     return {
         "ready": True,
         "backend": matcher_backend(),
+        **runtime_matcher_manifest(),
     }
 
 
-def _matcher_threshold(name: str) -> float:
-    value = float(os.environ.get(name) or 0.0)
-    if not math.isfinite(value) or value < 0.0 or value > 1.0:
-        raise ValueError(f"{name} must be between 0 and 1")
-    return value
+def _matcher_metadata(
+    matcher: MutualGraphMatcher | NumpyMutualGraphMatcher,
+) -> dict[str, str]:
+    backend = str(getattr(matcher, "backend", "pytorch"))
+    checkpoint_sha256 = (
+        _DEFAULT_NUMPY_MATCHER_SHA256
+        if backend == "numpy"
+        else _DEFAULT_MATCHER_SHA256
+    )
+    return {
+        "matcher_release": _MATCHER_RELEASE,
+        "matcher_backend": backend,
+        "matcher_checkpoint_sha256": checkpoint_sha256,
+        "matcher_feature_schema": PEMM_V3_FEATURE_SCHEMA_ID,
+        "matcher_feature_schema_sha256": PEMM_V3_FEATURE_SCHEMA_SHA256,
+    }
+
+
+def _top_rank_probability(ranked: list[tuple[float, UINode]]) -> float:
+    return float(ranked[0][0]) if ranked else 0.0
 
 
 def _learned_candidates(
@@ -433,7 +476,22 @@ def _source_node(
         and node.bbox[0] <= x <= node.bbox[2]
         and node.bbox[1] <= y <= node.bbox[3]
     ]
-    return min(containing, key=lambda node: _area(node.bbox), default=None)
+    actionable = [
+        node
+        for node in containing
+        if node.enabled and (node.clickable or node.editable or node.scrollable)
+    ]
+    candidates = actionable or containing
+    return min(
+        candidates,
+        key=lambda node: (
+            _area(node.bbox),
+            not _has_stable_identity(node),
+            -node.depth,
+            node.node_id,
+        ),
+        default=None,
+    )
 
 
 def _has_stable_identity(node: UINode) -> bool:

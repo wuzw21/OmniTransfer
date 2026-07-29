@@ -18,7 +18,12 @@ from omnitransfer.benchmark import (
     split_queries_by_group,
 )
 from omnitransfer.importers import load_queries
-from omnitransfer.learned_matcher import MatcherConfig, parameter_count
+from omnitransfer.learned_matcher import (
+    MatcherConfig,
+    PEMM_V3_FEATURE_SCHEMA_ID,
+    PEMM_V3_FEATURE_SCHEMA_SHA256,
+    parameter_count,
+)
 from omnitransfer.mutual_matcher import (
     build_mutual_assignment_matcher,
     save_mutual_matcher_checkpoint,
@@ -43,11 +48,12 @@ def main() -> None:
     parser.add_argument("--target-context-nodes", type=int, default=64)
     parser.add_argument("--limit-train", type=int, default=0)
     parser.add_argument("--limit-eval", type=int, default=0)
-    parser.add_argument("--min-probability", type=float, default=0.0)
-    parser.add_argument("--min-margin", type=float, default=0.0)
+    parser.add_argument("--min-probability", type=float, default=0.5)
+    parser.add_argument("--min-margin", type=float, default=0.15)
     parser.add_argument("--latency-budget-ms", type=float, default=50.0)
     parser.add_argument("--latency-images", type=int, default=100)
     parser.add_argument("--fail-on-latency", action="store_true")
+    parser.add_argument("--confidence-weight", type=float, default=1.0)
     args = parser.parse_args()
 
     queries = load_queries(args.input)
@@ -77,6 +83,8 @@ def main() -> None:
         learning_rate=args.learning_rate,
         seed=args.seed,
         device=args.device,
+        confidence_weight=args.confidence_weight,
+        feature_schema_id=PEMM_V3_FEATURE_SCHEMA_ID,
     )
     image_latency = benchmark_image_latency(
         result.model,
@@ -85,6 +93,7 @@ def main() -> None:
         device=args.device,
         budget_ms=args.latency_budget_ms,
         max_images=args.latency_images,
+        feature_schema_id=PEMM_V3_FEATURE_SCHEMA_ID,
     )
     predictions = predict_queries(
         result.model,
@@ -93,14 +102,15 @@ def main() -> None:
         device=args.device,
         min_probability=args.min_probability,
         min_margin=args.min_margin,
+        feature_schema_id=PEMM_V3_FEATURE_SCHEMA_ID,
     )
     metrics = {
         name: asdict(summary)
         for name, summary in evaluate_slices(eval_queries, predictions).items()
     }
     report = {
-        "schema_version": "omnitransfer_mutual_matcher_experiment_v2",
-        "architecture": "explicit_pair_evidence_mutual_assignment",
+        "schema_version": "omnitransfer_mutual_matcher_experiment_v3",
+        "architecture": "explicit_pair_evidence_mutual_assignment_no_null",
         "input": str(args.input.resolve()),
         "split_counts": {name: len(rows) for name, rows in splits.items()},
         "split_seed": args.split_seed,
@@ -110,6 +120,9 @@ def main() -> None:
         "eval_queries": len(eval_queries),
         "matcher_config": asdict(config),
         "parameter_count": parameter_count(result.model),
+        "feature_schema_id": PEMM_V3_FEATURE_SCHEMA_ID,
+        "feature_schema_sha256": PEMM_V3_FEATURE_SCHEMA_SHA256,
+        "confidence_weight": args.confidence_weight,
         "history": list(result.history),
         "thresholds": {
             "min_probability": args.min_probability,

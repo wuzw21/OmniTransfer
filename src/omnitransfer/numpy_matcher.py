@@ -2,26 +2,34 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
 import json
 import math
+from collections.abc import Iterable, Mapping
+from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any
 
 from omnitransfer.learned_matcher import (
     LearnedMatch,
     MatcherConfig,
+    PEMM_V3_FEATURE_SCHEMA_ID,
     cross_relation_features,
     encode_graph,
+    is_actionable,
 )
 from omnitransfer.ui_graph import UIGraph, local_context_graph
 
-
-_SCHEMA_VERSION = "omnitransfer_numpy_mutual_matcher_v1"
+_SCHEMA_VERSION = "omnitransfer_numpy_mutual_matcher_v2"
+_COMPATIBLE_SCHEMA_VERSIONS = {
+    "omnitransfer_numpy_mutual_matcher_v1",
+    _SCHEMA_VERSION,
+}
 
 
 class NumpyMutualGraphMatcher:
     """Inference-only adapter for XML graph matching without PyTorch."""
+
+    feature_schema_id = PEMM_V3_FEATURE_SCHEMA_ID
 
     def __init__(
         self,
@@ -34,11 +42,11 @@ class NumpyMutualGraphMatcher:
         self.backend = "numpy"
 
     @classmethod
-    def from_checkpoint(cls, path: str | Path) -> "NumpyMutualGraphMatcher":
+    def from_checkpoint(cls, path: str | Path) -> NumpyMutualGraphMatcher:
         np = _require_numpy()
         with np.load(Path(path), allow_pickle=False) as checkpoint:
             schema_version = _decode(checkpoint["__schema_version__"])
-            if schema_version != _SCHEMA_VERSION:
+            if schema_version not in _COMPATIBLE_SCHEMA_VERSIONS:
                 raise ValueError("checkpoint is not a NumPy mutual assignment matcher")
             config = MatcherConfig(**json.loads(_decode(checkpoint["__config_json__"])))
             weights = {
@@ -58,9 +66,15 @@ class NumpyMutualGraphMatcher:
         min_probability: float = 0.0,
         min_margin: float = 0.0,
     ) -> LearnedMatch:
-        np = _require_numpy()
-        if not any(node.node_id == source_node_id for node in source.nodes):
+        _require_numpy()
+        source_node = next(
+            (node for node in source.nodes if node.node_id == source_node_id),
+            None,
+        )
+        if source_node is None:
             return LearnedMatch(None, 0.0, 0.0, "source_node_missing", ())
+        if not is_actionable(source_node):
+            return LearnedMatch(None, 0.0, 0.0, "source_node_not_actionable", ())
         if source.metadata.get("screenshot_path") or target.metadata.get("screenshot_path"):
             raise RuntimeError("numpy_matcher_requires_xml_only_graphs")
         if len(source.nodes) > self.config.source_context_nodes:
@@ -81,42 +95,60 @@ class NumpyMutualGraphMatcher:
             raise AssertionError("source context dropped its anchor node")
         allowed = set(candidate_node_ids or (node.node_id for node in target.nodes))
         candidate_indices = [
-            index for index, node in enumerate(target.nodes) if node.node_id in allowed
+            index
+            for index, node in enumerate(target.nodes)
+            if node.node_id in allowed and is_actionable(node)
         ]
         if not candidate_indices:
             return LearnedMatch(None, 0.0, 0.0, "target_candidates_missing", ())
-        logits = self._forward(source, target)["logits_ab"][source_index]
-        selected_logits = logits[candidate_indices]
-        probabilities = _softmax(selected_logits, axis=0)
+        output = self._forward(source, target)
+        selected_logits = output["logits_ab"][source_index][candidate_indices]
+        selected_affinity = output["affinity"][source_index][candidate_indices]
+        rank_probabilities = _softmax(selected_logits, axis=0)
+        match_probabilities = _sigmoid(selected_affinity)
         ranked = sorted(
             (
-                (target.nodes[index].node_id, float(probabilities[position]))
+                (target.nodes[index].node_id, float(rank_probabilities[position]))
                 for position, index in enumerate(candidate_indices)
             ),
             key=lambda item: (-item[1], item[0]),
         )
         best_id, best_probability = ranked[0]
+        best_position = next(
+            position
+            for position, index in enumerate(candidate_indices)
+            if target.nodes[index].node_id == best_id
+        )
+        match_probability = float(match_probabilities[best_position])
         second_probability = max(
             (score for _, score in ranked[1:]),
             default=0.0,
         )
         margin = best_probability - second_probability
         scores = tuple(ranked)
-        if best_probability < min_probability or margin < min_margin:
+        if match_probability < min_probability or margin < min_margin:
             return LearnedMatch(
                 None,
-                best_probability,
+                match_probability,
                 margin,
                 "learned_low_confidence",
                 scores,
             )
         target_node = next(node for node in target.nodes if node.node_id == best_id)
-        return LearnedMatch(target_node, best_probability, margin, "learned_match", scores)
+        return LearnedMatch(target_node, match_probability, margin, "learned_match", scores)
 
     def _forward(self, source: UIGraph, target: UIGraph) -> dict[str, Any]:
         np = _require_numpy()
-        source_graph = encode_graph(source, config=self.config)
-        target_graph = encode_graph(target, config=self.config)
+        source_graph = encode_graph(
+            source,
+            config=self.config,
+            feature_schema_id=self.feature_schema_id,
+        )
+        target_graph = encode_graph(
+            target,
+            config=self.config,
+            feature_schema_id=self.feature_schema_id,
+        )
         source_token_ids = np.asarray(source_graph.token_ids, dtype=np.int64)
         target_token_ids = np.asarray(target_graph.token_ids, dtype=np.int64)
         source_numeric = np.asarray(source_graph.numeric_features, dtype=np.float32)
@@ -124,7 +156,11 @@ class NumpyMutualGraphMatcher:
         source_relations = np.asarray(source_graph.relation_features, dtype=np.float32)
         target_relations = np.asarray(target_graph.relation_features, dtype=np.float32)
         pair_relations = np.asarray(
-            cross_relation_features(source, target),
+            cross_relation_features(
+                source,
+                target,
+                feature_schema_id=self.feature_schema_id,
+            ),
             dtype=np.float32,
         )
         source_states, source_semantic, source_attributes = self._encode_nodes(
@@ -195,14 +231,14 @@ class NumpyMutualGraphMatcher:
             norm=True,
             final_index=4,
         ).squeeze(-1)
-        source_null = self._linear(source_states, "null_score").squeeze(-1)
-        target_null = self._linear(target_states, "null_score").squeeze(-1)
-        logits_ab, logits_ba = _mutual_assignment_logits(
-            affinity,
-            source_null,
-            target_null,
-        )
-        return {"logits_ab": logits_ab, "logits_ba": logits_ba}
+        logits_ab, logits_ba = _mutual_assignment_logits(affinity)
+        return {
+            "logits_ab": logits_ab,
+            "logits_ba": logits_ba,
+            "affinity": affinity,
+            "source_relations": source_relations,
+            "target_relations": target_relations,
+        }
 
     def _encode_nodes(self, token_ids: Any, numeric: Any) -> tuple[Any, Any, Any]:
         np = _require_numpy()
@@ -374,34 +410,15 @@ def save_numpy_mutual_matcher_checkpoint(
 
 def _mutual_assignment_logits(
     affinity: Any,
-    source_null_logits: Any,
-    target_null_logits: Any,
 ) -> tuple[Any, Any]:
-    np = _require_numpy()
-    source_count, target_count = affinity.shape
-    augmented = np.concatenate(
-        (
-            np.concatenate((affinity, source_null_logits[:, None]), axis=1),
-            np.concatenate(
-                (target_null_logits[None, :], np.zeros((1, 1), dtype=np.float32)),
-                axis=1,
-            ),
-        ),
-        axis=0,
-    )
-    row_log = _log_softmax(augmented, axis=1)
-    column_log = _log_softmax(augmented, axis=0)
+    _require_numpy()
+    row_log = _log_softmax(affinity, axis=1)
+    column_log = _log_softmax(affinity, axis=0)
     mutual = np_float(0.5) * (
-        row_log[:source_count, :target_count]
-        + column_log[:source_count, :target_count]
+        row_log
+        + column_log
     )
-    return (
-        np.concatenate((mutual, row_log[:source_count, target_count:]), axis=1),
-        np.concatenate(
-            (mutual.T, column_log[source_count:, :target_count].T),
-            axis=1,
-        ),
-    )
+    return mutual, mutual.T
 
 
 def _gelu(values: Any) -> Any:

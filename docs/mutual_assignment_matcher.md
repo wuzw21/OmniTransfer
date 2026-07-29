@@ -41,10 +41,9 @@ M[i,j] = MLP_fuse(C_semantic[i,j], C_visual[i,j],
                   visual_available[i,j])
 ```
 
-There is no `Q @ K.T` correspondence scorer. A NULL row and column are appended
-to this one final matrix. Row normalization gives `P(target | source)` and
-column normalization gives `P(source | target)`. The real-node assignment score
-is their log-space geometric mean:
+There is no `Q @ K.T` correspondence scorer and no learned NULL row or column.
+Row normalization gives `P(target | source)` and column normalization gives
+`P(source | target)`. The pair-ranking score is their log-space geometric mean:
 
 ```text
 score[i,j] = 0.5 * (log P(target[j] | source[i])
@@ -53,6 +52,18 @@ score[i,j] = 0.5 * (log P(target[j] | source[i])
 
 Source and target nodes share all encoders and pair heads. There are no
 source-to-target and target-to-source execution paths and no recovery path.
+The unnormalized fused pair logit is trained with balanced binary supervision
+and its sigmoid is the absolute match confidence. Runtime fails closed when
+that confidence or the top-1 margin is below threshold, so an absent mapping
+still returns control to the caller without representing absence as a class.
+
+The frozen checkpoint is bound to feature schema
+`pemm-v3-node-context-v1`
+(`171735252bbdaea3da8c2fd21967963698f89e45c085cc6801172dfff66d2e58`).
+This legacy schema preserves the token, numeric, relation, and graph-context
+semantics used during training. A tensor-width match is not sufficient:
+loading these weights through the newer geometry-free RCAM encoder is a schema
+error. PEMM's legacy inputs do not define the proposed RCAM method.
 
 ## Clean Relative-XML Result
 
@@ -64,6 +75,7 @@ seed 17, training seed 17, and three supervised epochs as the frozen baseline.
 | Relation cross-attention | 70.73% | 91.39% | 821,015 | 50.21 ms |
 | Dot-product mutual matrix | 66.46% | 92.21% | 611,902 | 46.92 ms |
 | Explicit pair-evidence mutual matrix | 78.83% | 94.54% | 670,459 | 48.82 ms |
+| Pair confidence, no NULL class | 77.45% | 92.46% | 670,362 | 62.28 ms |
 
 The dot-product mutual matcher is smaller and has slightly better Recall@5, but
 loses 4.27 Top-1 points. It remains a frozen lightweight high-recall baseline;
@@ -85,3 +97,8 @@ seed 17, and three epochs, the dev comparison is:
 The crop CNN therefore contributes 2.07 Top-1 points on dev without becoming a
 mandatory execution branch. Missing screenshots set `visual_available` to zero;
 semantic, attribute, context, geometry, and anchor matrices remain unchanged.
+
+The fixed 0.5 pair-confidence and 0.15 rank-margin gates were selected on dev.
+Together they cover 80.09% of the frozen test queries with 86.90% selective
+accuracy. On the recorded Android Settings replay, the true same-page pair
+scores 0.999999 while a same-package wrong page scores 0.1845 and fails closed.

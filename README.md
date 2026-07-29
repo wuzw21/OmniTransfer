@@ -126,13 +126,79 @@ Return value:
 target_candidate_id        selected target UI element
 target_bbox                target element bounds
 target_center              click/input center point
-score                      model score for the selected candidate
-margin                     top1-top2 score gap
+score                      compatibility alias of pair_confidence
+pair_confidence            absolute sigmoid confidence for the selected pair
+rank_probability           selected candidate's probability within this screen
+margin                     top1-top2 rank-probability gap
 top_candidates             ranked candidates when top_k > 1
+matcher_release            immutable runtime model release id
+matcher_backend            pytorch or numpy
+matcher_checkpoint_sha256  exact checkpoint used for this result
+matcher_feature_schema     exact encoder contract used by the checkpoint
+matcher_feature_schema_sha256
 ```
 
 Only two XML trees are not enough by themselves, because the matcher also needs
 to know which source element from the recorded screen should be relocated.
+
+## Fixed Runtime Release
+
+Training experiments and replay-time deployment are intentionally separated.
+The research architecture is the Relation-Aware Cross-Attention Matcher (RCAM),
+described below. RCAM has not yet passed the frozen reviewed-gold promotion
+gate, so it is not silently used by `action_transfer`.
+
+The current immutable replay-time release is:
+
+```text
+release id                 pair-evidence-mutual-matcher-v3.0.1
+mapping mode               mutual_graph_matcher_no_null_v3
+architecture               Pair-Evidence Mutual Matcher, no learned NULL class
+training data              4,124 ASE 2023 training queries
+frozen test                1,592 ASE 2023 gold queries
+parameters                 670,362
+pair-confidence gate       0.5
+rank-margin gate           0.15
+feature schema             pemm-v3-node-context-v1
+feature schema SHA256      171735252bbdaea3da8c2fd21967963698f89e45c085cc6801172dfff66d2e58
+PyTorch checkpoint SHA256  61beec6da26f7aab7c51fd778ea22b5cfc956ca0cb658f1e91f4e8debc6f95b8
+NumPy checkpoint SHA256    6e5668343419da38776e1f32ad9da610abc323637d8f6c6df38fb72ddec062b8
+```
+
+Its frozen ASE test result is 77.45% Top-1 and 92.46% Recall@5. The 0.15
+rank-margin gate was selected on dev: coverage is 78.90% and selective accuracy
+is 85.00% when combined with the 0.5 pair-confidence gate. On the untouched
+test split, the same frozen gates give 80.09% coverage and 86.90% selective
+accuracy. These numbers belong only to this fixed legacy release; they are not
+RCAM results and they are not MobileViews generalization results.
+
+The release bundles both PyTorch and NumPy exports of the same weights.
+PyTorch is used when available and NumPy is the portable fallback. The runtime
+verifies the selected file's SHA-256 before loading it. A checkpoint environment
+variable cannot replace the model. Every learned mapping result records the
+release id, backend, checkpoint hash, feature-schema hash, absolute pair
+confidence, relative rank probability, and rank margin. This makes a failed
+mapping reproducible instead of relying on an ambiguous `mapping_mode` string.
+
+The legacy production checkpoint is inseparable from its training-time encoder:
+that encoder includes resource id, normalized geometry, and cross-screen
+geometry because those were present when the weights were learned. Loading the
+checkpoint through the newer RCAM encoder is forbidden even though both happen
+to produce 64D tensors. RCAM remains the proposed method: its separate
+`rcam-node-context-v1` schema removes resource id and absolute node geometry.
+The fixed legacy schema exists only to make the deployed baseline reproducible,
+not to redefine the RCAM paper method.
+
+`rank_probability` is not an attention weight. It is the softmax probability
+over target candidates after the model has produced pair affinities.
+`pair_confidence` is the sigmoid of the selected pair affinity and is the value
+used by the fail-closed gate. Internal attention weights are neither returned
+nor interpreted as calibrated confidence.
+
+A new RCAM checkpoint may replace this release only after its exact checkpoint,
+data manifest, code commit, reviewed-gold metrics, and warm latency have been
+frozen together. Transfer failure always returns to the caller's VLM fallback;
+the runtime never replays source coordinates on the target device.
 
 ## Smoke Check
 

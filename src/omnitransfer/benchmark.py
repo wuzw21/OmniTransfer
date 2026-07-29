@@ -15,6 +15,7 @@ from typing import Any, Callable, Iterable, Mapping
 from omnitransfer.eval import RankingMetrics, ranking_metrics
 from omnitransfer.learned_matcher import (
     MatcherConfig,
+    RCAM_FEATURE_SCHEMA_ID,
     build_relation_aware_matcher,
     matcher_inputs,
     prepare_visual_asset,
@@ -161,6 +162,7 @@ def fine_tune_matcher(
     correspondence_weight: float = 1.0,
     confidence_weight: float = 1.0,
     context_mask_probability: float = 0.0,
+    feature_schema_id: str = RCAM_FEATURE_SCHEMA_ID,
     epoch_callback: Callable[[dict[str, float]], None] | None = None,
 ) -> FineTuneResult:
     """Fine-tune mutual ranking and absolute pair confidence."""
@@ -235,6 +237,7 @@ def fine_tune_matcher(
                     config=cfg,
                     device=device,
                     source_context_mask_indices=masked_source_indices,
+                    feature_schema_id=feature_schema_id,
                 )
             )
             layer_scores = tuple(output.get("assignment_scores_by_layer") or ())
@@ -446,6 +449,7 @@ def predict_queries(
     device: str = "cpu",
     min_probability: float = 0.0,
     min_margin: float = 0.0,
+    feature_schema_id: str = RCAM_FEATURE_SCHEMA_ID,
 ) -> list[Prediction]:
     """Predict candidates or NULL with no coordinate-passthrough fallback."""
 
@@ -492,6 +496,7 @@ def predict_queries(
                 target_graph,
                 config=cfg,
                 device=device,
+                feature_schema_id=feature_schema_id,
             )
             _synchronize(device, torch)
             input_end = time.perf_counter()
@@ -571,6 +576,7 @@ def benchmark_image_latency(
     device: str = "cpu",
     budget_ms: float = 50.0,
     max_images: int = 100,
+    feature_schema_id: str = RCAM_FEATURE_SCHEMA_ID,
 ) -> LatencySummary:
     """Measure one query per decoded image pair after model-only warmup."""
 
@@ -628,12 +634,14 @@ def benchmark_image_latency(
         (warmup_query,),
         config=config,
         device=device,
+        feature_schema_id=feature_schema_id,
     )
     predictions = predict_queries(
         model,
         unique_queries,
         config=config,
         device=device,
+        feature_schema_id=feature_schema_id,
     )
     return latency_summary(
         predictions,

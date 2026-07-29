@@ -7,7 +7,7 @@ from omnitransfer.numpy_matcher import NumpyMutualGraphMatcher
 from omnitransfer.ui_graph import UIGraph, UINode
 
 
-def test_numpy_inference_adapter_ignores_null_logit() -> None:
+def test_numpy_inference_adapter_rejects_low_pair_confidence() -> None:
     source = _graph("source", ("search", "settings", "help"))
     target = _graph("target", ("settings", "search", "help"))
     config = MatcherConfig(
@@ -19,23 +19,23 @@ def test_numpy_inference_adapter_ignores_null_logit() -> None:
         target_context_nodes=4,
     )
 
-    class NullDominantMatcher(NumpyMutualGraphMatcher):
+    class LowConfidenceMatcher(NumpyMutualGraphMatcher):
         def _forward(self, source_graph, target_graph):
-            logits_ab = np.zeros((len(source_graph.nodes), len(target_graph.nodes) + 1))
+            logits_ab = np.zeros((len(source_graph.nodes), len(target_graph.nodes)))
             logits_ab[:, 2] = 2.0
-            logits_ab[:, -1] = 10.0
-            return {"logits_ab": logits_ab}
+            affinity = np.full_like(logits_ab, -10.0)
+            return {"logits_ab": logits_ab, "affinity": affinity}
 
-    result = NullDominantMatcher({}, config=config).predict(
+    result = LowConfidenceMatcher({}, config=config).predict(
         source,
         target,
         source_node_id="node_0",
+        min_probability=0.5,
     )
 
-    assert result.target_node is not None
-    assert result.target_node.node_id == "node_1"
-    assert result.reason == "learned_match"
-    assert all(candidate_id != "__NULL__" for candidate_id, _ in result.scores)
+    assert result.target_node is None
+    assert result.reason == "learned_low_confidence"
+    assert result.probability < 0.5
 
 
 def _graph(graph_id: str, labels: tuple[str, ...]) -> UIGraph:
@@ -53,6 +53,7 @@ def _graph(graph_id: str, labels: tuple[str, ...]) -> UIGraph:
             parent_id="root",
             text=label,
             class_name="android.widget.TextView",
+            clickable=True,
             bbox=(10.0, 10.0 + 25.0 * index, 90.0, 30.0 + 25.0 * index),
         )
         for index, label in enumerate(labels)

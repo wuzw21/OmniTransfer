@@ -7,15 +7,18 @@ from pathlib import Path
 from typing import Any
 
 from omnitransfer.learned_matcher import (
-    LearnedGraphMatcher,
+    RelationAwareMatcher,
     MatcherConfig,
     NUMERIC_FEATURE_DIM,
+    PEMM_V3_FEATURE_SCHEMA_ID,
     RELATION_FEATURE_DIM,
 )
 
 
-class MutualGraphMatcher(LearnedGraphMatcher):
+class MutualGraphMatcher(RelationAwareMatcher):
     """Inference adapter for the single-matrix mutual matcher."""
+
+    feature_schema_id = PEMM_V3_FEATURE_SCHEMA_ID
 
     @classmethod
     def from_checkpoint(
@@ -26,7 +29,7 @@ class MutualGraphMatcher(LearnedGraphMatcher):
     ) -> "MutualGraphMatcher":
         torch = _require_torch()
         payload = torch.load(Path(path), map_location=device)
-        if payload.get("schema_version") != "omnitransfer_mutual_matcher_v2":
+        if payload.get("schema_version") != "omnitransfer_mutual_matcher_v3":
             raise ValueError("checkpoint is not a mutual assignment matcher")
         config = MatcherConfig(**dict(payload["matcher_config"]))
         model = build_mutual_assignment_matcher(config)
@@ -48,7 +51,7 @@ def save_mutual_matcher_checkpoint(
     output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "schema_version": "omnitransfer_mutual_matcher_v2",
+            "schema_version": "omnitransfer_mutual_matcher_v3",
             "matcher_config": asdict(config),
             "state_dict": model.state_dict(),
             "metadata": dict(metadata or {}),
@@ -222,7 +225,6 @@ def build_mutual_assignment_matcher(
                 nn.Dropout(cfg.dropout),
                 nn.Linear(cfg.relation_hidden_dim, 1),
             )
-            self.null_score = nn.Linear(cfg.hidden_dim, 1)
 
         def forward(
             self,
@@ -304,11 +306,7 @@ def build_mutual_assignment_matcher(
             affinity = self.pair_fusion(
                 torch.stack(tuple(feature_matrices.values()), dim=-1)
             ).squeeze(-1)
-            logits_ab, logits_ba = mutual_assignment_logits(
-                affinity,
-                source_null_logits=self.null_score(source_states).squeeze(-1),
-                target_null_logits=self.null_score(target_states).squeeze(-1),
-            )
+            logits_ab, logits_ba = mutual_assignment_logits(affinity)
             return {
                 "logits_ab": logits_ab,
                 "logits_ba": logits_ba,
@@ -350,48 +348,19 @@ def build_mutual_assignment_matcher(
 
 def mutual_assignment_logits(
     affinity: Any,
-    *,
-    source_null_logits: Any,
-    target_null_logits: Any,
 ) -> tuple[Any, Any]:
-    """Return source and target assignment logits from one augmented matrix."""
+    """Return bidirectional pair logits without a learned NULL class."""
 
     torch = _require_torch()
     if affinity.ndim != 2:
         raise ValueError("affinity must be a two-dimensional matrix")
-    source_count, target_count = affinity.shape
-    if source_null_logits.shape != (source_count,):
-        raise ValueError("source_null_logits must contain one value per source node")
-    if target_null_logits.shape != (target_count,):
-        raise ValueError("target_null_logits must contain one value per target node")
-    augmented = torch.cat(
-        [
-            torch.cat([affinity, source_null_logits[:, None]], dim=1),
-            torch.cat(
-                [
-                    target_null_logits[None, :],
-                    affinity.new_zeros((1, 1)),
-                ],
-                dim=1,
-            ),
-        ],
-        dim=0,
-    )
-    row_log_probabilities = torch.log_softmax(augmented, dim=1)
-    column_log_probabilities = torch.log_softmax(augmented, dim=0)
+    row_log_probabilities = torch.log_softmax(affinity, dim=1)
+    column_log_probabilities = torch.log_softmax(affinity, dim=0)
     mutual = 0.5 * (
-        row_log_probabilities[:source_count, :target_count]
-        + column_log_probabilities[:source_count, :target_count]
+        row_log_probabilities
+        + column_log_probabilities
     )
-    logits_ab = torch.cat(
-        [mutual, row_log_probabilities[:source_count, target_count:]],
-        dim=1,
-    )
-    logits_ba = torch.cat(
-        [mutual.T, column_log_probabilities[source_count:, :target_count].T],
-        dim=1,
-    )
-    return logits_ab, logits_ba
+    return mutual, mutual.T
 
 
 def _require_torch() -> Any:
