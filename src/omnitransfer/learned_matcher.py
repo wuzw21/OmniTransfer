@@ -47,7 +47,7 @@ class MatcherConfig:
     visual_canvas_size: int = 384
     source_context_nodes: int = 48
     target_context_nodes: int = 64
-    assignment_head: str = "mutual_projection"
+    assignment_head: str = "pair_mlp"
 
 
 @dataclass(frozen=True)

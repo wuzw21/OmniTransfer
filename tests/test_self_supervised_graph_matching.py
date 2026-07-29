@@ -321,7 +321,7 @@ def test_omnitransfer_training_defaults_to_anchor_context_masking() -> None:
     parameter = inspect.signature(train_relation_aware_matcher).parameters[
         "context_mask_probability"
     ]
-    assert DEFAULT_CONTEXT_MASK_PROBABILITY == 0.25
+    assert DEFAULT_CONTEXT_MASK_PROBABILITY == 0.05
     assert parameter.default == DEFAULT_CONTEXT_MASK_PROBABILITY
 
 

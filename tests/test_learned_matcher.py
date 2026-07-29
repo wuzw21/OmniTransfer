@@ -180,8 +180,8 @@ def test_mutual_log_assignment_normalizes_both_matching_directions() -> None:
     assert torch.isfinite(affinity.grad).all()
 
 
-def test_omnitransfer_defaults_to_mutual_assignment() -> None:
-    assert MatcherConfig().assignment_head == "mutual_projection"
+def test_omnitransfer_defaults_to_learned_pair_compatibility() -> None:
+    assert MatcherConfig().assignment_head == "pair_mlp"
 
 
 def test_omnitransfer_public_names_share_one_implementation() -> None:

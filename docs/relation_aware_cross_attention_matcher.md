@@ -83,19 +83,16 @@ target <- attend(target, source)
 ```
 
 The score for source node `i` and target node `j` is learned only from their
-contextual descriptors. A shared low-dimensional projection produces the dense
-affinity matrix; there is no direct cross-page geometry input. Row and column
-normalization are averaged so that a pair must be competitive in both matching
-directions:
+contextual descriptors. One shared compatibility MLP produces the dense
+affinity matrix from each contextual node pair; there is no direct cross-page
+geometry input:
 
 ```text
-A_ij = <W h_i, W h_j> / sqrt(d)
-S_ij = 0.5 * (log_softmax_row(A)_ij + log_softmax_col(A)_ij)
+S_ij = MLP([h_i, h_j, |h_i - h_j|, h_i * h_j])
 ```
 
 The default model uses hidden size 64, two layers, four heads, at least 48 source
-context slots and 64 target context slots. The exact trainable parameter count
-is computed and stored with every checkpoint.
+is 579,926 and is also computed and stored with every checkpoint.
 If a page has more actionable nodes than the nominal context limit, every
 actionable node is retained so it remains an explicit candidate hard negative.
 
@@ -110,7 +107,7 @@ real in-screen hard negatives.
 
 The same-page augmentation masks text and descriptions, perturbs relations,
 drops non-actionable context, injects distractors, and hides visual crops for
-half of the nodes by default. In addition, 25% of supervised action nodes lose
+half of the nodes by default. In addition, 5% of supervised action nodes lose
 their own text, description, and crop inside the loss computation. The node
 must then be identified from class/action state and attention over the
 surrounding nodes. This is the direct training signal for anonymous clickable
@@ -123,6 +120,10 @@ L = 0.5 * (CE(S_source_to_target, Y_source_to_target)
          + CE(S_target_to_source, Y_target_to_source))
     + lambda * L_bidirectional_consistency
 ```
+
+A smaller mutual-projection head is retained only as an ablation. On the frozen
+mixed development smoke it reduced latency but did not improve Top-1, so it is
+not the default OmniTransfer method.
 
 The consistency term encourages the probability of a labeled pair to agree in
 both directions. Multiple correspondences from the same page pair are learned
@@ -178,6 +179,9 @@ under large layout changes.
 
 The runtime target is less than 50 ms per page pair on one RTX 4090 after model
 warmup, with graph/input preparation and model time reported separately.
+
+The default-strength selection, complete development ablation, and artifact
+contract are frozen in `docs/omnitransfer_experiment_appendix_20260729.md`.
 
 ## Historical Implementation Smoke
 

@@ -19,7 +19,7 @@ from omnitransfer.ui_graph import BBox, UIGraph, UINode, multi_anchor_context_gr
 
 
 FEATURE_DIM = NUMERIC_FEATURE_DIM
-DEFAULT_CONTEXT_MASK_PROBABILITY = 0.25
+DEFAULT_CONTEXT_MASK_PROBABILITY = 0.05
 
 
 @dataclass(frozen=True)

@@ -5,13 +5,15 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import platform
+import subprocess
 import sys
 from typing import Any, Mapping
 
 
-METRIC_LOG_SCHEMA = "omnitransfer.relation_aware_matcher_metrics.v1"
+METRIC_LOG_SCHEMA = "omnitransfer.matcher_metrics.v1"
 
 
 class TrainingMetricLog:
@@ -73,3 +75,24 @@ def runtime_environment(device: str) -> dict[str, Any]:
         metadata["cuda_device_name"] = torch.cuda.get_device_name(index)
         metadata["cuda_version"] = str(torch.version.cuda)
     return metadata
+
+
+def source_revision() -> str | None:
+    """Return the immutable source revision supplied by a release or git."""
+
+    frozen = os.environ.get("OMNITRANSFER_CODE_REVISION", "").strip()
+    if frozen:
+        return frozen
+    repository = Path(__file__).resolve().parents[2]
+    try:
+        result = subprocess.run(
+            ("git", "rev-parse", "HEAD"),
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    revision = result.stdout.strip()
+    return revision or None

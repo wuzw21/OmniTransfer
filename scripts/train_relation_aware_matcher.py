@@ -7,11 +7,13 @@ import argparse
 from dataclasses import asdict, replace
 import json
 from pathlib import Path
+import sys
 
 from omnitransfer.experiment_logging import (
     TrainingMetricLog,
     file_sha256,
     runtime_environment,
+    source_revision,
 )
 from omnitransfer.learned_matcher import (
     MatcherConfig,
@@ -107,7 +109,7 @@ def main() -> None:
             num_layers=args.num_layers,
             source_context_nodes=args.source_context_nodes,
             target_context_nodes=args.target_context_nodes,
-            assignment_head=args.assignment_head or "mutual_projection",
+            assignment_head=args.assignment_head or "pair_mlp",
         )
     pairs, graphs, adapter = load_ui_correspondence_pairs(
         args.input,
@@ -148,26 +150,32 @@ def main() -> None:
     augment = AugmentConfig(
         visual_dropout_prob=args.visual_dropout_probability,
     )
+    input_artifacts = [
+        {
+            "path": str(path.resolve()),
+            "sha256": file_sha256(path),
+        }
+        for path in args.input
+    ]
+    validation_artifacts = [
+        {
+            "path": str(path.resolve()),
+            "sha256": file_sha256(path),
+        }
+        for path in args.validation_input
+    ]
+    revision = source_revision()
+    command = [str(value) for value in sys.argv]
     metrics_path = args.metrics_log or args.output.with_suffix(".metrics.jsonl")
     metric_log = TrainingMetricLog(metrics_path)
     metric_log.start(
         {
             "architecture": "omnitransfer",
-            "objective": "layerwise_symmetric_mutual_assignment",
-            "inputs": [
-                {
-                    "path": str(path.resolve()),
-                    "sha256": file_sha256(path),
-                }
-                for path in args.input
-            ],
-            "validation_inputs": [
-                {
-                    "path": str(path.resolve()),
-                    "sha256": file_sha256(path),
-                }
-                for path in args.validation_input
-            ],
+            "objective": "symmetric_actionable_correspondence",
+            "code_revision": revision,
+            "command": command,
+            "inputs": input_artifacts,
+            "validation_inputs": validation_artifacts,
             "matcher_config": asdict(config),
             "augmentation": asdict(augment),
             "context_mask_probability": args.context_mask_probability,
@@ -211,8 +219,11 @@ def main() -> None:
     report = {
         "schema_version": "omnitransfer.matcher_experiment.v1",
         "architecture": "omnitransfer",
-        "objective": "layerwise_symmetric_mutual_assignment",
-        "inputs": [str(path.resolve()) for path in args.input],
+        "objective": "symmetric_actionable_correspondence",
+        "code_revision": revision,
+        "command": command,
+        "inputs": input_artifacts,
+        "validation_inputs": validation_artifacts,
         "pretrained": str(args.pretrained.resolve()) if args.pretrained else None,
         "adapter": adapter,
         "validation_adapter": validation_adapter,
@@ -237,6 +248,12 @@ def main() -> None:
         config=config,
         metadata=checkpoint_metadata,
     )
+    checkpoint_artifact = {
+        "path": str(args.output.resolve()),
+        "sha256": file_sha256(args.output),
+        "parameter_count": parameter_count(model),
+    }
+    report["checkpoint"] = checkpoint_artifact
     for row in history:
         metric_log.append("epoch_end", row)
     metric_log.append(
@@ -251,11 +268,7 @@ def main() -> None:
     )
     metric_log.append(
         "checkpoint",
-        {
-            "path": str(args.output.resolve()),
-            "sha256": file_sha256(args.output),
-            "parameter_count": parameter_count(model),
-        },
+        checkpoint_artifact,
     )
     report_path = args.report or args.output.with_suffix(".json")
     report_path.parent.mkdir(parents=True, exist_ok=True)

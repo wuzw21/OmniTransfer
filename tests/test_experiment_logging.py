@@ -5,6 +5,7 @@ from omnitransfer.experiment_logging import (
     TrainingMetricLog,
     file_sha256,
     runtime_environment,
+    source_revision,
 )
 
 
@@ -55,3 +56,9 @@ def test_appendix_provenance_includes_input_hash_and_runtime(tmp_path) -> None:
     assert environment["device"] == "cpu"
     assert "python" in environment
     assert "platform" in environment
+
+
+def test_source_revision_prefers_frozen_release_environment(monkeypatch) -> None:
+    monkeypatch.setenv("OMNITRANSFER_CODE_REVISION", "immutable-commit")
+
+    assert source_revision() == "immutable-commit"
