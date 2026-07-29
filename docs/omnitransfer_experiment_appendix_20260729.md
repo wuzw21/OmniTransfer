@@ -40,6 +40,38 @@ Each three-epoch run performs 661 optimizer updates per epoch: 249 cross-page
 pairs and 412 lazily generated augmented-view pairs. Seed is 17, learning rate
 is `3e-4`, and the optimizer is AdamW.
 
+## Human-Gold Relation Matcher Reference
+
+The historical relation cross-attention checkpoint is the clean human-gold
+reference for the proposed method. It was trained for three epochs only
+on the ASE 2023 human-authored train split; no MobileViews, self-supervised
+graphs, outcome preferences, or pretrained checkpoint entered optimization.
+
+```text
+train: 4,124 human-gold iOS-to-Android queries / 32 Apps
+dev:   1,014 human-gold queries / 8 Apps
+test:  1,592 human-gold queries / 10 Apps
+split seed: 17
+training seed: 17
+epochs: 3
+parameters: 821,015
+hidden dimension: 96
+attention layers / heads: 2 / 4
+checkpoint:
+  runtime/evals/vision_widget_mapping/clean_relative_xml_v1/results/
+  learned_seed17/learned_matcher_seed17.pt
+checkpoint SHA-256:
+  9c8de428234eac20110fe9714d62c47a0d7b7670118bb85ff39af92d64aa99c4
+```
+
+Its untouched human-gold test result is Top-1 `70.73%`, Recall@3 `87.12%`,
+Recall@5 `91.39%`, and recorded p95 latency `55.68 ms`. This is the honest
+relation-matcher baseline. The new OmniTransfer matcher must be trained from
+the same declared human-gold train split and selected on the same dev split
+before any claim that it improves this result. MobileViews may supply
+augmentation evidence, but it cannot redefine, contaminate, or dominate the
+human-gold metric.
+
 ## Environment
 
 ```text
