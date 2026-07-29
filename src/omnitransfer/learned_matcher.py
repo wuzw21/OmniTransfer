@@ -488,17 +488,10 @@ def _build_learned_graph_cross_attention_matcher(
             self.query = nn.Linear(cfg.hidden_dim, cfg.hidden_dim, bias=False)
             self.key = nn.Linear(cfg.hidden_dim, cfg.hidden_dim, bias=False)
             self.value = nn.Linear(cfg.hidden_dim, cfg.hidden_dim, bias=False)
-            self.relation_encoder = nn.Sequential(
+            self.relation_weight = nn.Sequential(
                 nn.Linear(RELATION_FEATURE_DIM, cfg.relation_hidden_dim),
                 nn.GELU(),
-            )
-            head_dim = cfg.hidden_dim // cfg.num_heads
-            score_dim = head_dim * 4 + cfg.relation_hidden_dim
-            self.score = nn.Sequential(
-                nn.LayerNorm(score_dim),
-                nn.Linear(score_dim, cfg.relation_hidden_dim),
-                nn.GELU(),
-                nn.Linear(cfg.relation_hidden_dim, 1),
+                nn.Linear(cfg.relation_hidden_dim, cfg.num_heads * 2),
             )
             self.output = nn.Linear(cfg.hidden_dim, cfg.hidden_dim, bias=False)
             self.norm_attention = nn.LayerNorm(cfg.hidden_dim)
@@ -510,7 +503,8 @@ def _build_learned_graph_cross_attention_matcher(
             )
             self.norm_output = nn.LayerNorm(cfg.hidden_dim)
             self.dropout = nn.Dropout(cfg.dropout)
-            self.head_dim = head_dim
+            self.head_dim = cfg.hidden_dim // cfg.num_heads
+            self.scale = self.head_dim**-0.5
 
         def forward(self, states: Any, relations: Any) -> tuple[Any, Any]:
             node_count = int(states.shape[0])
@@ -523,25 +517,16 @@ def _build_learned_graph_cross_attention_matcher(
             value = self.value(states).reshape(
                 node_count, cfg.num_heads, self.head_dim
             ).transpose(0, 1)
-            query_pairs = query[:, :, None, :].expand(
-                -1, -1, node_count, -1
-            )
-            key_pairs = key[:, None, :, :].expand(
-                -1, node_count, -1, -1
-            )
-            relation = self.relation_encoder(relations)
-            relation = relation.unsqueeze(0).expand(cfg.num_heads, -1, -1, -1)
-            score_features = torch.cat(
-                [
-                    query_pairs,
-                    key_pairs,
-                    torch.abs(query_pairs - key_pairs),
-                    query_pairs * key_pairs,
-                    relation,
-                ],
-                dim=-1,
-            )
-            scores = self.score(score_features).squeeze(-1)
+            content_scores = (
+                query @ key.transpose(-1, -2)
+            ) * self.scale
+            relation_parameters = self.relation_weight(relations)
+            relation_gate, relation_bias = relation_parameters.chunk(2, dim=-1)
+            relation_gate = (
+                2.0 * torch.sigmoid(relation_gate)
+            ).permute(2, 0, 1)
+            relation_bias = relation_bias.permute(2, 0, 1)
+            scores = content_scores * relation_gate + relation_bias
             attention = torch.softmax(scores, dim=-1)
             context = attention @ value
             context = context.transpose(0, 1).reshape(node_count, cfg.hidden_dim)
@@ -647,34 +632,18 @@ def _build_learned_graph_cross_attention_matcher(
     class PartialAssignmentHead(nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            pair_dim = cfg.hidden_dim * 4
-            self.compatibility = nn.Sequential(
-                nn.LayerNorm(pair_dim),
-                nn.Linear(pair_dim, cfg.hidden_dim),
-                nn.GELU(),
-                nn.Dropout(cfg.dropout),
-                nn.Linear(cfg.hidden_dim, 1),
+            self.compatibility_projection = nn.Linear(
+                cfg.hidden_dim,
+                cfg.hidden_dim,
+                bias=False,
             )
             self.matchability = nn.Linear(cfg.hidden_dim, 1)
 
         def forward(self, source_states: Any, target_states: Any) -> Any:
-            source = source_states[:, None, :].expand(
-                -1, target_states.shape[0], -1
-            )
-            target = target_states[None, :, :].expand(
-                source_states.shape[0], -1, -1
-            )
-            pair = torch.cat(
-                [
-                    source,
-                    target,
-                    torch.abs(source - target),
-                    source * target,
-                ],
-                dim=-1,
-            )
+            source = self.compatibility_projection(source_states)
+            target = self.compatibility_projection(target_states)
             return (
-                self.compatibility(pair).squeeze(-1)
+                (source @ target.T) / math.sqrt(cfg.hidden_dim)
                 + self.matchability(source_states)
                 + self.matchability(target_states).T
             )

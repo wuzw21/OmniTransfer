@@ -66,11 +66,11 @@ same row / same column / overlap / neighbor
 relative position / relative size / IoU / tree distance
 ```
 
-A learned compatibility function determines how much node `k` changes node
-`i`:
+A learned relation gate determines how much node `k` changes node `i`:
 
 ```text
-e_ik = MLP_score([q_i, k_k, |q_i-k_k|, q_i*k_k, MLP_relation(r_ik)])
+[g_ik, b_ik] = MLP_relation(r_ik)
+e_ik = 2 * sigmoid(g_ik) * (q_i dot k_k / sqrt(d)) + b_ik
 A_ik = softmax_k(e_ik)
 h_i' = h_i + sum_k A_ik W_v h_k
 ```
@@ -96,7 +96,8 @@ The score for source node `i` and target node `j` is then learned only from
 their target-conditioned contextual descriptors:
 
 ```text
-S_ij = MLP([h_i, h_j, |h_i - h_j|, h_i * h_j])
+S_ij = (W_m h_i) dot (W_m h_j) / sqrt(d)
+     + matchability(h_i) + matchability(h_j)
 P_ij = 0.5 * (log softmax_j(S_ij) + log softmax_i(S_ij))
 ```
 
@@ -107,7 +108,7 @@ progressively refines correspondence rather than merely decorating a final
 pointwise classifier.
 
 The default model uses hidden size 64, two layers, four heads, 48 source context
-nodes, and 64 target context nodes. It has 557,400 trainable parameters; the
+nodes, and 64 target context nodes. It has 540,197 trainable parameters; the
 exact count is stored with every checkpoint.
 If a page has more actionable nodes than the nominal context limit, every
 actionable node is retained so it remains an explicit candidate hard negative.
@@ -206,6 +207,14 @@ checkpoint SHA-256: identical across runs
 
 This result verifies the implementation and reproducibility only. It is not a
 generalization score and must not appear as the paper's formal accuracy.
+
+The learned-gate implementation was also exercised on a real MobileViews
+608-by-608 actionable-node pair. One forward and backward pass used 683 MiB
+peak allocated CUDA memory. This stress test verifies that attention and
+assignment do not materialize a high-dimensional pair-feature volume. Its
+1.47-second forward time is an extreme-node-count scalability diagnostic, not
+evidence for the 50 ms runtime target; formal latency reports must include node
+count and the long tail.
 
 ## Non-Goals
 
