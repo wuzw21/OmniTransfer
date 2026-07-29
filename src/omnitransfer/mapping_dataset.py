@@ -5,7 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from collections import defaultdict
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 from pathlib import Path
@@ -19,7 +19,7 @@ from omnitransfer.gui_odyssey_pairs import (
     _human_review_graph,
     _make_weak_gui_odyssey_pair,
 )
-from omnitransfer.ui_graph import UIGraph, graph_from_record, graph_to_record
+from omnitransfer.ui_graph import UIGraph, UINode, graph_from_record, graph_to_record
 
 
 UI_CORRESPONDENCE_PAIR_SCHEMA = "omnitransfer.ui_correspondence_pair.v1"
@@ -49,9 +49,7 @@ def adapt_ase_queries(
     """Group authored ASE queries into gold multi-match UI correspondence records."""
 
     resolved_assets = (
-        Path(asset_root).expanduser().resolve()
-        if asset_root is not None
-        else None
+        Path(asset_root).expanduser().resolve() if asset_root is not None else None
     )
     grouped: dict[tuple[str, str], list[Query]] = defaultdict(list)
     for query in queries:
@@ -128,10 +126,7 @@ def adapt_ase_queries(
                 "page_id": source_page_id,
                 "platform": _ase_platform(page_queries[0], "source"),
                 "screenshot_path": _resolve_asset_path(
-                    str(
-                        page_queries[0].metadata.get("source_screenshot_path")
-                        or ""
-                    ),
+                    str(page_queries[0].metadata.get("source_screenshot_path") or ""),
                     asset_root=resolved_assets,
                 ),
                 "graph": source_graph,
@@ -140,10 +135,7 @@ def adapt_ase_queries(
                 "page_id": target_page_id,
                 "platform": _ase_platform(page_queries[0], "target"),
                 "screenshot_path": _resolve_asset_path(
-                    str(
-                        page_queries[0].metadata.get("target_screenshot_path")
-                        or ""
-                    ),
+                    str(page_queries[0].metadata.get("target_screenshot_path") or ""),
                     asset_root=resolved_assets,
                 ),
                 "graph": target_graph,
@@ -173,6 +165,294 @@ def adapt_ase_queries(
     return records
 
 
+def adapt_bmoca_trace_corpus(
+    corpus_root: str | Path,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Adapt BMOCA offline action alignments into diagnostic correspondence rows.
+
+    BMOCA action alignment is automatic evidence rather than reviewed gold.  The
+    adapter therefore fixes every row to ``diagnostic``/``unreviewed`` and keeps
+    the original pair ids and alignment scores in provenance.  Endpoint ids such
+    as ``e57`` belong to the trace collector, so they are rebound to canonical
+    XML-tree node ids using the recorded bbox, class, actionability, and semantic
+    attributes.  These fields are used only to construct offline labels.
+    """
+
+    root = Path(corpus_root).expanduser().resolve()
+    manifest = _read_json_object(root / "manifest.json")
+    if manifest.get("schema_version") != "omniflow.offline-trace-corpus.v1":
+        raise ValueError("unsupported BMOCA offline trace manifest")
+    memory = _read_json_object(root / "pair_memory.json")
+    if memory.get("schema_version") != "omniflow.transfer-pair-memory.v1":
+        raise ValueError("unsupported BMOCA transfer pair memory")
+    raw_pairs = memory.get("pairs")
+    if not isinstance(raw_pairs, dict):
+        raise TypeError("BMOCA pair_memory.pairs must be an object")
+
+    trace_by_run: dict[str, dict[str, Any]] = {}
+    for raw_trace in manifest.get("traces") or ():
+        if not isinstance(raw_trace, dict):
+            raise TypeError("BMOCA manifest trace must be an object")
+        run_id = _nonempty_text(raw_trace.get("run_id"), "trace.run_id")
+        catalog = raw_trace.get("state_catalog")
+        if not isinstance(catalog, dict):
+            raise TypeError(f"BMOCA trace {run_id} has no state catalog")
+        relative_path = _nonempty_text(catalog.get("path"), "state_catalog.path")
+        trace_by_run[run_id] = {
+            **raw_trace,
+            "state_catalog_path": (root / relative_path).resolve(),
+        }
+
+    state_catalogs: dict[str, dict[str, dict[str, Any]]] = {}
+    graph_cache: dict[tuple[str, str], UIGraph] = {}
+
+    def trace_state(run_id: str, state_id: str) -> dict[str, Any]:
+        trace = trace_by_run.get(run_id)
+        if trace is None:
+            raise ValueError(f"BMOCA endpoint references unknown run: {run_id}")
+        if run_id not in state_catalogs:
+            catalog = _read_json_object(Path(trace["state_catalog_path"]))
+            states = catalog.get("states")
+            if not isinstance(states, dict):
+                raise TypeError(f"BMOCA state catalog {run_id} has invalid states")
+            state_catalogs[run_id] = states
+        state = state_catalogs[run_id].get(state_id)
+        if not isinstance(state, dict):
+            raise ValueError(f"BMOCA endpoint references unknown state: {state_id}")
+        return state
+
+    def endpoint_graph(
+        endpoint: dict[str, Any],
+    ) -> tuple[UIGraph, dict[str, Any], tuple[str, str]]:
+        run_id = _nonempty_text(endpoint.get("run_id"), "endpoint.run_id")
+        state_id = _nonempty_text(
+            endpoint.get("state_id") or endpoint.get("page_id"),
+            "endpoint.state_id",
+        )
+        key = (run_id, state_id)
+        state = trace_state(run_id, state_id)
+        if key not in graph_cache:
+            display = state.get("display")
+            if not isinstance(display, dict):
+                display = {}
+            xml = _nonempty_text(state.get("xml"), "state.xml")
+            graph_cache[key] = graph_from_record(
+                {
+                    "id": state_id,
+                    "xml": xml,
+                    "width": display.get("width") or endpoint.get("width"),
+                    "height": display.get("height") or endpoint.get("height"),
+                },
+                graph_id=_bmoca_page_id(trace_by_run[run_id], state_id),
+            )
+        return graph_cache[key], trace_by_run[run_id], key
+
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    unresolved: Counter[str] = Counter()
+    input_pairs = 0
+    duplicate_edges = 0
+    executed_nodes_marked_actionable = 0
+    for pair_id, raw_pair in sorted(raw_pairs.items()):
+        input_pairs += 1
+        if not isinstance(raw_pair, dict):
+            unresolved["pair_not_object"] += 1
+            continue
+        source_endpoint = raw_pair.get("source")
+        target_endpoint = raw_pair.get("target")
+        if not isinstance(source_endpoint, dict) or not isinstance(
+            target_endpoint, dict
+        ):
+            unresolved["missing_endpoint"] += 1
+            continue
+        if (
+            source_endpoint.get("action_tool") != "click"
+            or target_endpoint.get("action_tool") != "click"
+        ):
+            unresolved["non_click_action"] += 1
+            continue
+        try:
+            source_graph, source_trace, source_graph_key = endpoint_graph(
+                source_endpoint
+            )
+            target_graph, target_trace, target_graph_key = endpoint_graph(
+                target_endpoint
+            )
+            source_node = _bind_bmoca_endpoint(source_endpoint, source_graph)
+            target_node = _bind_bmoca_endpoint(target_endpoint, target_graph)
+        except (KeyError, TypeError, ValueError) as exc:
+            unresolved[f"invalid:{exc}"] += 1
+            continue
+        if source_node is None:
+            unresolved["source_node_unresolved"] += 1
+            continue
+        if target_node is None:
+            unresolved["target_node_unresolved"] += 1
+            continue
+        if not _is_actionable_ui_node(source_node):
+            source_graph = _mark_bmoca_executed_node_actionable(
+                source_graph, source_node.node_id
+            )
+            graph_cache[source_graph_key] = source_graph
+            source_node = next(
+                node
+                for node in source_graph.nodes
+                if node.node_id == source_node.node_id
+            )
+            executed_nodes_marked_actionable += 1
+        if not _is_actionable_ui_node(target_node):
+            target_graph = _mark_bmoca_executed_node_actionable(
+                target_graph, target_node.node_id
+            )
+            graph_cache[target_graph_key] = target_graph
+            target_node = next(
+                node
+                for node in target_graph.nodes
+                if node.node_id == target_node.node_id
+            )
+            executed_nodes_marked_actionable += 1
+
+        group_key = (source_graph.graph_id, target_graph.graph_id)
+        group = grouped.setdefault(
+            group_key,
+            {
+                "source_graph": source_graph,
+                "target_graph": target_graph,
+                "source_graph_key": source_graph_key,
+                "target_graph_key": target_graph_key,
+                "source_endpoint": source_endpoint,
+                "target_endpoint": target_endpoint,
+                "source_trace": source_trace,
+                "target_trace": target_trace,
+                "matches": defaultdict(set),
+                "pair_ids": [],
+                "tasks": set(),
+                "scores": [],
+            },
+        )
+        group["source_graph"] = graph_cache[source_graph_key]
+        group["target_graph"] = graph_cache[target_graph_key]
+        if target_node.node_id in group["matches"][source_node.node_id]:
+            duplicate_edges += 1
+        group["matches"][source_node.node_id].add(target_node.node_id)
+        group["pair_ids"].append(str(raw_pair.get("pair_id") or pair_id))
+        group["tasks"].update(
+            str(trace.get("task_id") or "")
+            for trace in (source_trace, target_trace)
+            if trace.get("task_id")
+        )
+        evidence = raw_pair.get("evidence")
+        if isinstance(evidence, dict) and evidence.get("alignment_score") is not None:
+            group["scores"].append(float(evidence["alignment_score"]))
+
+    records: list[dict[str, Any]] = []
+    output_correspondences = 0
+    for (source_page_id, target_page_id), group in sorted(grouped.items()):
+        source_graph = graph_cache[group["source_graph_key"]]
+        target_graph = graph_cache[group["target_graph_key"]]
+        source_record = graph_to_record(source_graph)
+        target_record = graph_to_record(target_graph)
+        source_endpoint = group["source_endpoint"]
+        target_endpoint = group["target_endpoint"]
+        source_trace = group["source_trace"]
+        target_trace = group["target_trace"]
+        matches = [
+            {
+                "source_node_id": source_id,
+                "target_node_ids": sorted(target_ids),
+                "label": "correspondence",
+            }
+            for source_id, target_ids in sorted(group["matches"].items())
+        ]
+        output_correspondences += sum(
+            len(match["target_node_ids"]) for match in matches
+        )
+        tasks = sorted(group["tasks"])
+        app = str(
+            source_endpoint.get("package_name")
+            or target_endpoint.get("package_name")
+            or "unknown"
+        )
+        records.append(
+            validate_ui_correspondence_pair(
+                {
+                    "schema_version": UI_CORRESPONDENCE_PAIR_SCHEMA,
+                    "pair_id": _stable_pair_id("bmoca", source_page_id, target_page_id),
+                    "split": "diagnostic",
+                    "label_status": "unreviewed",
+                    "source": {
+                        "page_id": source_page_id,
+                        "platform": "android",
+                        "screenshot_path": _bmoca_screenshot_path(
+                            root, source_endpoint
+                        ),
+                        "graph": source_record,
+                    },
+                    "target": {
+                        "page_id": target_page_id,
+                        "platform": "android",
+                        "screenshot_path": _bmoca_screenshot_path(
+                            root, target_endpoint
+                        ),
+                        "graph": target_record,
+                    },
+                    "matches": matches,
+                    "partition_keys": [
+                        *(f"bmoca:task:{task}" for task in tasks),
+                        (
+                            "bmoca:environment-pair:"
+                            f"{source_trace.get('environment_id', 'unknown')}"
+                            f"->{target_trace.get('environment_id', 'unknown')}"
+                        ),
+                    ],
+                    "provenance": {
+                        "dataset": "bmoca_three_environment_aligned_success",
+                        "annotation": "offline_trace_dp_alignment_unreviewed",
+                        "source_pair_ids": sorted(set(group["pair_ids"])),
+                        "alignment_score": {
+                            "minimum": min(group["scores"])
+                            if group["scores"]
+                            else None,
+                            "maximum": max(group["scores"])
+                            if group["scores"]
+                            else None,
+                        },
+                        "offline_label_binding": (
+                            "bbox_class_actionability_semantics_to_xml_node"
+                        ),
+                    },
+                    "slices": {
+                        "app": app,
+                        "tasks": tasks,
+                        "source_environment": str(
+                            source_trace.get("environment_id") or "unknown"
+                        ),
+                        "target_environment": str(
+                            target_trace.get("environment_id") or "unknown"
+                        ),
+                        "action": "click",
+                    },
+                }
+            )
+        )
+
+    report = {
+        "schema_version": "omnitransfer.bmoca_trace_adapter.v1",
+        "input_pairs": input_pairs,
+        "output_records": len(records),
+        "output_match_rows": sum(len(record["matches"]) for record in records),
+        "output_correspondences": output_correspondences,
+        "duplicate_edges_collapsed": duplicate_edges,
+        "executed_nodes_marked_actionable": executed_nodes_marked_actionable,
+        "unresolved_endpoints": sum(unresolved.values()),
+        "skipped": dict(sorted(unresolved.items())),
+        "split": "diagnostic",
+        "label_status": "unreviewed",
+        "formal_gold": False,
+        "full_xml_graphs": len(graph_cache),
+    }
+    return records, report
+
+
 def adapt_gui_odyssey_rows(
     rows: list[dict[str, Any]],
     annotation_dir: str | Path,
@@ -187,7 +467,9 @@ def adapt_gui_odyssey_rows(
         raise ValueError("GUIOdyssey weak labels may only enter train or diagnostic")
     annotations = Path(annotation_dir).expanduser().resolve()
     screenshots = (
-        Path(screenshot_dir).expanduser().resolve() if screenshot_dir is not None else None
+        Path(screenshot_dir).expanduser().resolve()
+        if screenshot_dir is not None
+        else None
     )
     cache: dict[str, dict[str, Any]] = {}
     skipped: Counter[str] = Counter()
@@ -209,7 +491,9 @@ def adapt_gui_odyssey_rows(
                 require_bbox_contains_point=require_bbox_contains_point,
                 matcher_config=None,
             )
-            record = _gui_odyssey_weak_record(row, pair.graph_a, pair.graph_b, split=split)
+            record = _gui_odyssey_weak_record(
+                row, pair.graph_a, pair.graph_b, split=split
+            )
         except _ActionPointOutsideBBox:
             skipped["action_bbox_excludes_point"] += 1
             continue
@@ -368,9 +652,7 @@ def plan_ui_correspondence_pool(
         union.join(source_page, target_page)
         page_keys_by_pair[pair_id] = (source_page, target_page)
         app_ids[pair_id] = app_id
-        dataset_counts[
-            str(record["provenance"].get("dataset") or "unknown")
-        ] += 1
+        dataset_counts[str(record["provenance"].get("dataset") or "unknown")] += 1
     if not pair_ids:
         raise ValueError("UI correspondence pool is empty")
 
@@ -438,7 +720,9 @@ def plan_ui_correspondence_pool(
             page_splits[page_key].add(split)
     page_overlap = _cross_split_values(page_splits)
     if page_overlap:
-        raise AssertionError(f"page leakage in pool split: {_first_overlap(page_overlap)}")
+        raise AssertionError(
+            f"page leakage in pool split: {_first_overlap(page_overlap)}"
+        )
     apps_in_multiple_splits = sorted(
         app_id for app_id, splits in app_splits.items() if len(splits) > 1
     )
@@ -492,9 +776,7 @@ def iter_split_ui_correspondence_pool(
         provenance["source_label_status"] = record["label_status"]
         provenance.pop("reserved_split", None)
         provenance["split_protocol"] = "within_app_page_component_v1"
-        record["partition_keys"] = [
-            f"pool:component:{plan.component_ids[pair_id]}"
-        ]
+        record["partition_keys"] = [f"pool:component:{plan.component_ids[pair_id]}"]
         record["slices"]["app"] = plan.app_ids[pair_id]
         if _is_mobileviews_self_supervised_proposal(record):
             record["split"] = assigned_split
@@ -610,7 +892,9 @@ def write_ui_correspondence_dataset(
             record = validate_ui_correspondence_pair(raw_record)
             split = record["split"]
             assignment_split = _assignment_split(record)
-            _record_assignment(pair_splits, record["pair_id"], assignment_split, "pair id")
+            _record_assignment(
+                pair_splits, record["pair_id"], assignment_split, "pair id"
+            )
             for side in ("source", "target"):
                 _record_assignment(
                     page_splits,
@@ -636,9 +920,7 @@ def write_ui_correspondence_dataset(
             assignment_counts[assignment_split] += 1
             label_counts[record["label_status"]] += 1
             split_label_counts[split][record["label_status"]] += 1
-            dataset_counts[
-                str(record["provenance"].get("dataset") or "unknown")
-            ] += 1
+            dataset_counts[str(record["provenance"].get("dataset") or "unknown")] += 1
             file_match_counts[split] += len(record["matches"])
             for match in record["matches"]:
                 match_counts[match["label"]] += 1
@@ -756,14 +1038,18 @@ def validate_ui_correspondence_pair(record: dict[str, Any]) -> dict[str, Any]:
         target_node_ids = match.get("target_node_ids")
         if not isinstance(target_node_ids, list):
             raise TypeError(f"matches[{index}].target_node_ids must be a list")
-        normalized_targets = list(dict.fromkeys(str(node_id) for node_id in target_node_ids))
+        normalized_targets = list(
+            dict.fromkeys(str(node_id) for node_id in target_node_ids)
+        )
         if label == "correspondence" and not normalized_targets:
             raise ValueError("correspondence match has no target nodes")
         if label == "no_correspondence" and normalized_targets:
             raise ValueError("no_correspondence match contains target nodes")
         if label not in {"correspondence", "no_correspondence"}:
             raise ValueError(f"unsupported match label: {label}")
-        missing = [node_id for node_id in normalized_targets if node_id not in target_ids]
+        missing = [
+            node_id for node_id in normalized_targets if node_id not in target_ids
+        ]
         if missing:
             raise ValueError(f"match target nodes are absent: {missing}")
         match["target_node_ids"] = normalized_targets
@@ -825,7 +1111,10 @@ def _gui_odyssey_weak_record(
     )
     return {
         "schema_version": UI_CORRESPONDENCE_PAIR_SCHEMA,
-        "pair_id": str(row.get("pair_id") or _stable_pair_id("guiodyssey", source_page_id, target_page_id)),
+        "pair_id": str(
+            row.get("pair_id")
+            or _stable_pair_id("guiodyssey", source_page_id, target_page_id)
+        ),
         "split": split,
         "label_status": "weak",
         "source": {
@@ -849,7 +1138,10 @@ def _gui_odyssey_weak_record(
         ],
         "partition_keys": [
             f"guiodyssey:task:{task}",
-            *(f"guiodyssey:episode:{episode}" for episode in sorted((source_episode, target_episode))),
+            *(
+                f"guiodyssey:episode:{episode}"
+                for episode in sorted((source_episode, target_episode))
+            ),
             f"guiodyssey:trajectory:{trajectory}",
         ],
         "provenance": {
@@ -864,7 +1156,8 @@ def _gui_odyssey_weak_record(
             "target_device": target_device,
             "source_form_factor": _form_factor(source_device),
             "target_form_factor": _form_factor(target_device),
-            "cross_form_factor": _form_factor(source_device) != _form_factor(target_device),
+            "cross_form_factor": _form_factor(source_device)
+            != _form_factor(target_device),
             "browser_or_webview": bool(
                 source_endpoint.get("web_or_webview_context")
                 or target_endpoint.get("web_or_webview_context")
@@ -940,7 +1233,10 @@ def _gui_odyssey_human_record(
     target_device = str(target_endpoint.get("device_name") or "unknown")
     return {
         "schema_version": UI_CORRESPONDENCE_PAIR_SCHEMA,
-        "pair_id": str(row.get("pair_id") or _stable_pair_id("guiodyssey-review", source_page_id, target_page_id)),
+        "pair_id": str(
+            row.get("pair_id")
+            or _stable_pair_id("guiodyssey-review", source_page_id, target_page_id)
+        ),
         "split": split,
         "label_status": "gold",
         "source": {
@@ -958,7 +1254,10 @@ def _gui_odyssey_human_record(
         "matches": matches,
         "partition_keys": [
             f"guiodyssey:task:{task}",
-            *(f"guiodyssey:episode:{episode}" for episode in sorted((source_episode, target_episode))),
+            *(
+                f"guiodyssey:episode:{episode}"
+                for episode in sorted((source_episode, target_episode))
+            ),
             f"guiodyssey:trajectory:{trajectory}",
         ],
         "provenance": {
@@ -972,7 +1271,8 @@ def _gui_odyssey_human_record(
             "target_device": target_device,
             "source_form_factor": _form_factor(source_device),
             "target_form_factor": _form_factor(target_device),
-            "cross_form_factor": _form_factor(source_device) != _form_factor(target_device),
+            "cross_form_factor": _form_factor(source_device)
+            != _form_factor(target_device),
             "browser_or_webview": bool(
                 source_endpoint.get("web_or_webview_context")
                 or target_endpoint.get("web_or_webview_context")
@@ -1026,7 +1326,9 @@ def _ase_page_id(query: Query, side: str) -> str:
 
 
 def _required_query_metadata(query: Query, key: str) -> str:
-    return _nonempty_text(query.metadata.get(key), f"query {query.query_id} metadata.{key}")
+    return _nonempty_text(
+        query.metadata.get(key), f"query {query.query_id} metadata.{key}"
+    )
 
 
 def _source_node_id(query: Query) -> str:
@@ -1038,7 +1340,9 @@ def _source_node_id(query: Query) -> str:
     )
 
 
-def _node_record_from_payload(payload: dict[str, Any], *, node_id: str) -> dict[str, Any]:
+def _node_record_from_payload(
+    payload: dict[str, Any], *, node_id: str
+) -> dict[str, Any]:
     bbox = payload.get("bbox", payload.get("bounds"))
     excluded = {
         "id",
@@ -1060,7 +1364,9 @@ def _node_record_from_payload(payload: dict[str, Any], *, node_id: str) -> dict[
         "metadata",
     }
     metadata = {
-        **(payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}),
+        **(
+            payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        ),
         **{key: value for key, value in payload.items() if key not in excluded},
     }
     return {
@@ -1080,6 +1386,161 @@ def _node_record_from_payload(payload: dict[str, Any], *, node_id: str) -> dict[
         "child_ids": [str(value) for value in payload.get("child_ids") or ()],
         "metadata": metadata,
     }
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise TypeError(f"JSON root must be an object: {path}")
+    return value
+
+
+def _bmoca_page_id(trace: dict[str, Any], state_id: str) -> str:
+    environment = _nonempty_text(
+        trace.get("environment_id") or "unknown",
+        "trace.environment_id",
+    )
+    return f"bmoca:environment:{environment}:state:{state_id}"
+
+
+def _bmoca_screenshot_path(root: Path, endpoint: dict[str, Any]) -> str:
+    value = str(endpoint.get("screenshot_path") or "")
+    if not value:
+        return ""
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = root / path
+    return str(path.resolve())
+
+
+def _bind_bmoca_endpoint(
+    endpoint: dict[str, Any],
+    graph: UIGraph,
+) -> UINode | None:
+    """Resolve one collector-local endpoint id to one canonical XML node."""
+
+    raw_node = endpoint.get("node")
+    if not isinstance(raw_node, dict):
+        raise TypeError("BMOCA endpoint.node must be an object")
+    bounds = raw_node.get("bounds", raw_node.get("bbox"))
+    if not isinstance(bounds, (list, tuple)) or len(bounds) != 4:
+        raise ValueError("BMOCA endpoint node has invalid bounds")
+    wanted_bbox = tuple(float(value) for value in bounds)
+    attributes = raw_node.get("attributes")
+    if not isinstance(attributes, dict):
+        attributes = {}
+    wanted_class = _bmoca_class_name(
+        attributes.get("class") or raw_node.get("class_name")
+    )
+    candidates = [
+        node
+        for node in graph.nodes
+        if node.bbox is not None
+        and all(
+            abs(actual - wanted) <= 0.5
+            for actual, wanted in zip(node.bbox, wanted_bbox, strict=True)
+        )
+        and (not wanted_class or _bmoca_class_name(node.class_name) == wanted_class)
+    ]
+    if not candidates:
+        return None
+
+    expects_actionable = bool(
+        attributes.get("clickable")
+        or attributes.get("editable")
+        or attributes.get("scrollable")
+    )
+    if expects_actionable:
+        actionable = [
+            node
+            for node in candidates
+            if node.enabled and (node.clickable or node.editable or node.scrollable)
+        ]
+        if actionable:
+            candidates = actionable
+
+    wanted_resource = _bmoca_resource_leaf(
+        attributes.get("resource_id") or raw_node.get("resource_id")
+    )
+    if wanted_resource:
+        resource_matches = [
+            node
+            for node in candidates
+            if _bmoca_resource_leaf(node.resource_id) == wanted_resource
+        ]
+        if resource_matches:
+            candidates = resource_matches
+
+    for raw_value, field in (
+        (
+            attributes.get("text", raw_node.get("text")),
+            lambda node: node.text,
+        ),
+        (
+            attributes.get(
+                "content_description",
+                raw_node.get("content_desc"),
+            ),
+            lambda node: node.content_desc,
+        ),
+    ):
+        wanted = _bmoca_semantic_text(raw_value)
+        if not wanted:
+            continue
+        semantic_matches = [
+            node for node in candidates if _bmoca_semantic_text(field(node)) == wanted
+        ]
+        if semantic_matches:
+            candidates = semantic_matches
+
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _is_actionable_ui_node(node: UINode) -> bool:
+    return bool(node.enabled and (node.clickable or node.editable or node.scrollable))
+
+
+def _mark_bmoca_executed_node_actionable(
+    graph: UIGraph,
+    node_id: str,
+) -> UIGraph:
+    """Use the observed click only as offline evidence of actionability."""
+
+    found = False
+    nodes: list[UINode] = []
+    for node in graph.nodes:
+        if node.node_id != node_id:
+            nodes.append(node)
+            continue
+        found = True
+        nodes.append(
+            replace(
+                node,
+                clickable=True,
+                metadata={
+                    **node.metadata,
+                    "actionability_evidence": "bmoca_executed_click",
+                },
+            )
+        )
+    if not found:
+        raise ValueError(f"BMOCA action node is absent from graph: {node_id}")
+    return replace(graph, nodes=tuple(nodes))
+
+
+def _bmoca_class_name(value: Any) -> str:
+    return str(value or "").strip().casefold().rsplit(".", 1)[-1]
+
+
+def _bmoca_resource_leaf(value: Any) -> str:
+    normalized = str(value or "").strip().casefold()
+    return normalized.rsplit("/", 1)[-1]
+
+
+def _bmoca_semantic_text(value: Any) -> str:
+    return " ".join(str(value or "").casefold().split())
 
 
 def _page_graph(
@@ -1105,7 +1566,9 @@ def _page_graph(
         }
     existing = {str(node.get("node_id")) for node in graph["nodes"]}
     graph["nodes"].extend(
-        node for node_id, node in sorted(required_nodes.items()) if node_id not in existing
+        node
+        for node_id, node in sorted(required_nodes.items())
+        if node_id not in existing
     )
     return graph
 
@@ -1261,8 +1724,7 @@ def _assign_app_components(
 
     total = sum(int(component["size"]) for component in components)
     targets = {
-        split: total * percentage / 100.0
-        for split, percentage in percentages.items()
+        split: total * percentage / 100.0 for split, percentage in percentages.items()
     }
     enabled_splits = tuple(
         split for split in ("train", "dev", "test") if percentages[split] > 0
@@ -1331,9 +1793,7 @@ class _StringUnionFind:
 
 def _cross_split_values(values: dict[str, set[str]]) -> dict[str, list[str]]:
     return {
-        key: sorted(splits)
-        for key, splits in sorted(values.items())
-        if len(splits) > 1
+        key: sorted(splits) for key, splits in sorted(values.items()) if len(splits) > 1
     }
 
 

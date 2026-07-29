@@ -6,6 +6,7 @@ import pytest
 from omnitransfer.mapping_dataset import (
     UI_CORRESPONDENCE_PAIR_SCHEMA,
     adapt_ase_queries,
+    adapt_bmoca_trace_corpus,
     adapt_gui_odyssey_human_reviews,
     adapt_gui_odyssey_rows,
     audit_ui_correspondence_pairs,
@@ -170,9 +171,7 @@ def test_ase_queries_are_grouped_into_one_multi_match_ui_correspondence() -> Non
                 "bounds": [0.7, 0.8, 0.9, 0.9],
                 "metadata": {"platform": "ios"},
             },
-            target_candidates=(
-                Candidate("target-b", bbox=(0.6, 0.8, 0.8, 0.9)),
-            ),
+            target_candidates=(Candidate("target-b", bbox=(0.6, 0.8, 0.8, 0.9)),),
             gold_candidate_id="target-b",
             metadata=common_metadata,
         ),
@@ -203,6 +202,247 @@ def test_ase_queries_are_grouped_into_one_multi_match_ui_correspondence() -> Non
         source_nodes["source-a"]["metadata"]["actionability_evidence"]
         == "ase_public_mapping_source"
     )
+
+
+def test_bmoca_trace_corpus_groups_actions_and_binds_full_xml_nodes(
+    tmp_path: Path,
+) -> None:
+    corpus = tmp_path / "bmoca"
+    source_trace = corpus / "traces" / "trace-source"
+    target_trace = corpus / "traces" / "trace-target"
+    source_trace.mkdir(parents=True)
+    target_trace.mkdir(parents=True)
+    source_xml = """
+    <hierarchy width="1080" height="1920">
+      <android.widget.FrameLayout bounds="[0,0][1080,1920]">
+        <android.widget.Button text="ALPHA" resource-id="pkg:id/alpha"
+          clickable="true" bounds="[10,20][210,120]" />
+        <android.view.View resource-id="pkg:id/image_preview"
+          clickable="false" bounds="[0,200][1080,1600]" />
+        <android.view.View resource-id="pkg:id/overlay_view"
+          clickable="true" bounds="[0,200][1080,1600]" />
+        <android.widget.SeekBar content-desc="Media volume"
+          resource-id="android:id/seekbar" clickable="false"
+          bounds="[100,1650][980,1750]" />
+      </android.widget.FrameLayout>
+    </hierarchy>
+    """
+    target_xml = source_xml.replace("ALPHA", "Alpha").replace(
+        "[10,20][210,120]", "[20,30][220,130]"
+    )
+    (source_trace / "transfer_states.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "omniflow.transfer-state-catalog.v1",
+                "run_id": "run-source",
+                "states": {
+                    "source-page": {
+                        "state_id": "source-page",
+                        "xml": source_xml,
+                        "package_name": "pkg",
+                        "activity_name": "Main",
+                        "display": {"width": 1080, "height": 1920},
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (target_trace / "transfer_states.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "omniflow.transfer-state-catalog.v1",
+                "run_id": "run-target",
+                "states": {
+                    "target-page": {
+                        "state_id": "target-page",
+                        "xml": target_xml,
+                        "package_name": "pkg",
+                        "activity_name": "Main",
+                        "display": {"width": 1080, "height": 1920},
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (corpus / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "omniflow.offline-trace-corpus.v1",
+                "traces": [
+                    {
+                        "trace_id": "trace-source",
+                        "task_id": "task/example",
+                        "environment_id": "100",
+                        "run_id": "run-source",
+                        "state_catalog": {
+                            "path": "traces/trace-source/transfer_states.json"
+                        },
+                    },
+                    {
+                        "trace_id": "trace-target",
+                        "task_id": "task/example",
+                        "environment_id": "101",
+                        "run_id": "run-target",
+                        "state_catalog": {
+                            "path": "traces/trace-target/transfer_states.json"
+                        },
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def endpoint(
+        run_id: str,
+        page_id: str,
+        *,
+        node_id: str,
+        bounds: list[int],
+        class_name: str,
+        text: str = "",
+        resource_id: str = "",
+        clickable: bool = True,
+    ) -> dict:
+        return {
+            "run_id": run_id,
+            "state_id": page_id,
+            "page_id": page_id,
+            "action_tool": "click",
+            "package_name": "pkg",
+            "screenshot_path": f"{page_id}.png",
+            "width": 1080,
+            "height": 1920,
+            "point": {"x": 100, "y": 70, "coordinate_space": "page_pixels"},
+            "node": {
+                "node_id": node_id,
+                "bounds": bounds,
+                "attributes": {
+                    "class": class_name,
+                    "text": text,
+                    "content_description": "",
+                    "resource_id": resource_id,
+                    "clickable": clickable,
+                    "enabled": True,
+                },
+            },
+        }
+
+    pairs = {
+        "pair-alpha": {
+            "pair_id": "pair-alpha",
+            "bidirectional": True,
+            "source": endpoint(
+                "run-source",
+                "source-page",
+                node_id="e2",
+                bounds=[10, 20, 210, 120],
+                class_name="Button",
+                text="alpha",
+                resource_id="alpha",
+            ),
+            "target": endpoint(
+                "run-target",
+                "target-page",
+                node_id="e2",
+                bounds=[20, 30, 220, 130],
+                class_name="Button",
+                text="alpha",
+                resource_id="alpha",
+            ),
+            "evidence": {"alignment_score": 0.95},
+        },
+        "pair-overlay": {
+            "pair_id": "pair-overlay",
+            "bidirectional": True,
+            "source": endpoint(
+                "run-source",
+                "source-page",
+                node_id="e4",
+                bounds=[0, 200, 1080, 1600],
+                class_name="View",
+                resource_id="overlay_view",
+            ),
+            "target": endpoint(
+                "run-target",
+                "target-page",
+                node_id="e4",
+                bounds=[0, 200, 1080, 1600],
+                class_name="View",
+                resource_id="overlay_view",
+            ),
+            "evidence": {"alignment_score": 0.9},
+        },
+        "pair-slider": {
+            "pair_id": "pair-slider",
+            "bidirectional": True,
+            "source": endpoint(
+                "run-source",
+                "source-page",
+                node_id="e5",
+                bounds=[100, 1650, 980, 1750],
+                class_name="SeekBar",
+                resource_id="seekbar",
+                clickable=False,
+            ),
+            "target": endpoint(
+                "run-target",
+                "target-page",
+                node_id="e5",
+                bounds=[100, 1650, 980, 1750],
+                class_name="SeekBar",
+                resource_id="seekbar",
+                clickable=False,
+            ),
+            "evidence": {"alignment_score": 0.92},
+        },
+    }
+    (corpus / "pair_memory.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "omniflow.transfer-pair-memory.v1",
+                "pairs": pairs,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    records, report = adapt_bmoca_trace_corpus(corpus)
+
+    assert len(records) == 1
+    record = records[0]
+    assert record["schema_version"] == UI_CORRESPONDENCE_PAIR_SCHEMA
+    assert record["split"] == "diagnostic"
+    assert record["label_status"] == "unreviewed"
+    assert record["provenance"]["annotation"] == "offline_trace_dp_alignment_unreviewed"
+    assert len(record["matches"]) == 3
+    source_nodes = {
+        node["node_id"]: node for node in record["source"]["graph"]["nodes"]
+    }
+    target_nodes = {
+        node["node_id"]: node for node in record["target"]["graph"]["nodes"]
+    }
+    for match in record["matches"]:
+        assert source_nodes[match["source_node_id"]]["clickable"] is True
+        assert all(
+            target_nodes[node_id]["clickable"] for node_id in match["target_node_ids"]
+        )
+    overlay_match = next(
+        match
+        for match in record["matches"]
+        if source_nodes[match["source_node_id"]]["resource_id"].endswith("overlay_view")
+    )
+    assert all(
+        target_nodes[node_id]["resource_id"].endswith("overlay_view")
+        for node_id in overlay_match["target_node_ids"]
+    )
+    assert report["input_pairs"] == 3
+    assert report["output_records"] == 1
+    assert report["output_correspondences"] == 3
+    assert report["unresolved_endpoints"] == 0
+    assert report["executed_nodes_marked_actionable"] == 2
 
 
 def test_ase_adapter_materializes_relative_xml_into_the_page_pair(
@@ -257,12 +497,9 @@ def test_ase_adapter_materializes_relative_xml_into_the_page_pair(
 
     assert record["source"]["graph"]["metadata"]["source_format"] == "xml"
     assert record["target"]["graph"]["metadata"]["source_format"] == "xml"
+    assert any(node["text"] == "Search" for node in record["source"]["graph"]["nodes"])
     assert any(
-        node["text"] == "Search" for node in record["source"]["graph"]["nodes"]
-    )
-    assert any(
-        node["content_desc"] == "Search"
-        for node in record["target"]["graph"]["nodes"]
+        node["content_desc"] == "Search" for node in record["target"]["graph"]["nodes"]
     )
 
 
@@ -287,7 +524,12 @@ def test_gui_odyssey_weak_pair_uses_the_same_page_pair_schema(tmp_path: Path) ->
                     "screenshot": f"{episode_id}_3.png",
                     "action": "CLICK",
                     "info": [point, point],
-                    "sam2_bbox": [point[0] - 50, point[1] - 50, point[0] + 50, point[1] + 50],
+                    "sam2_bbox": [
+                        point[0] - 50,
+                        point[1] - 50,
+                        point[0] + 50,
+                        point[1] + 50,
+                    ],
                     "low_level_instruction": "Open Apps.",
                 }
             ],
@@ -480,7 +722,10 @@ def test_reviewed_gui_odyssey_multi_point_pair_can_enter_formal_test(
                 ],
                 "matches": [
                     {"source_node_id": "source-apps", "target_node_id": "target-apps"},
-                    {"source_node_id": "source-search", "target_node_id": "target-search"},
+                    {
+                        "source_node_id": "source-search",
+                        "target_node_id": "target-search",
+                    },
                     {
                         "source_node_id": "source-search",
                         "target_node_id": "target-search-label",

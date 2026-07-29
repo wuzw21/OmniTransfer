@@ -12,6 +12,7 @@ from omnitransfer.experiment_logging import file_sha256
 from omnitransfer.importers import load_queries
 from omnitransfer.mapping_dataset import (
     adapt_ase_queries,
+    adapt_bmoca_trace_corpus,
     iter_split_ui_correspondence_pool,
     plan_ui_correspondence_pool,
     validate_ui_correspondence_pair,
@@ -24,6 +25,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ase-queries", type=Path)
     parser.add_argument("--ase-assets-root", type=Path)
+    parser.add_argument(
+        "--bmoca-trace-corpus",
+        nargs="*",
+        type=Path,
+        default=(),
+        help=(
+            "BMOCA offline-trace corpus directories containing manifest.json, "
+            "pair_memory.json, and per-run XML state catalogs. Automatic "
+            "alignments remain unreviewed."
+        ),
+    )
     parser.add_argument(
         "--correspondence-pairs",
         "--page-pairs",
@@ -68,6 +80,33 @@ def main() -> None:
             "output_schema": "omnitransfer.ui_correspondence_pair.v1",
         }
 
+    bmoca_records: list[dict[str, Any]] = []
+    bmoca_reports: list[dict[str, Any]] = []
+    for corpus_value in args.bmoca_trace_corpus:
+        corpus = corpus_value.expanduser().resolve()
+        records, report = adapt_bmoca_trace_corpus(corpus)
+        bmoca_records.extend(records)
+        bmoca_reports.append({"corpus_root": str(corpus), **report})
+        inputs.extend(
+            (
+                _input_manifest(
+                    corpus / "manifest.json",
+                    kind="bmoca_offline_trace_manifest",
+                ),
+                _input_manifest(
+                    corpus / "pair_memory.json",
+                    kind="bmoca_transfer_pair_memory",
+                ),
+            )
+        )
+    if bmoca_reports:
+        adapters["bmoca_offline_trace_alignment"] = {
+            "records": len(bmoca_records),
+            "corpora": bmoca_reports,
+            "output_schema": "omnitransfer.ui_correspondence_pair.v1",
+            "formal_gold": False,
+        }
+
     correspondence_adapter = {
         "records": 0,
         "files": len(args.correspondence_pairs),
@@ -79,13 +118,15 @@ def main() -> None:
     if args.correspondence_pairs:
         adapters["existing_ui_correspondence_pairs"] = correspondence_adapter
 
-    if not ase_records and not args.correspondence_pairs:
+    if not ase_records and not bmoca_records and not args.correspondence_pairs:
         raise SystemExit(
-            "Provide --ase-queries and/or at least one --correspondence-pairs file"
+            "Provide --ase-queries, --bmoca-trace-corpus, and/or at least one "
+            "--correspondence-pairs file"
         )
 
     def records() -> Iterable[dict[str, Any]]:
         yield from ase_records
+        yield from bmoca_records
         for pair_path in args.correspondence_pairs:
             path = pair_path.expanduser().resolve()
             for row in _iter_correspondence_pairs(path):
