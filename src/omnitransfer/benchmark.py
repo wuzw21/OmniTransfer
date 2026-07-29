@@ -10,7 +10,7 @@ import math
 from pathlib import Path
 import random
 import time
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from omnitransfer.eval import RankingMetrics, ranking_metrics
 from omnitransfer.learned_matcher import (
@@ -23,7 +23,7 @@ from omnitransfer.outcome_learning import OutcomePreference, preference_ranking_
 from omnitransfer.schema import Candidate, Prediction, Query
 from omnitransfer.self_supervised import (
     AugmentConfig,
-    TrainingPair,
+    CorrespondencePair,
     make_training_pair,
     matching_loss,
 )
@@ -157,10 +157,13 @@ def fine_tune_matcher(
     self_supervised_weight: float = 0.0,
     self_supervised_interval: int = 4,
     augment_config: AugmentConfig | None = None,
-    correspondence_pairs: list[TrainingPair] | None = None,
+    correspondence_pairs: list[CorrespondencePair] | None = None,
     correspondence_weight: float = 1.0,
+    confidence_weight: float = 1.0,
+    context_mask_probability: float = 0.0,
+    epoch_callback: Callable[[dict[str, float]], None] | None = None,
 ) -> FineTuneResult:
-    """Fine-tune candidate assignment with set-valued gold and NULL examples."""
+    """Fine-tune mutual ranking and absolute pair confidence."""
 
     torch = _require_torch()
     cfg = config or MatcherConfig()
@@ -178,6 +181,10 @@ def fine_tune_matcher(
         raise ValueError("self_supervised_interval must be positive")
     if correspondence_weight < 0.0:
         raise ValueError("correspondence_weight must be non-negative")
+    if confidence_weight < 0.0:
+        raise ValueError("confidence_weight must be non-negative")
+    if not 0.0 <= context_mask_probability <= 1.0:
+        raise ValueError("context_mask_probability must be between zero and one")
     training_queries = [query for query in queries if query.target_candidates]
     weak_pairs = list(correspondence_pairs or ())
     auxiliary_graphs = [
@@ -191,12 +198,16 @@ def fine_tune_matcher(
         losses: list[float] = []
         preference_losses: list[float] = []
         self_supervised_losses: list[float] = []
-        null_examples = 0
+        negative_queries = 0
+        confidence_losses: list[float] = []
         preference_pairs = 0
-        self_supervised_null_labels = 0
+        self_supervised_unmatched_labels = 0
         self_supervised_positive_labels = 0
         self_supervised_pairs = 0
         correspondence_losses: list[float] = []
+        final_assignment_losses: list[float] = []
+        intermediate_assignment_losses: list[float] = []
+        context_masked_queries = 0
         rng.shuffle(auxiliary_graphs)
         rng.shuffle(weak_pairs)
         auxiliary_index = 0
@@ -211,16 +222,37 @@ def fine_tune_matcher(
                 for index, node in enumerate(source_graph.nodes)
                 if node.node_id == source_node_id
             )
+            masked_source_indices = (
+                (source_index,)
+                if rng.random() < context_mask_probability
+                else ()
+            )
+            context_masked_queries += int(bool(masked_source_indices))
             output = matcher(
                 *matcher_inputs(
                     source_graph,
                     target_graph,
                     config=cfg,
                     device=device,
+                    source_context_mask_indices=masked_source_indices,
                 )
             )
-            logits = _candidate_logits(
-                output["logits_ab"][source_index],
+            layer_scores = tuple(output.get("assignment_scores_by_layer") or ())
+            if not layer_scores:
+                layer_scores = (output["logits_ab"],)
+            candidate_layer_scores = tuple(
+                _candidate_values(
+                    scores[source_index],
+                    target_graph,
+                    query,
+                    torch=torch,
+                    device=device,
+                )
+                for scores in layer_scores
+            )
+            logits = candidate_layer_scores[-1]
+            confidence_logits = _candidate_values(
+                output["affinity"][source_index],
                 target_graph,
                 query,
                 torch=torch,
@@ -232,17 +264,45 @@ def fine_tune_matcher(
                 for index, candidate in enumerate(query.target_candidates)
                 if candidate.candidate_id in gold_ids
             ]
-            log_probabilities = torch.log_softmax(logits, dim=0)
             if gold_ids and not gold_indices:
                 raise ValueError(
                     f"query {query.query_id} has gold ids absent from target candidates"
                 )
+            confidence_loss = _balanced_pair_confidence_loss(
+                confidence_logits,
+                gold_indices,
+                torch=torch,
+            )
+            confidence_losses.append(float(confidence_loss.detach().cpu()))
             if gold_indices:
-                selected = torch.tensor(gold_indices, dtype=torch.long, device=device)
-                loss = -torch.logsumexp(log_probabilities[selected], dim=0)
+                assignment_losses = tuple(
+                    _set_valued_assignment_loss(
+                        layer_logits,
+                        gold_indices,
+                        torch=torch,
+                        device=device,
+                    )
+                    for layer_logits in candidate_layer_scores
+                )
+                loss = torch.stack(assignment_losses).mean()
+                final_assignment_losses.append(
+                    float(assignment_losses[-1].detach().cpu())
+                )
+                intermediate_assignment_losses.append(
+                    float(
+                        (
+                            torch.stack(assignment_losses[:-1]).mean()
+                            if len(assignment_losses) > 1
+                            else loss.new_zeros(())
+                        )
+                        .detach()
+                        .cpu()
+                    )
+                )
             else:
-                loss = -log_probabilities[-1]
-                null_examples += 1
+                loss = confidence_loss.new_zeros(())
+                negative_queries += 1
+            loss = loss + float(confidence_weight) * confidence_loss
             query_preferences = tuple((outcome_preferences or {}).get(query.query_id, ()))
             if query_preferences and preference_weight > 0.0:
                 ranking_loss = preference_ranking_loss(
@@ -284,7 +344,7 @@ def fine_tune_matcher(
                     self_supervised_positive_labels += sum(
                         target >= 0 for target in labels
                     )
-                    self_supervised_null_labels += sum(
+                    self_supervised_unmatched_labels += sum(
                         target < 0 for target in labels
                     )
                     self_supervised_pairs += 1
@@ -315,12 +375,32 @@ def fine_tune_matcher(
             torch.nn.utils.clip_grad_norm_(matcher.parameters(), max_norm=1.0)
             optimizer.step()
             losses.append(float(loss.detach().cpu()))
-        history.append(
-            {
+        epoch_metrics = {
                 "epoch": float(epoch + 1),
                 "loss": sum(losses) / max(len(losses), 1),
                 "queries": float(len(losses)),
-                "null_queries": float(null_examples),
+                "context_masked_queries": float(context_masked_queries),
+                "context_mask_rate": (
+                    context_masked_queries / max(len(losses), 1)
+                ),
+                "final_assignment_loss": (
+                    sum(final_assignment_losses) / len(final_assignment_losses)
+                    if final_assignment_losses
+                    else 0.0
+                ),
+                "intermediate_assignment_loss": (
+                    sum(intermediate_assignment_losses)
+                    / len(intermediate_assignment_losses)
+                    if intermediate_assignment_losses
+                    else 0.0
+                ),
+                "supervised_layers": float(len(layer_scores)),
+                "negative_queries": float(negative_queries),
+                "confidence_loss": (
+                    sum(confidence_losses) / len(confidence_losses)
+                    if confidence_losses
+                    else 0.0
+                ),
                 "preference_loss": (
                     sum(preference_losses) / len(preference_losses)
                     if preference_losses
@@ -336,7 +416,9 @@ def fine_tune_matcher(
                 "self_supervised_positive_labels": float(
                     self_supervised_positive_labels
                 ),
-                "self_supervised_null_labels": float(self_supervised_null_labels),
+                "self_supervised_unmatched_labels": float(
+                    self_supervised_unmatched_labels
+                ),
                 "correspondence_loss": (
                     sum(correspondence_losses) / len(correspondence_losses)
                     if correspondence_losses
@@ -344,7 +426,9 @@ def fine_tune_matcher(
                 ),
                 "correspondence_pairs": float(len(correspondence_losses)),
             }
-        )
+        history.append(epoch_metrics)
+        if epoch_callback is not None:
+            epoch_callback(dict(epoch_metrics))
     matcher.eval()
     return FineTuneResult(
         model=matcher,
@@ -411,8 +495,16 @@ def predict_queries(
             )
             _synchronize(device, torch)
             input_end = time.perf_counter()
-            logits = _candidate_logits(
-                model(*model_inputs)["logits_ab"][source_index],
+            output = model(*model_inputs)
+            logits = _candidate_values(
+                output["logits_ab"][source_index],
+                target_graph,
+                query,
+                torch=torch,
+                device=device,
+            )
+            confidence_logits = _candidate_values(
+                output["affinity"][source_index],
                 target_graph,
                 query,
                 torch=torch,
@@ -421,22 +513,29 @@ def predict_queries(
             _synchronize(device, torch)
             model_end = time.perf_counter()
             probabilities = torch.softmax(logits, dim=0).detach().cpu().tolist()
+            match_probabilities = (
+                torch.sigmoid(confidence_logits).detach().cpu().tolist()
+            )
             candidate_scores = {
                 candidate.candidate_id: float(probabilities[index])
                 for index, candidate in enumerate(query.target_candidates)
             }
             ranked = sorted(candidate_scores.items(), key=lambda item: (-item[1], item[0]))
             best_id, best_probability = ranked[0]
-            null_probability = float(probabilities[-1])
+            best_index = next(
+                index
+                for index, candidate in enumerate(query.target_candidates)
+                if candidate.candidate_id == best_id
+            )
+            match_confidence = float(match_probabilities[best_index])
             second_probability = max(
-                [null_probability, *(score for _, score in ranked[1:])],
-                default=null_probability,
+                (score for _, score in ranked[1:]),
+                default=0.0,
             )
             margin = best_probability - second_probability
             selected = (
                 best_id
-                if best_probability > null_probability
-                and best_probability >= min_probability
+                if match_confidence >= min_probability
                 and margin >= min_margin
                 else None
             )
@@ -447,7 +546,7 @@ def predict_queries(
                     selected_candidate_id=selected,
                     scores=candidate_scores,
                     metadata={
-                        "null_probability": null_probability,
+                        "match_confidence": match_confidence,
                         "top1_probability": best_probability,
                         "margin": margin,
                         "mapping_status": "mapped" if selected else "transfer_failure",
@@ -895,7 +994,7 @@ def _xml_graph_from_path(path: str, *, width: float, height: float) -> UIGraph:
     return parsed
 
 
-def _candidate_logits(
+def _candidate_values(
     logits: Any,
     target_graph: UIGraph,
     query: Query,
@@ -914,9 +1013,44 @@ def _candidate_logits(
     selected_indices = [
         node_indices[candidate.candidate_id] for candidate in query.target_candidates
     ]
-    selected_indices.append(len(target_graph.nodes))
     index_tensor = torch.tensor(selected_indices, dtype=torch.long, device=device)
     return logits.index_select(0, index_tensor)
+
+
+def _set_valued_assignment_loss(
+    logits: Any,
+    gold_indices: list[int],
+    *,
+    torch: Any,
+    device: str,
+) -> Any:
+    log_probabilities = torch.log_softmax(logits, dim=0)
+    selected = torch.tensor(gold_indices, dtype=torch.long, device=device)
+    return -torch.logsumexp(log_probabilities[selected], dim=0)
+
+
+def _balanced_pair_confidence_loss(
+    logits: Any,
+    gold_indices: list[int],
+    *,
+    torch: Any,
+) -> Any:
+    labels = torch.zeros_like(logits)
+    if gold_indices:
+        labels[torch.tensor(gold_indices, dtype=torch.long, device=logits.device)] = 1.0
+    losses = torch.nn.functional.binary_cross_entropy_with_logits(
+        logits,
+        labels,
+        reduction="none",
+    )
+    positive_mask = labels > 0.5
+    negative_mask = ~positive_mask
+    parts = []
+    if torch.any(positive_mask):
+        parts.append(losses[positive_mask].mean())
+    if torch.any(negative_mask):
+        parts.append(losses[negative_mask].mean())
+    return torch.stack(parts).mean()
 
 
 def _node_from_payload(
