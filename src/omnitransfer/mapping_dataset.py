@@ -496,10 +496,11 @@ def iter_split_ui_correspondence_pool(
             f"pool:component:{plan.component_ids[pair_id]}"
         ]
         record["slices"]["app"] = plan.app_ids[pair_id]
-        if assigned_split == "train":
+        if _is_mobileviews_self_supervised_proposal(record):
+            record["split"] = assigned_split
+            record["label_status"] = "self_supervised"
+        elif assigned_split == "train":
             record["split"] = "train"
-            if _is_mobileviews_self_supervised_proposal(record):
-                record["label_status"] = "self_supervised"
         elif record["label_status"] == "gold":
             record["split"] = assigned_split
         else:
@@ -524,6 +525,7 @@ def audit_ui_correspondence_pairs(records: list[dict[str, Any]]) -> dict[str, An
     partition_splits: dict[str, set[str]] = defaultdict(set)
     split_counts: Counter[str] = Counter()
     label_counts: Counter[str] = Counter()
+    split_label_counts: dict[str, Counter[str]] = defaultdict(Counter)
     dataset_counts: Counter[str] = Counter()
     match_counts: Counter[str] = Counter()
     assignment_counts: Counter[str] = Counter()
@@ -538,6 +540,7 @@ def audit_ui_correspondence_pairs(records: list[dict[str, Any]]) -> dict[str, An
         split_counts[split] += 1
         assignment_counts[assignment_split] += 1
         label_counts[record["label_status"]] += 1
+        split_label_counts[split][record["label_status"]] += 1
         dataset_counts[str(record["provenance"].get("dataset") or "unknown")] += 1
         for match in record["matches"]:
             match_counts[match["label"]] += 1
@@ -559,6 +562,10 @@ def audit_ui_correspondence_pairs(records: list[dict[str, Any]]) -> dict[str, An
         "split_counts": dict(sorted(split_counts.items())),
         "assignment_counts": dict(sorted(assignment_counts.items())),
         "label_status_counts": dict(sorted(label_counts.items())),
+        "split_label_status_counts": {
+            split: dict(sorted(counts.items()))
+            for split, counts in sorted(split_label_counts.items())
+        },
         "dataset_counts": dict(sorted(dataset_counts.items())),
         "match_label_counts": dict(sorted(match_counts.items())),
         "overlap": {"pair_id": {}, "page_id": {}, "partition_key": {}},
@@ -589,6 +596,7 @@ def write_ui_correspondence_dataset(
     split_counts: Counter[str] = Counter()
     assignment_counts: Counter[str] = Counter()
     label_counts: Counter[str] = Counter()
+    split_label_counts: dict[str, Counter[str]] = defaultdict(Counter)
     dataset_counts: Counter[str] = Counter()
     match_counts: Counter[str] = Counter()
     file_match_counts: Counter[str] = Counter()
@@ -627,6 +635,7 @@ def write_ui_correspondence_dataset(
             split_counts[split] += 1
             assignment_counts[assignment_split] += 1
             label_counts[record["label_status"]] += 1
+            split_label_counts[split][record["label_status"]] += 1
             dataset_counts[
                 str(record["provenance"].get("dataset") or "unknown")
             ] += 1
@@ -655,6 +664,10 @@ def write_ui_correspondence_dataset(
         "split_counts": dict(sorted(split_counts.items())),
         "assignment_counts": dict(sorted(assignment_counts.items())),
         "label_status_counts": dict(sorted(label_counts.items())),
+        "split_label_status_counts": {
+            split: dict(sorted(counts.items()))
+            for split, counts in sorted(split_label_counts.items())
+        },
         "dataset_counts": dict(sorted(dataset_counts.items())),
         "match_label_counts": dict(sorted(match_counts.items())),
         "overlap": {"pair_id": {}, "page_id": {}, "partition_key": {}},
@@ -718,8 +731,11 @@ def validate_ui_correspondence_pair(record: dict[str, Any]) -> dict[str, Any]:
     label_status = _required_text(value, "label_status")
     if label_status not in _LABEL_STATUSES:
         raise ValueError(f"unsupported label status: {label_status}")
-    if split in {"dev", "test"} and label_status != "gold":
-        raise ValueError(f"{split} contains non-gold labels")
+    if split in {"dev", "test"} and label_status not in {
+        "gold",
+        "self_supervised",
+    }:
+        raise ValueError(f"{split} contains unsupported labels: {label_status}")
 
     source_ids = _validate_page(value.get("source"), side="source")
     target_ids = _validate_page(value.get("target"), side="target")

@@ -76,6 +76,15 @@ def test_ui_correspondence_schema_accepts_multiple_matches_for_train_and_test() 
     assert len(train["matches"]) == 2
     assert train["matches"][0]["target_node_ids"] == ["target-a", "target-b"]
 
+    self_supervised_test = validate_ui_correspondence_pair(
+        {**base, "split": "test", "label_status": "self_supervised"}
+    )
+    assert self_supervised_test["label_status"] == "self_supervised"
+    with pytest.raises(ValueError, match="unsupported labels"):
+        validate_ui_correspondence_pair(
+            {**base, "split": "test", "label_status": "unreviewed"}
+        )
+
 
 def test_legacy_schema_is_read_but_normalized_to_ui_correspondence() -> None:
     record = {
@@ -677,7 +686,7 @@ def test_unified_pool_is_split_within_app_without_page_leakage(
     audit_ui_correspondence_pairs(split_records)
 
 
-def test_mobileviews_pool_keeps_connected_pages_together_and_reserves_review(
+def test_mobileviews_pool_keeps_connected_pages_together_across_splits(
     tmp_path: Path,
 ) -> None:
     def record(index: int, source_page: str, target_page: str) -> dict:
@@ -736,14 +745,16 @@ def test_mobileviews_pool_keeps_connected_pages_together_and_reserves_review(
     assert plan.assignments["proposal-0"] == plan.assignments["proposal-1"]
     for row in split_records:
         assigned = plan.assignments[row["pair_id"]]
-        if assigned == "train":
-            assert row["split"] == "train"
-            assert row["label_status"] == "self_supervised"
-        else:
-            assert row["split"] == "diagnostic"
-            assert row["label_status"] == "unreviewed"
-            assert row["provenance"]["reserved_split"] == assigned
-    audit_ui_correspondence_pairs(split_records)
+        assert row["split"] == assigned
+        assert row["label_status"] == "self_supervised"
+        assert "reserved_split" not in row["provenance"]
+    audit = audit_ui_correspondence_pairs(split_records)
+    for split in {"train", "dev", "test"}:
+        assert audit["split_label_status_counts"][split] == {
+            "self_supervised": sum(
+                assigned == split for assigned in plan.assignments.values()
+            )
+        }
 
 
 def test_within_app_pool_split_can_disable_dev(tmp_path: Path) -> None:

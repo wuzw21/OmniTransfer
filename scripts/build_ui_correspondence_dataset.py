@@ -125,6 +125,8 @@ def main() -> None:
                 "split_protocol": "within_app_page_component_v1",
                 "same_app_may_span_train_dev_test": True,
                 "pair_page_component_overlap": "forbidden",
+                "mobileviews_self_supervised_follows_assigned_split": True,
+                "formal_metrics_require_label_status": "gold",
                 "app_disjoint_primary_test": False,
                 "app_disjoint_evaluation": "optional_generalization_slice",
             }

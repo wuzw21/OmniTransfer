@@ -35,7 +35,11 @@ def main() -> None:
         nargs="+",
         type=Path,
         default=(),
-        help="Gold dev UI-correspondence JSONL files with the same record schema.",
+        help=(
+            "Held-out dev UI-correspondence JSONL files with the same record "
+            "schema; label_status distinguishes development pseudo-labels "
+            "from formal gold."
+        ),
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--report", type=Path)
@@ -112,7 +116,7 @@ def main() -> None:
             allowed_splits=frozenset({"dev"}),
         )
         if not validation_pairs:
-            raise SystemExit("No gold dev correspondence pairs were accepted")
+            raise SystemExit("No held-out dev correspondence pairs were accepted")
     preview = {
         "adapter": adapter,
         "matcher_config": asdict(config),

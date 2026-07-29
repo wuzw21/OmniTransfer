@@ -6,8 +6,10 @@ RCAM is built from one mixed `omnitransfer.ui_correspondence_pair.v1` pool.
 Dataset adapters run before splitting and never create dataset-specific model
 paths. The canonical splitter assigns page-connected components inside each
 App, so the same App may appear across train/dev/test while pair, page, and
-component overlap remains zero. Non-gold dev/test assignments are review
-candidates, not formal metrics.
+component overlap remains zero. Page-disjoint MobileViews proposals may occupy
+dev/test with `label_status=self_supervised`; those splits support fast
+development comparisons but are not formal metrics. Formal paper metrics use
+only reviewed or original `label_status=gold` records.
 
 ```bash
 PYTHONPATH=src python scripts/build_ui_correspondence_dataset.py \

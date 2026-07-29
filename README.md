@@ -284,12 +284,15 @@ PYTHONPATH=src python scripts/build_ui_correspondence_dataset.py \
 The output contains the frozen `pool.jsonl` plus train/dev/test/diagnostic
 views in the same schema. The same App intentionally spans splits when it has
 enough page-disjoint components; exact pair, page, and component identities
-never overlap. Non-gold dev/test assignments stay diagnostic review candidates.
-App-disjoint evaluation is a secondary generalization slice.
+never overlap. MobileViews automatic correspondences retain
+`label_status=self_supervised` in every assigned split; held-out results on
+these rows are development metrics, while paper results must filter to
+`label_status=gold`. Other unreviewed proposals stay diagnostic review
+candidates. App-disjoint evaluation is a secondary generalization slice.
 
 Aligned MobileViews/Mind2Web correspondence pairs update the same model without
-a second scoring path. MobileViews automatic labels assigned to train are
-recorded as self-supervised:
+a second scoring path. MobileViews automatic labels are recorded as
+self-supervised:
 
 ```bash
 PYTHONPATH=src python scripts/train_relation_aware_matcher.py \

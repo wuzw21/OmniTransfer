@@ -137,11 +137,13 @@ zero overlap. This makes the primary question new-state and new-layout transfer
 inside known Apps. An App-disjoint partition is reported separately as a harder
 generalization slice.
 
-Self-supervised proposals may enter only the training split. A non-gold record
-assigned to dev or test remains a diagnostic review candidate until a human
-accepts it; formal dev and test contain reviewed or original gold only.
-Ambiguous one-to-many labels are represented as set-valued targets rather than
-forced into a false one-to-one mapping.
+MobileViews self-supervised proposals enter their page-disjoint assigned split,
+including dev and test, while retaining `label_status=self_supervised`. These
+held-out rows provide scalable development metrics but never reviewed-gold
+claims. Other non-gold records remain diagnostic review candidates; formal
+paper metrics contain reviewed or original gold only. Ambiguous one-to-many
+labels are represented as set-valued targets rather than forced into a false
+one-to-one mapping.
 
 ## Evaluation
 

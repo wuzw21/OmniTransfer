@@ -35,9 +35,11 @@ splits. App-disjoint evaluation is an additional generalization slice, not the
 primary split. `view_str`, `origin_id`, `state_str`, and `structure_str` may be
 used only by offline self-supervised label construction and must never enter
 matcher model inputs. Self-supervised proposals may enter only the training
-split. Non-gold dev/test assignments remain review candidates; formal dev and
-test records require reviewed or original gold labels. Unmatched nodes remain
-ignored unless a human explicitly labels NULL.
+split or a page-disjoint held-out self-supervised split. Their
+`label_status=self_supervised` must be preserved so automatic validation is
+never reported as reviewed-gold evaluation. Other non-gold dev/test assignments
+remain review candidates. Unmatched nodes remain ignored unless a human
+explicitly labels NULL.
 
 # Shortcut-Free Actionable Matching Long-Term Rule
 
