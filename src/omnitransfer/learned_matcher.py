@@ -29,6 +29,8 @@ PEMM_V3_FEATURE_SCHEMA_SPEC = (
 PEMM_V3_FEATURE_SCHEMA_SHA256 = hashlib.sha256(
     PEMM_V3_FEATURE_SCHEMA_SPEC.encode("utf-8")
 ).hexdigest()
+LEGACY_ATTENTION_ARCHITECTURE = "relation_bias_v1"
+LEARNED_GRAPH_ATTENTION_ARCHITECTURE = "learned_graph_cross_attention_v2"
 
 
 @dataclass(frozen=True)
@@ -47,7 +49,8 @@ class MatcherConfig:
     visual_canvas_size: int = 384
     source_context_nodes: int = 48
     target_context_nodes: int = 64
-    assignment_head: str = "pair_mlp"
+    architecture: str = LEARNED_GRAPH_ATTENTION_ARCHITECTURE
+    assignment_head: str = "partial_assignment"
 
 
 @dataclass(frozen=True)
@@ -154,10 +157,10 @@ def mutual_log_assignment(affinity: Any) -> Any:
     )
 
 
-def build_relation_aware_matcher(
+def _build_legacy_relation_aware_matcher(
     config: MatcherConfig | None = None,
 ) -> Any:
-    """Build a compact relation-biased, bidirectional cross-attention matcher."""
+    """Build the frozen v1 architecture for checkpoint reproduction only."""
 
     torch = _require_torch()
     nn = torch.nn
@@ -454,6 +457,387 @@ def build_relation_aware_matcher(
     return RelationAwareCrossAttentionMatcher()
 
 
+def _build_learned_graph_cross_attention_matcher(
+    config: MatcherConfig,
+) -> Any:
+    """Build graph-context attention followed by bidirectional soft matching."""
+
+    torch = _require_torch()
+    nn = torch.nn
+    cfg = config
+    if cfg.hidden_dim % cfg.num_heads != 0:
+        raise ValueError("hidden_dim must be divisible by num_heads")
+    if cfg.source_context_nodes <= 0:
+        raise ValueError("source_context_nodes must be positive")
+    if cfg.target_context_nodes <= 0:
+        raise ValueError("target_context_nodes must be positive")
+    if cfg.visual_canvas_size < cfg.visual_patch_size:
+        raise ValueError("visual_canvas_size must cover one visual patch")
+    if cfg.num_layers <= 0:
+        raise ValueError("num_layers must be positive")
+    if cfg.assignment_head != "partial_assignment":
+        raise ValueError(
+            "learned graph cross-attention requires 'partial_assignment'"
+        )
+
+    class LearnedGraphAttention(nn.Module):
+        """Learn which same-screen node relations should update each node."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.query = nn.Linear(cfg.hidden_dim, cfg.hidden_dim, bias=False)
+            self.key = nn.Linear(cfg.hidden_dim, cfg.hidden_dim, bias=False)
+            self.value = nn.Linear(cfg.hidden_dim, cfg.hidden_dim, bias=False)
+            self.relation_encoder = nn.Sequential(
+                nn.Linear(RELATION_FEATURE_DIM, cfg.relation_hidden_dim),
+                nn.GELU(),
+            )
+            head_dim = cfg.hidden_dim // cfg.num_heads
+            score_dim = head_dim * 4 + cfg.relation_hidden_dim
+            self.score = nn.Sequential(
+                nn.LayerNorm(score_dim),
+                nn.Linear(score_dim, cfg.relation_hidden_dim),
+                nn.GELU(),
+                nn.Linear(cfg.relation_hidden_dim, 1),
+            )
+            self.output = nn.Linear(cfg.hidden_dim, cfg.hidden_dim, bias=False)
+            self.norm_attention = nn.LayerNorm(cfg.hidden_dim)
+            self.feed_forward = nn.Sequential(
+                nn.Linear(cfg.hidden_dim, cfg.hidden_dim * 2),
+                nn.GELU(),
+                nn.Dropout(cfg.dropout),
+                nn.Linear(cfg.hidden_dim * 2, cfg.hidden_dim),
+            )
+            self.norm_output = nn.LayerNorm(cfg.hidden_dim)
+            self.dropout = nn.Dropout(cfg.dropout)
+            self.head_dim = head_dim
+
+        def forward(self, states: Any, relations: Any) -> tuple[Any, Any]:
+            node_count = int(states.shape[0])
+            query = self.query(states).reshape(
+                node_count, cfg.num_heads, self.head_dim
+            ).transpose(0, 1)
+            key = self.key(states).reshape(
+                node_count, cfg.num_heads, self.head_dim
+            ).transpose(0, 1)
+            value = self.value(states).reshape(
+                node_count, cfg.num_heads, self.head_dim
+            ).transpose(0, 1)
+            query_pairs = query[:, :, None, :].expand(
+                -1, -1, node_count, -1
+            )
+            key_pairs = key[:, None, :, :].expand(
+                -1, node_count, -1, -1
+            )
+            relation = self.relation_encoder(relations)
+            relation = relation.unsqueeze(0).expand(cfg.num_heads, -1, -1, -1)
+            score_features = torch.cat(
+                [
+                    query_pairs,
+                    key_pairs,
+                    torch.abs(query_pairs - key_pairs),
+                    query_pairs * key_pairs,
+                    relation,
+                ],
+                dim=-1,
+            )
+            scores = self.score(score_features).squeeze(-1)
+            attention = torch.softmax(scores, dim=-1)
+            context = attention @ value
+            context = context.transpose(0, 1).reshape(node_count, cfg.hidden_dim)
+            states = self.norm_attention(
+                states + self.dropout(self.output(context))
+            )
+            states = self.norm_output(
+                states + self.dropout(self.feed_forward(states))
+            )
+            return states, attention
+
+    class BidirectionalCrossAttention(nn.Module):
+        """Exchange target-conditioned evidence through one soft affinity."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.affinity_projection = nn.Linear(
+                cfg.hidden_dim,
+                cfg.hidden_dim,
+                bias=False,
+            )
+            self.value = nn.Linear(cfg.hidden_dim, cfg.hidden_dim, bias=False)
+            self.update = nn.Sequential(
+                nn.LayerNorm(cfg.hidden_dim * 2),
+                nn.Linear(cfg.hidden_dim * 2, cfg.hidden_dim),
+                nn.GELU(),
+                nn.Dropout(cfg.dropout),
+                nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
+            )
+            self.output_norm = nn.LayerNorm(cfg.hidden_dim)
+            self.dropout = nn.Dropout(cfg.dropout)
+
+        def forward(
+            self,
+            source_states: Any,
+            target_states: Any,
+        ) -> tuple[Any, Any, Any, Any, Any]:
+            projected_source = self.affinity_projection(source_states)
+            projected_target = self.affinity_projection(target_states)
+            affinity = (
+                projected_source @ projected_target.T
+            ) / math.sqrt(cfg.hidden_dim)
+            attention_ab = torch.softmax(affinity, dim=1)
+            attention_ba = torch.softmax(affinity, dim=0).T
+            source_message = attention_ab @ self.value(target_states)
+            target_message = attention_ba @ self.value(source_states)
+            source_update = self.update(
+                torch.cat([source_states, source_message], dim=-1)
+            )
+            target_update = self.update(
+                torch.cat([target_states, target_message], dim=-1)
+            )
+            source_states = self.output_norm(
+                source_states + self.dropout(source_update)
+            )
+            target_states = self.output_norm(
+                target_states + self.dropout(target_update)
+            )
+            return (
+                source_states,
+                target_states,
+                affinity,
+                attention_ab,
+                attention_ba,
+            )
+
+    class GraphMatchingLayer(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.graph_attention = LearnedGraphAttention()
+            self.cross_attention = BidirectionalCrossAttention()
+
+        def forward(
+            self,
+            source_states: Any,
+            target_states: Any,
+            source_relations: Any,
+            target_relations: Any,
+        ) -> tuple[Any, Any, dict[str, Any]]:
+            source_states, source_attention = self.graph_attention(
+                source_states,
+                source_relations,
+            )
+            target_states, target_attention = self.graph_attention(
+                target_states,
+                target_relations,
+            )
+            (
+                source_states,
+                target_states,
+                cross_affinity,
+                attention_ab,
+                attention_ba,
+            ) = self.cross_attention(source_states, target_states)
+            return source_states, target_states, {
+                "source_graph": source_attention,
+                "target_graph": target_attention,
+                "cross_affinity": cross_affinity,
+                "source_to_target": attention_ab,
+                "target_to_source": attention_ba,
+            }
+
+    class PartialAssignmentHead(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            pair_dim = cfg.hidden_dim * 4
+            self.compatibility = nn.Sequential(
+                nn.LayerNorm(pair_dim),
+                nn.Linear(pair_dim, cfg.hidden_dim),
+                nn.GELU(),
+                nn.Dropout(cfg.dropout),
+                nn.Linear(cfg.hidden_dim, 1),
+            )
+            self.matchability = nn.Linear(cfg.hidden_dim, 1)
+
+        def forward(self, source_states: Any, target_states: Any) -> Any:
+            source = source_states[:, None, :].expand(
+                -1, target_states.shape[0], -1
+            )
+            target = target_states[None, :, :].expand(
+                source_states.shape[0], -1, -1
+            )
+            pair = torch.cat(
+                [
+                    source,
+                    target,
+                    torch.abs(source - target),
+                    source * target,
+                ],
+                dim=-1,
+            )
+            return (
+                self.compatibility(pair).squeeze(-1)
+                + self.matchability(source_states)
+                + self.matchability(target_states).T
+            )
+
+    class LearnedGraphCrossAttentionMatcher(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.token_embedding = nn.Embedding(
+                cfg.vocab_size,
+                cfg.token_dim,
+                padding_idx=0,
+            )
+            self.token_projection = nn.Linear(cfg.token_dim, cfg.hidden_dim)
+            self.numeric_projection = nn.Sequential(
+                nn.LayerNorm(NUMERIC_FEATURE_DIM),
+                nn.Linear(NUMERIC_FEATURE_DIM, cfg.hidden_dim),
+                nn.GELU(),
+                nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
+            )
+            self.visual_encoder = nn.Sequential(
+                nn.Conv2d(3, 16, kernel_size=5, stride=2, padding=2),
+                nn.GELU(),
+                nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+                nn.GELU(),
+                nn.Conv2d(32, cfg.hidden_dim, kernel_size=3, stride=2, padding=1),
+                nn.GELU(),
+                nn.AdaptiveAvgPool2d((1, 1)),
+                nn.Flatten(),
+            )
+            self.missing_visual = nn.Parameter(torch.zeros(cfg.hidden_dim))
+            self.input_norm = nn.LayerNorm(cfg.hidden_dim)
+            self.layers = nn.ModuleList(
+                GraphMatchingLayer() for _ in range(cfg.num_layers)
+            )
+            self.assignment_head = PartialAssignmentHead()
+
+        def _encode_nodes(
+            self,
+            token_ids: Any,
+            numeric_features: Any,
+            visual_patches: Any,
+            visual_mask: Any,
+        ) -> Any:
+            mask = token_ids.ne(0).unsqueeze(-1)
+            embedded = self.token_embedding(token_ids)
+            token_sum = (embedded * mask).sum(dim=1)
+            token_count = mask.sum(dim=1).clamp_min(1)
+            token_states = self.token_projection(token_sum / token_count)
+            numeric_states = self.numeric_projection(numeric_features)
+            visual_states = self.visual_encoder(visual_patches)
+            missing = self.missing_visual.unsqueeze(0).expand(
+                visual_states.shape[0], -1
+            )
+            visual_states = (
+                visual_mask * visual_states + (1.0 - visual_mask) * missing
+            )
+            return self.input_norm(
+                token_states + numeric_states + visual_states
+            )
+
+        @staticmethod
+        def _actionable_indices(numeric_features: Any) -> Any:
+            mask = (
+                numeric_features[:, :3].sum(dim=1).gt(0.0)
+                & numeric_features[:, 3].gt(0.0)
+            )
+            return torch.nonzero(mask, as_tuple=False).flatten()
+
+        def _partial_assignment(
+            self,
+            affinity: Any,
+            source_numeric: Any,
+            target_numeric: Any,
+        ) -> Any:
+            source_indices = self._actionable_indices(source_numeric)
+            target_indices = self._actionable_indices(target_numeric)
+            assignment = torch.full_like(affinity, -1.0e4)
+            if source_indices.numel() == 0 or target_indices.numel() == 0:
+                return assignment
+            actionable_affinity = affinity[
+                source_indices[:, None],
+                target_indices[None, :],
+            ]
+            actionable_assignment = mutual_log_assignment(actionable_affinity)
+            assignment[
+                source_indices[:, None],
+                target_indices[None, :],
+            ] = actionable_assignment
+            return assignment
+
+        def forward(
+            self,
+            source_token_ids: Any,
+            source_numeric: Any,
+            source_relations: Any,
+            target_token_ids: Any,
+            target_numeric: Any,
+            target_relations: Any,
+            source_target_relations: Any,
+            source_visual: Any,
+            source_visual_mask: Any,
+            target_visual: Any,
+            target_visual_mask: Any,
+        ) -> dict[str, Any]:
+            del source_target_relations
+            source_states = self._encode_nodes(
+                source_token_ids,
+                source_numeric,
+                source_visual,
+                source_visual_mask,
+            )
+            target_states = self._encode_nodes(
+                target_token_ids,
+                target_numeric,
+                target_visual,
+                target_visual_mask,
+            )
+            assignments = []
+            affinities = []
+            attention_diagnostics = []
+            for layer in self.layers:
+                source_states, target_states, diagnostics = layer(
+                    source_states,
+                    target_states,
+                    source_relations,
+                    target_relations,
+                )
+                affinity = self.assignment_head(source_states, target_states)
+                assignment = self._partial_assignment(
+                    affinity,
+                    source_numeric,
+                    target_numeric,
+                )
+                affinities.append(affinity)
+                assignments.append(assignment)
+                attention_diagnostics.append(diagnostics)
+            return {
+                "logits_ab": assignments[-1],
+                "logits_ba": assignments[-1].T,
+                "affinity": affinities[-1],
+                "assignment_scores_by_layer": tuple(assignments),
+                "affinities_by_layer": tuple(affinities),
+                "attention_by_layer": tuple(attention_diagnostics),
+                "source_states": source_states,
+                "target_states": target_states,
+            }
+
+    return LearnedGraphCrossAttentionMatcher()
+
+
+def build_relation_aware_matcher(
+    config: MatcherConfig | None = None,
+) -> Any:
+    """Build the versioned OmniTransfer matcher behind one public interface."""
+
+    cfg = config or MatcherConfig()
+    if cfg.architecture == LEARNED_GRAPH_ATTENTION_ARCHITECTURE:
+        return _build_learned_graph_cross_attention_matcher(cfg)
+    if cfg.architecture == LEGACY_ATTENTION_ARCHITECTURE:
+        return _build_legacy_relation_aware_matcher(cfg)
+    raise ValueError(f"unsupported matcher architecture: {cfg.architecture}")
+
+
 # Canonical paper-facing builder. Keep the descriptive implementation name
 # checkpoint-compatible without exposing it as a second model.
 build_omnitransfer_matcher = build_relation_aware_matcher
@@ -608,7 +992,10 @@ class RelationAwareMatcher:
     ) -> "RelationAwareMatcher":
         torch = _require_torch()
         payload = torch.load(Path(path), map_location=device)
-        config = MatcherConfig(**dict(payload["matcher_config"]))
+        config_values = dict(payload["matcher_config"])
+        if "architecture" not in config_values:
+            config_values["architecture"] = LEGACY_ATTENTION_ARCHITECTURE
+        config = MatcherConfig(**config_values)
         model = build_relation_aware_matcher(config)
         model.load_state_dict(payload["state_dict"])
         return cls(model, config=config, device=device)
@@ -726,9 +1113,14 @@ def save_matcher_checkpoint(
     torch = _require_torch()
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
+    schema_version = (
+        "omnitransfer.graph_cross_attention_matcher.v2"
+        if config.architecture == LEARNED_GRAPH_ATTENTION_ARCHITECTURE
+        else "omnitransfer.relation_aware_cross_attention_matcher.v1"
+    )
     torch.save(
         {
-            "schema_version": "omnitransfer.relation_aware_cross_attention_matcher.v1",
+            "schema_version": schema_version,
             "matcher_config": asdict(config),
             "state_dict": model.state_dict(),
             "metadata": dict(metadata or {}),

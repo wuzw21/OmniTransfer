@@ -16,6 +16,7 @@ from omnitransfer.experiment_logging import (
     source_revision,
 )
 from omnitransfer.learned_matcher import (
+    LEARNED_GRAPH_ATTENTION_ARCHITECTURE,
     MatcherConfig,
     OmniTransferMatcher,
     parameter_count,
@@ -52,10 +53,6 @@ def main() -> None:
     parser.add_argument("--hidden-dim", type=int, default=64)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--num-layers", type=int, default=2)
-    parser.add_argument(
-        "--assignment-head",
-        choices=("pair_mlp", "mutual_projection"),
-    )
     parser.add_argument("--source-context-nodes", type=int, default=48)
     parser.add_argument("--target-context-nodes", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=1)
@@ -94,12 +91,10 @@ def main() -> None:
             source_context_nodes=args.source_context_nodes,
             target_context_nodes=args.target_context_nodes,
         )
-        if (
-            args.assignment_head is not None
-            and args.assignment_head != config.assignment_head
-        ):
+        if config.architecture != LEARNED_GRAPH_ATTENTION_ARCHITECTURE:
             raise SystemExit(
-                "--assignment-head cannot change a pretrained checkpoint architecture"
+                "legacy checkpoints are frozen references and cannot initialize "
+                "the learned graph cross-attention trainer"
             )
         pretrained_model = pretrained.model
     else:
@@ -109,7 +104,6 @@ def main() -> None:
             num_layers=args.num_layers,
             source_context_nodes=args.source_context_nodes,
             target_context_nodes=args.target_context_nodes,
-            assignment_head=args.assignment_head or "pair_mlp",
         )
     pairs, graphs, adapter = load_ui_correspondence_pairs(
         args.input,
@@ -170,7 +164,7 @@ def main() -> None:
     metric_log = TrainingMetricLog(metrics_path)
     metric_log.start(
         {
-            "architecture": "omnitransfer",
+            "architecture": config.architecture,
             "objective": "symmetric_actionable_correspondence",
             "code_revision": revision,
             "command": command,
@@ -218,7 +212,7 @@ def main() -> None:
     )
     report = {
         "schema_version": "omnitransfer.matcher_experiment.v1",
-        "architecture": "omnitransfer",
+        "architecture": config.architecture,
         "objective": "symmetric_actionable_correspondence",
         "code_revision": revision,
         "command": command,

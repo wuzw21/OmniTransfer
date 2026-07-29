@@ -23,13 +23,15 @@ Every training example has the same representation:
 CorrespondencePair(source_graph, target_graph, correspondences)
 ```
 
-The pair can come from either of two transformations of the human-gold ASE
-training split:
+The pair can come from either of two transformations of the unified training
+split:
 
-1. **Augmented-view pair.** Two views are generated from one ASE training page.
+1. **Augmented-view pair.** Two views are generated from one training page.
    Known transformation identity constructs auxiliary correspondence labels.
-2. **Cross-page pair.** The human annotation supplies multiple iOS-to-Android
-   aligned nodes under a real platform and layout change.
+2. **Cross-page pair.** Human annotations or offline self-supervised alignment
+   supply multiple aligned actionable nodes under a real platform or layout
+   change. Label provenance remains explicit and determines which evaluation
+   claims are valid.
 
 The origin or stable node identity is used only to construct offline labels. It
 is never passed to the matcher. Both pair sources use the same tensors, matcher,
@@ -53,7 +55,7 @@ absolute coordinates, absolute box size, page order, and offline stable ids are
 not model inputs. The bbox is used only to extract the visual crop and construct
 within-page relative relations.
 
-### Local Relation Encoding
+### Learned Graph Attention
 
 For nodes `i` and `k` on the same page, relation features describe hierarchy and
 relative layout:
@@ -64,45 +66,58 @@ same row / same column / overlap / neighbor
 relative position / relative size / IoU / tree distance
 ```
 
-A relation MLP produces an attention bias rather than a fixed similarity score:
+A learned compatibility function determines how much node `k` changes node
+`i`:
 
 ```text
-A_ik = softmax(q_i k_k / sqrt(d) + MLP_relation(r_ik))
+e_ik = MLP_score([q_i, k_k, |q_i-k_k|, q_i*k_k, MLP_relation(r_ik)])
+A_ik = softmax_k(e_ik)
+h_i' = h_i + sum_k A_ik W_v h_k
 ```
 
-This is how the model learns local relationships without observing a node's
-absolute screen position.
+Every selected node can participate. "Local" is therefore not a coordinate
+window and there is no fixed distance weight: the model learns which semantic,
+tree, and relative-layout relations are useful. The residual preserves the
+node's own evidence as the primary signal while context changes its descriptor.
+Absolute screen position is never observed.
 
 ### Cross-Page Matching
 
-Each matcher layer performs relation-aware self-attention on both pages and
-then bidirectional cross-attention:
+Each matcher layer first applies learned graph attention independently to both
+pages. One shared projected affinity then performs bidirectional cross-attention:
 
 ```text
-source <- attend(source, target)
-target <- attend(target, source)
+C_ij = (W_c h_i^source) dot (W_c h_j^target) / sqrt(d)
+source_i <- source_i + MLP([source_i, softmax_j(C_ij) W_v target_j])
+target_j <- target_j + MLP([target_j, softmax_i(C_ij) W_v source_i])
 ```
 
-The score for source node `i` and target node `j` is learned only from their
-contextual descriptors. One shared compatibility MLP produces the dense
-affinity matrix from each contextual node pair; there is no direct cross-page
-geometry input:
+The score for source node `i` and target node `j` is then learned only from
+their target-conditioned contextual descriptors:
 
 ```text
 S_ij = MLP([h_i, h_j, |h_i - h_j|, h_i * h_j])
+P_ij = 0.5 * (log softmax_j(S_ij) + log softmax_i(S_ij))
 ```
 
-The default model uses hidden size 64, two layers, four heads, at least 48 source
-is 579,926 and is also computed and stored with every checkpoint.
+Only actionable rows and columns enter the partial assignment. Non-actionable
+text and icon nodes remain graph context. Every layer emits a partial
+assignment and receives the same symmetric supervision, so cross-attention
+progressively refines correspondence rather than merely decorating a final
+pointwise classifier.
+
+The default model uses hidden size 64, two layers, four heads, 48 source context
+nodes, and 64 target context nodes. It has 557,400 trainable parameters; the
+exact count is stored with every checkpoint.
 If a page has more actionable nodes than the nominal context limit, every
 actionable node is retained so it remains an explicit candidate hard negative.
 
 ## Unified Training
 
 Each epoch builds one shuffled stream containing both augmented-view pairs and
-cross-page pairs from the declared ASE training split. Augmented views are
-generated lazily when sampled so they do not create another serialized
-dataset.
+cross-page pairs from the declared unified training split. Augmented views are
+generated lazily when sampled so they do not create another serialized dataset
+or trainer.
 Every actionable node is retained in both augmented views. Node dropout applies
 only to non-actionable context, so sibling buttons, rows, and menu items remain
 real in-screen hard negatives.
@@ -123,10 +138,6 @@ L = 0.5 * (CE(S_source_to_target, Y_source_to_target)
     + lambda * L_bidirectional_consistency
 ```
 
-A smaller mutual-projection head is retained only as an ablation. On the frozen
-mixed development smoke it reduced latency but did not improve Top-1, so it is
-not the default OmniTransfer method.
-
 The consistency term encourages the probability of a labeled pair to agree in
 both directions. Multiple correspondences from the same page pair are learned
 together. Supervised rows and ranking candidates are actionable nodes only.
@@ -140,17 +151,20 @@ matching results report positive Top-1 and Recall@K.
 
 ## Data Boundary
 
-Every record uses `omnitransfer.ui_correspondence_pair.v1`, but the primary
-experiment contains only the clean ASE 2023 human-gold mappings. Its original
-App-disjoint declarations are preserved: 4,124 train, 1,014 dev, and 1,592
-test mappings. Exact pair, page, partition, and App leakage across these splits
-is forbidden.
+Every record uses `omnitransfer.ui_correspondence_pair.v1`. MobileViews
+Android-to-Android layouts and ASE iOS-to-Android mappings enter one pool before
+the split is assigned; dataset origin never creates a second model or
+optimization path. Splits are formed inside each App by page-connected
+components. Exact pair, page, component, and partition identities cannot cross
+splits.
 
-MobileViews automatic correspondences are excluded from primary training,
-checkpoint selection, and evaluation. Existing MobileViews artifacts remain
-only as historical self-supervised diagnostics. Ambiguous human-equivalent
-targets are represented as set-valued labels rather than forced into a false
-one-to-one mapping.
+Automatic MobileViews correspondences retain
+`label_status=self_supervised`. They may train the matcher and support
+page-disjoint diagnostics, but they are never reported as reviewed-gold
+accuracy. Formal modern Android-to-Android results require the reviewed
+Benchmark B export; formal ASE results use only its original human-gold test
+annotations. Ambiguous equivalent targets are represented as set-valued labels
+rather than forced into a false one-to-one mapping.
 
 ## Evaluation
 

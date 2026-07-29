@@ -64,8 +64,6 @@ def main() -> None:
                     str(num_layers),
                     "--source-context-nodes",
                     str(context_nodes),
-                    "--assignment-head",
-                    "mutual_projection",
                     "--context-mask-probability",
                     str(args.context_mask_probability),
                     "--device",

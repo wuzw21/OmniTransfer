@@ -1,9 +1,11 @@
 import math
 import random
+from dataclasses import asdict
 
 import pytest
 
 from omnitransfer.learned_matcher import (
+    LEGACY_ATTENTION_ARCHITECTURE,
     RelationAwareMatcher,
     MatcherConfig,
     NUMERIC_FEATURE_DIM,
@@ -18,6 +20,7 @@ from omnitransfer.learned_matcher import (
 )
 from omnitransfer.self_supervised import (
     AugmentConfig,
+    make_correspondence_training_pair,
     make_training_pair,
     matching_loss,
 )
@@ -122,7 +125,7 @@ def test_node_encoding_ignores_resource_id_and_absolute_position() -> None:
 
 
 def test_relation_matcher_forward_and_partial_assignment_loss() -> None:
-    torch = pytest.importorskip("torch")
+    pytest.importorskip("torch")
     config = MatcherConfig(hidden_dim=64, num_heads=4, num_layers=1, dropout=0.0)
     graph = _graph("train")
     pair = make_training_pair(
@@ -156,9 +159,8 @@ def test_relation_matcher_forward_and_partial_assignment_loss() -> None:
     loss.backward()
     assert any(parameter.grad is not None for parameter in model.parameters())
     assert parameter_count(model) < 1_500_000
-    assert any(
-        isinstance(module, torch.nn.MultiheadAttention) for module in model.modules()
-    )
+    assert len(output["assignment_scores_by_layer"]) == config.num_layers
+    assert len(output["attention_by_layer"]) == config.num_layers
 
 
 def test_mutual_log_assignment_normalizes_both_matching_directions() -> None:
@@ -181,7 +183,7 @@ def test_mutual_log_assignment_normalizes_both_matching_directions() -> None:
 
 
 def test_omnitransfer_defaults_to_learned_pair_compatibility() -> None:
-    assert MatcherConfig().assignment_head == "pair_mlp"
+    assert MatcherConfig().assignment_head == "partial_assignment"
 
 
 def test_omnitransfer_public_names_share_one_implementation() -> None:
@@ -201,6 +203,110 @@ def test_omnitransfer_public_names_share_one_implementation() -> None:
     assert train_omnitransfer_matcher is train_relation_aware_matcher
 
 
+def test_omnitransfer_refines_one_soft_assignment_per_attention_layer() -> None:
+    torch = pytest.importorskip("torch")
+    config = MatcherConfig(
+        hidden_dim=32,
+        num_heads=4,
+        num_layers=2,
+        dropout=0.0,
+    )
+    source = _graph("source")
+    target = _graph("target")
+    model = build_relation_aware_matcher(config)
+
+    output = model(*matcher_inputs(source, target, config=config))
+
+    assert len(output["assignment_scores_by_layer"]) == 2
+    assert len(output["affinities_by_layer"]) == 2
+    assert torch.equal(
+        output["logits_ab"],
+        output["assignment_scores_by_layer"][-1],
+    )
+    assert torch.equal(output["logits_ba"], output["logits_ab"].T)
+    assert torch.equal(output["affinity"], output["affinities_by_layer"][-1])
+
+
+def test_graph_attention_learns_anonymous_actions_from_child_text() -> None:
+    torch = pytest.importorskip("torch")
+
+    def anonymous_tabs(
+        graph_id: str,
+        rows: tuple[tuple[str, str], ...],
+    ) -> UIGraph:
+        nodes = [UINode(node_id="root", origin_id="root", class_name="Root")]
+        for node_id, label in rows:
+            label_id = f"{node_id}-label"
+            nodes.extend(
+                (
+                    UINode(
+                        node_id=node_id,
+                        origin_id=node_id,
+                        class_name="LinearLayout",
+                        clickable=True,
+                        parent_id="root",
+                        child_ids=(label_id,),
+                    ),
+                    UINode(
+                        node_id=label_id,
+                        origin_id=label_id,
+                        class_name="TextView",
+                        text=label,
+                        parent_id=node_id,
+                    ),
+                )
+            )
+        return UIGraph(graph_id=graph_id, nodes=tuple(nodes))
+
+    source = anonymous_tabs(
+        "source-tabs",
+        (("source-library", "Library"), ("source-discover", "Discover")),
+    )
+    target = anonymous_tabs(
+        "target-tabs",
+        (("target-discover", "Discover"), ("target-library", "Library")),
+    )
+    config = MatcherConfig(
+        token_dim=24,
+        hidden_dim=32,
+        relation_hidden_dim=16,
+        num_heads=4,
+        num_layers=1,
+        dropout=0.0,
+        source_context_nodes=16,
+        target_context_nodes=16,
+    )
+    pair = make_correspondence_training_pair(
+        source,
+        target,
+        (
+            ("source-library", "target-library"),
+            ("source-discover", "target-discover"),
+        ),
+        matcher_config=config,
+    )
+    torch.manual_seed(17)
+    model = build_relation_aware_matcher(config)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3.0e-3)
+
+    for _ in range(12):
+        optimizer.zero_grad(set_to_none=True)
+        loss = matching_loss(
+            model,
+            pair,
+            matcher_config=config,
+            cycle_weight=0.0,
+        )
+        loss.backward()
+        optimizer.step()
+
+    with torch.no_grad():
+        output = model(*matcher_inputs(source, target, config=config))
+    actionable_scores = output["logits_ab"][[1, 3]][:, [1, 3]]
+
+    assert torch.argmax(actionable_scores, dim=1).tolist() == [1, 0]
+
+
 def test_mutual_projection_reports_one_assignment_per_attention_layer() -> None:
     torch = pytest.importorskip("torch")
     config = MatcherConfig(
@@ -208,6 +314,7 @@ def test_mutual_projection_reports_one_assignment_per_attention_layer() -> None:
         num_heads=4,
         num_layers=2,
         dropout=0.0,
+        architecture=LEGACY_ATTENTION_ARCHITECTURE,
         assignment_head="mutual_projection",
     )
     source = _graph("source")
@@ -453,7 +560,40 @@ def test_visual_checkpoint_round_trip(tmp_path) -> None:
 
     assert (
         payload["schema_version"]
-        == "omnitransfer.relation_aware_cross_attention_matcher.v1"
+        == "omnitransfer.graph_cross_attention_matcher.v2"
     )
     assert restored.config == config
+    assert parameter_count(restored.model) == parameter_count(model)
+
+
+def test_frozen_v1_checkpoint_loads_with_legacy_architecture(tmp_path) -> None:
+    torch = pytest.importorskip("torch")
+    config = MatcherConfig(
+        hidden_dim=32,
+        num_heads=4,
+        num_layers=1,
+        dropout=0.0,
+        architecture=LEGACY_ATTENTION_ARCHITECTURE,
+        assignment_head="pair_mlp",
+    )
+    model = build_relation_aware_matcher(config)
+    config_payload = asdict(config)
+    del config_payload["architecture"]
+    checkpoint = tmp_path / "legacy-v1.pt"
+    torch.save(
+        {
+            "schema_version": (
+                "omnitransfer.relation_aware_cross_attention_matcher.v1"
+            ),
+            "matcher_config": config_payload,
+            "state_dict": model.state_dict(),
+            "metadata": {"frozen_reference": True},
+        },
+        checkpoint,
+    )
+
+    restored = RelationAwareMatcher.from_checkpoint(checkpoint)
+
+    assert restored.config.architecture == LEGACY_ATTENTION_ARCHITECTURE
+    assert restored.config.assignment_head == "pair_mlp"
     assert parameter_count(restored.model) == parameter_count(model)
