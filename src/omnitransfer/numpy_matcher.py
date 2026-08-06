@@ -495,7 +495,12 @@ def _mutual_assignment_logits(
     return mutual, mutual.T
 
 
-def _visual_inputs(graph: UIGraph, *, patch_size: int) -> tuple[Any, Any]:
+def _visual_inputs(
+    graph: UIGraph,
+    *,
+    patch_size: int,
+    canvas_size: int = 0,
+) -> tuple[Any, Any]:
     np = _require_numpy()
     patches = np.zeros(
         (len(graph.nodes), 3, patch_size, patch_size),
@@ -505,6 +510,13 @@ def _visual_inputs(graph: UIGraph, *, patch_size: int) -> tuple[Any, Any]:
     image = _graph_rgb(graph)
     if image is None:
         return patches, mask
+    if canvas_size > 0 and max(image.shape[:2]) > canvas_size:
+        scale = float(canvas_size) / float(max(image.shape[:2]))
+        image = _resize_rgb_shape(
+            image,
+            height=max(1, round(image.shape[0] * scale)),
+            width=max(1, round(image.shape[1] * scale)),
+        )
     image_height, image_width = image.shape[:2]
     graph_width = float(graph.width or image_width)
     graph_height = float(graph.height or image_height)
@@ -560,12 +572,19 @@ def _graph_rgb(graph: UIGraph) -> Any | None:
 
 
 def _resize_rgb(image: Any, size: int) -> Any:
+    return _resize_rgb_shape(image, height=size, width=size).astype(
+        _require_numpy().float32,
+        copy=False,
+    ) / np_float(255.0)
+
+
+def _resize_rgb_shape(image: Any, *, height: int, width: int) -> Any:
     np = _require_numpy()
     source_height, source_width = image.shape[:2]
-    if source_height == size and source_width == size:
-        return image.astype(np.float32) / np_float(255.0)
-    ys = np.linspace(0.0, max(0, source_height - 1), size, dtype=np.float32)
-    xs = np.linspace(0.0, max(0, source_width - 1), size, dtype=np.float32)
+    if source_height == height and source_width == width:
+        return image.copy()
+    ys = np.linspace(0.0, max(0, source_height - 1), height, dtype=np.float32)
+    xs = np.linspace(0.0, max(0, source_width - 1), width, dtype=np.float32)
     y0 = np.floor(ys).astype(np.int64)
     x0 = np.floor(xs).astype(np.int64)
     y1 = np.minimum(y0 + 1, source_height - 1)
@@ -580,7 +599,7 @@ def _resize_rgb(image: Any, size: int) -> Any:
         image[y1[:, None], x0[None, :]].astype(np.float32) * (np_float(1.0) - wx)
         + image[y1[:, None], x1[None, :]].astype(np.float32) * wx
     )
-    return (top * (np_float(1.0) - wy) + bottom * wy) / np_float(255.0)
+    return top * (np_float(1.0) - wy) + bottom * wy
 
 
 def _gelu(values: Any) -> Any:

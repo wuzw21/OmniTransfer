@@ -10,35 +10,47 @@ from pathlib import Path
 from typing import Any
 
 from omnitransfer.learned_matcher import (
-    PEMM_V3_FEATURE_SCHEMA_ID,
-    PEMM_V3_FEATURE_SCHEMA_SHA256,
+    RelationAwareMatcher,
 )
-from omnitransfer.mutual_matcher import MutualGraphMatcher
-from omnitransfer.numpy_matcher import NumpyMutualGraphMatcher
+from omnitransfer.numpy_v9_matcher import NumpyGeometricAlignmentMatcher
 from omnitransfer.ui_graph import UIGraph, UINode, graph_from_record
 
 _MIN_ANCHOR_OFFSET = -1.0
 _MAX_ANCHOR_OFFSET = 2.0
-_MATCHER_RELEASE = "pair-evidence-mutual-matcher-v3.0.1"
-_MATCHER_MODE = "mutual_graph_matcher_no_null_v3"
-_DEFAULT_MATCHER_MIN_PROBABILITY = 0.5
-_DEFAULT_MATCHER_MIN_MARGIN = 0.15
+_MATCHER_RELEASE = "omnitransfer-direct-text-alignment-v9.3.1-mobile"
+_MATCHER_MODE = "omnitransfer_direct_text_alignment_v9"
 _DEFAULT_MATCHER_CHECKPOINT = (
     Path(__file__).resolve().parent
     / "checkpoints"
-    / "pair_evidence_mutual_no_null_v3_20260723"
-    / "no_null_seed17.pt"
+    / "omnitransfer_direct_text_alignment_v9_20260805"
+    / "v9_direct_text_alignment_seed29.npz"
 )
 _DEFAULT_MATCHER_SHA256 = (
-    "61beec6da26f7aab7c51fd778ea22b5cfc956ca0cb658f1e91f4e8debc6f95b8"
+    "b8a6735bd97a7163ad186ec4c869eebbb05634522472035bd9c3b9bc323c5e9e"
 )
-_DEFAULT_NUMPY_MATCHER_CHECKPOINT = _DEFAULT_MATCHER_CHECKPOINT.with_suffix(".npz")
-_DEFAULT_NUMPY_MATCHER_SHA256 = (
-    "6e5668343419da38776e1f32ad9da610abc323637d8f6c6df38fb72ddec062b8"
+_MATCHER_FEATURE_SCHEMA_ID = "omnitransfer-direct-text-spatial-xml-v9"
+_MATCHER_FEATURE_SCHEMA_SPEC = (
+    "direct_text=semantic_exact,token_dice,trigram_dice,containment,presence;"
+    "hashed_text=signed_class_hash;node_text_state=presence_only;"
+    "numeric=clickable,editable,scrollable,enabled,padded_zero;"
+    "visual=node_crop_rgb;"
+    "within_page_relations=hierarchy,sibling,ancestor,descendant,row,column,"
+    "overlap,neighbors,near,control_context;"
+    "cross_page_evidence=semantic_exact,token_dice,trigram_dice,containment,"
+    "semantic_presence,action_compatibility,class_similarity;"
+    "inference_alignment=page_normalized_center,dominant_xml_container_position,"
+    "dominant_xml_branch_order,top5_consensus,adaptive_confidence;"
+    "forbidden=learned_token_lookup,resource_id,raw_absolute_position,"
+    "source_coordinate_passthrough,app_identity;"
+    "context=source128,target160"
 )
+_MATCHER_FEATURE_SCHEMA_SHA256 = hashlib.sha256(
+    _MATCHER_FEATURE_SCHEMA_SPEC.encode("utf-8")
+).hexdigest()
+_CANDIDATE_RANKING_SCHEMA_VERSION = "omnitransfer.candidate-ranking.v1"
 
 
-def action_transfer(
+def rank_action_candidates(
     *,
     target_xml: str,
     source_xml: str | None = None,
@@ -60,77 +72,95 @@ def action_transfer(
     top_k: int = 1,
     history: Any = None,
 ) -> dict[str, Any]:
-    """Relocate one recorded target and return coordinates in target XML pixels.
+    """Return the complete candidate ranking without accepting or rejecting it.
 
-    Android display and screenshot scaling belong to the caller. Semantic
-    source-to-target matching uses only the XML coordinate systems.
+    Confidence and page-identity policy belong to the caller. This API only
+    validates the inputs required to score, runs the matcher, and projects the
+    recorded within-node offset onto every ranked target candidate.
     """
 
     del source_element, source_coordinate_space, target_display_size, history
+    identity = _page_identity(
+        source_package_name=source_package_name,
+        target_package_name=target_package_name,
+        source_activity_name=source_activity_name,
+        target_activity_name=target_activity_name,
+    )
     if not source_xml:
-        return {
-            "mapped": False,
-            "mapping_mode": _MATCHER_MODE,
-            "reason": "source_graph_required",
-        }
-    source_package = str(source_package_name or "").strip()
-    target_package = str(target_package_name or "").strip()
-    if source_package and target_package and source_package != target_package:
-        return {
-            "mapped": False,
-            "mapping_mode": "page_identity",
-            "reason": "target_page_identity_mismatch",
-            "source_package_name": source_package,
-            "target_package_name": target_package,
-        }
-    source = graph_from_record(
-        {
-            "xml": source_xml,
-            "screenshot_path": source_screenshot_path,
-            "visual_rgb": source_visual_rgb,
-        },
-        graph_id="source",
-    )
-    target = graph_from_record(
-        {
-            "xml": target_xml,
-            "screenshot_path": target_screenshot_path,
-            "visual_rgb": target_visual_rgb,
-        },
-        graph_id="target",
-    )
+        return _candidate_ranking_result(
+            status="invalid_input",
+            reason="source_graph_required",
+            action_type=action_type,
+            top_k=top_k,
+            identity=identity,
+        )
+    try:
+        source = graph_from_record(
+            {
+                "xml": source_xml,
+                "screenshot_path": source_screenshot_path,
+                "visual_rgb": source_visual_rgb,
+            },
+            graph_id="source",
+        )
+        target = graph_from_record(
+            {
+                "xml": target_xml,
+                "screenshot_path": target_screenshot_path,
+                "visual_rgb": target_visual_rgb,
+            },
+            graph_id="target",
+        )
+    except Exception as error:
+        return _candidate_ranking_result(
+            status="invalid_input",
+            reason="graph_parse_failed",
+            action_type=action_type,
+            top_k=top_k,
+            identity=identity,
+            error=str(error) or type(error).__name__,
+        )
     source_node = _source_node(source, source_point, source_element_id)
     if source_node is None:
-        return {
-            "mapped": False,
-            "mapping_mode": _MATCHER_MODE,
-            "reason": "source_target_missing",
-        }
+        return _candidate_ranking_result(
+            status="invalid_input",
+            reason="source_target_missing",
+            source=source,
+            target=target,
+            action_type=action_type,
+            top_k=top_k,
+            identity=identity,
+        )
     offset = _source_offset(source_node, source_point, source_offset)
     if offset is None:
-        return {
-            "mapped": False,
-            "mapping_mode": _MATCHER_MODE,
-            "reason": "source_point_or_offset_required",
-        }
-    equivalent_target = _equivalent_graph_target(source, target, source_node)
-    if equivalent_target is not None:
-        return _mapped_result(
+        return _candidate_ranking_result(
+            status="invalid_input",
+            reason="source_point_or_offset_required",
             source=source,
             target=target,
             source_node=source_node,
-            target_node=equivalent_target,
-            offset=offset,
-            mapping_mode="equivalent_ui_graph",
-            score=1.0,
-            margin=1.0,
-            ranked=[(1.0, equivalent_target)],
-            top_k=top_k,
             action_type=action_type,
-            source_activity_name=source_activity_name,
-            target_activity_name=target_activity_name,
+            top_k=top_k,
+            identity=identity,
         )
-    candidates = tuple(
+    equivalent_target = _equivalent_graph_target(source, target, source_node)
+    if equivalent_target is not None:
+        return _candidate_ranking_result(
+            status="scored",
+            reason="equivalent_ui_graph",
+            mapping_mode="equivalent_ui_graph",
+            source=source,
+            target=target,
+            source_node=source_node,
+            offset=offset,
+            ranked=[(1.0, equivalent_target)],
+            pair_confidence=1.0,
+            margin=1.0,
+            action_type=action_type,
+            top_k=top_k,
+            identity=identity,
+        )
+    candidate_node_ids = tuple(
         node.node_id
         for node in target.nodes
         if node.bbox is not None and node.enabled
@@ -142,113 +172,149 @@ def action_transfer(
             source,
             target,
             source_node_id=source_node.node_id,
-            candidate_node_ids=candidates,
-            min_probability=_DEFAULT_MATCHER_MIN_PROBABILITY,
-            min_margin=_DEFAULT_MATCHER_MIN_MARGIN,
+            candidate_node_ids=candidate_node_ids,
+            min_probability=0.0,
+            min_margin=0.0,
         )
     except Exception as error:
-        return {
-            "mapped": False,
-            "mapping_mode": _MATCHER_MODE,
-            "matcher_release": _MATCHER_RELEASE,
-            "reason": "matcher_unavailable",
-            "error": str(error) or type(error).__name__,
-            "src_element": _node_dict(source_node),
-            "source_size": _graph_size(source),
-            "target_size": _graph_size(target),
-        }
+        return _candidate_ranking_result(
+            status="matcher_unavailable",
+            reason="matcher_unavailable",
+            source=source,
+            target=target,
+            source_node=source_node,
+            offset=offset,
+            action_type=action_type,
+            top_k=top_k,
+            identity=identity,
+            error=str(error) or type(error).__name__,
+        )
     ranked = _learned_candidates(target, match.scores)
-    target_node = match.target_node
-    selection_evidence: dict[str, str] = {}
-    if target_node is None and ranked:
-        target_node = ranked[0][1]
-        selection_evidence = {
-            "selection_policy": "top_candidate_required",
-            "matcher_reason": str(match.reason or "matcher_abstained"),
-        }
-    if target_node is None or target_node.bbox is None:
-        return {
-            "mapped": False,
-            "mapping_mode": _MATCHER_MODE,
-            "reason": str(match.reason or "matcher_abstained"),
-            "src_element": _node_dict(source_node),
-            "source_size": _graph_size(source),
-            "target_size": _graph_size(target),
-            "score": float(match.probability),
-            "pair_confidence": float(match.probability),
-            "rank_probability": _top_rank_probability(ranked),
-            "margin": float(match.margin),
-            "top_candidates": _candidate_dicts(ranked, top_k),
-            **matcher_metadata,
-        }
-    mapped = _mapped_result(
+    return _candidate_ranking_result(
+        status="scored" if ranked else "no_candidates",
+        reason=str(match.reason or ("ranked" if ranked else "target_candidates_missing")),
         source=source,
         target=target,
         source_node=source_node,
-        target_node=target_node,
         offset=offset,
-        mapping_mode=_MATCHER_MODE,
-        score=float(match.probability),
-        margin=float(match.margin),
         ranked=ranked,
-        top_k=top_k,
+        pair_confidence=float(match.probability),
+        margin=float(match.margin),
         action_type=action_type,
-        source_activity_name=source_activity_name,
-        target_activity_name=target_activity_name,
+        top_k=top_k,
+        identity=identity,
         matcher_metadata=matcher_metadata,
     )
-    mapped.update(selection_evidence)
-    return mapped
 
 
-def _mapped_result(
+def action_transfer(**kwargs: Any) -> dict[str, Any]:
+    """Deprecated name for the policy-free candidate-ranking API.
+
+    The compatibility name intentionally does not select, reject, or add a
+    ``mapped`` decision. Callers own all selection and fallback policy.
+    """
+
+    return rank_action_candidates(**kwargs)
+
+
+def _candidate_ranking_result(
     *,
-    source: UIGraph,
-    target: UIGraph,
-    source_node: UINode,
-    target_node: UINode,
-    offset: tuple[float, float],
-    mapping_mode: str,
-    score: float,
-    margin: float,
-    ranked: list[tuple[float, UINode]],
-    top_k: int,
+    status: str,
+    reason: str,
     action_type: str,
-    source_activity_name: str | None,
-    target_activity_name: str | None,
+    top_k: int,
+    identity: dict[str, Any],
+    mapping_mode: str = _MATCHER_MODE,
+    source: UIGraph | None = None,
+    target: UIGraph | None = None,
+    source_node: UINode | None = None,
+    offset: tuple[float, float] | None = None,
+    ranked: list[tuple[float, UINode]] | None = None,
+    pair_confidence: float | None = None,
+    margin: float | None = None,
+    error: str | None = None,
     matcher_metadata: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    target_point = _project_offset(offset, target_node.bbox or (0.0, 0.0, 0.0, 0.0))
-    result = {
-        "mapped": True,
+    ranked_values = list(ranked or ())
+    candidates = _projected_candidate_dicts(ranked_values, offset)
+    result: dict[str, Any] = {
+        "schema_version": _CANDIDATE_RANKING_SCHEMA_VERSION,
+        "status": status,
+        "reason": reason,
         "mapping_mode": mapping_mode,
-        "new_x": target_point[0],
-        "new_y": target_point[1],
-        "src_element": _node_dict(source_node),
+        "src_element": _node_dict(source_node) if source_node is not None else {},
         "source_size": _graph_size(source),
         "target_size": _graph_size(target),
-        "target_candidate_id": _public_node_id(target_node),
-        "target_bbox": list(target_node.bbox),
-        "target_center": list(_center(target_node.bbox)),
-        "score": score,
-        "pair_confidence": score,
-        "rank_probability": _top_rank_probability(ranked),
+        "score": pair_confidence,
+        "pair_confidence": pair_confidence,
+        "rank_probability": candidates[0]["score"] if candidates else None,
         "margin": margin,
-        "top_candidates": _candidate_dicts(ranked, top_k),
+        "candidates": candidates,
+        "top_candidates": candidates[: max(1, int(top_k))],
         "action_type": action_type,
-        "source_activity_name": str(source_activity_name or ""),
-        "target_activity_name": str(target_activity_name or ""),
+        **identity,
     }
+    if error:
+        result["error"] = error
     if matcher_metadata:
         result.update(matcher_metadata)
+    else:
+        result["matcher_release"] = _MATCHER_RELEASE
     return result
 
 
-def _get_matcher() -> MutualGraphMatcher:
+def _projected_candidate_dicts(
+    ranked: list[tuple[float, UINode]],
+    offset: tuple[float, float] | None,
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for candidate_score, candidate in ranked:
+        bounds = candidate.bbox
+        if bounds is None:
+            continue
+        projected = _project_offset(offset or (0.5, 0.5), bounds)
+        candidates.append(
+            {
+                "candidate_id": _public_node_id(candidate),
+                "resource_id": candidate.resource_id,
+                "text": candidate.text,
+                "content_desc": candidate.content_desc,
+                "class": candidate.class_name,
+                "bbox": list(bounds),
+                "score": float(candidate_score),
+                "new_x": projected[0],
+                "new_y": projected[1],
+            }
+        )
+    return candidates
+
+
+def _page_identity(
+    *,
+    source_package_name: str | None,
+    target_package_name: str | None,
+    source_activity_name: str | None,
+    target_activity_name: str | None,
+) -> dict[str, Any]:
+    source_package = str(source_package_name or "").strip()
+    target_package = str(target_package_name or "").strip()
+    return {
+        "source_package_name": source_package,
+        "target_package_name": target_package,
+        "source_activity_name": str(source_activity_name or ""),
+        "target_activity_name": str(target_activity_name or ""),
+        "page_identity_match": (
+            None
+            if not source_package or not target_package
+            else source_package == target_package
+        ),
+    }
+
+
+def _get_matcher() -> Any:
     device = str(os.environ.get("OMNITRANSFER_MATCHER_DEVICE") or "cpu").strip()
     return _load_matcher(
         str(_DEFAULT_MATCHER_CHECKPOINT.resolve()),
-        str(_DEFAULT_NUMPY_MATCHER_CHECKPOINT.resolve()),
         device,
     )
 
@@ -256,105 +322,30 @@ def _get_matcher() -> MutualGraphMatcher:
 @lru_cache(maxsize=4)
 def _load_matcher(
     checkpoint: str,
-    numpy_checkpoint: str,
     device: str,
-) -> MutualGraphMatcher | NumpyMutualGraphMatcher:
+) -> Any:
     path = Path(checkpoint)
-    numpy_path = Path(numpy_checkpoint)
-    if path.suffix == ".npz":
-        return _load_numpy_matcher(path)
-    if path.is_file() and path == _DEFAULT_MATCHER_CHECKPOINT.resolve():
+    if not path.is_file():
+        raise FileNotFoundError(f"OmniTransfer v9 checkpoint missing: {path}")
+    if path == _DEFAULT_MATCHER_CHECKPOINT.resolve():
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         if digest != _DEFAULT_MATCHER_SHA256:
-            raise ValueError("default mutual matcher checkpoint checksum mismatch")
-    if path.is_file():
-        try:
-            return MutualGraphMatcher.from_checkpoint(path, device=device)
-        except RuntimeError as error:
-            if "PyTorch" not in str(error):
-                raise
-    if numpy_path.is_file():
-        return _load_numpy_matcher(numpy_path)
-    raise FileNotFoundError(
-        f"mutual matcher checkpoints missing: {path}, {numpy_path}"
-    )
-
-
-def _load_numpy_matcher(path: Path) -> NumpyMutualGraphMatcher:
-    if path == _DEFAULT_NUMPY_MATCHER_CHECKPOINT.resolve():
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        if not _DEFAULT_NUMPY_MATCHER_SHA256 or digest != _DEFAULT_NUMPY_MATCHER_SHA256:
-            raise ValueError("default NumPy mutual matcher checkpoint checksum mismatch")
-    return NumpyMutualGraphMatcher.from_checkpoint(path)
-
-
-def matcher_backend() -> str:
-    """Return the backend after loading the canonical matcher."""
-
-    matcher = _get_matcher()
-    return str(getattr(matcher, "backend", "pytorch"))
-
-
-def runtime_matcher_manifest() -> dict[str, Any]:
-    """Describe the immutable matcher used by the replay-time API."""
-
-    matcher = _get_matcher()
-    return {
-        **_matcher_metadata(matcher),
-        "mapping_mode": _MATCHER_MODE,
-        "min_pair_confidence": _DEFAULT_MATCHER_MIN_PROBABILITY,
-        "min_rank_margin": _DEFAULT_MATCHER_MIN_MARGIN,
-    }
-
-
-def runtime_preflight() -> dict[str, Any]:
-    """Load the matcher and execute a deterministic end-to-end mapping."""
-
-    source_xml = (
-        '<hierarchy bounds="[0,0][100,100]">'
-        '<node resource-id="preflight:id/search" text="Search" '
-        'class="android.widget.Button" clickable="true" enabled="true" '
-        'bounds="[10,20][50,60]" />'
-        "</hierarchy>"
-    )
-    target_xml = (
-        '<hierarchy bounds="[0,0][200,400]">'
-        '<node resource-id="preflight:id/search" text="Search" '
-        'class="android.widget.Button" clickable="true" enabled="true" '
-        'bounds="[40,100][120,260]" />'
-        "</hierarchy>"
-    )
-    result = action_transfer(
-        source_xml=source_xml,
-        target_xml=target_xml,
-        source_point=(30.0, 40.0),
-    )
-    if not result.get("mapped"):
-        reason = str(result.get("reason") or "mapping_failed")
-        error = str(result.get("error") or "")
-        raise RuntimeError(f"omnitransfer_preflight_failed:{reason}:{error}".rstrip(":"))
-    return {
-        "ready": True,
-        "backend": matcher_backend(),
-        **runtime_matcher_manifest(),
-    }
+            raise ValueError("default OmniTransfer v9 checkpoint checksum mismatch")
+    if path.suffix == ".npz":
+        return NumpyGeometricAlignmentMatcher.from_checkpoint(path)
+    return RelationAwareMatcher.from_checkpoint(path, device=device)
 
 
 def _matcher_metadata(
-    matcher: MutualGraphMatcher | NumpyMutualGraphMatcher,
+    matcher: Any,
 ) -> dict[str, str]:
     backend = str(getattr(matcher, "backend", "pytorch"))
-    checkpoint_sha256 = (
-        _DEFAULT_NUMPY_MATCHER_SHA256
-        if backend == "numpy"
-        else _DEFAULT_MATCHER_SHA256
-    )
     return {
         "matcher_release": _MATCHER_RELEASE,
         "matcher_backend": backend,
-        "matcher_checkpoint_sha256": checkpoint_sha256,
-        "matcher_feature_schema": PEMM_V3_FEATURE_SCHEMA_ID,
-        "matcher_feature_schema_sha256": PEMM_V3_FEATURE_SCHEMA_SHA256,
+        "matcher_checkpoint_sha256": _DEFAULT_MATCHER_SHA256,
+        "matcher_feature_schema": _MATCHER_FEATURE_SCHEMA_ID,
+        "matcher_feature_schema_sha256": _MATCHER_FEATURE_SCHEMA_SHA256,
     }
 
 
@@ -442,42 +433,6 @@ def _subtree(graph: UIGraph, root_id: str) -> tuple[UINode, ...]:
     return tuple(nodes)
 
 
-def describe_action_target(
-    *,
-    source_xml: str,
-    source_point: tuple[float, float],
-    related_point: tuple[float, float] | None = None,
-) -> dict[str, Any] | None:
-    """Return the compact semantic target for one recorded source point."""
-
-    source = graph_from_record({"xml": source_xml}, graph_id="source")
-    source_node = _source_node(source, source_point, None)
-    if source_node is None or source_node.bbox is None:
-        return None
-    descriptor = _node_dict(source_node)
-    occurrence_index, occurrence_count = _occurrence(source, source_node)
-    if not _has_stable_identity(source_node) and occurrence_count <= 1:
-        return None
-    offset = _offset(source_point, source_node.bbox)
-    descriptor["offset_x"], descriptor["offset_y"] = offset
-    if related_point is not None:
-        raw_end_offset = _unclamped_offset(related_point, source_node.bbox)
-        if not all(
-            math.isfinite(value)
-            and _MIN_ANCHOR_OFFSET <= value <= _MAX_ANCHOR_OFFSET
-            for value in raw_end_offset
-        ):
-            return None
-        end_offset = _offset(related_point, source_node.bbox)
-        descriptor["end_offset_x"], descriptor["end_offset_y"] = end_offset
-    if occurrence_count > 1:
-        descriptor["occurrence_index"] = occurrence_index
-        descriptor["occurrence_count"] = occurrence_count
-    descriptor.pop("bounds", None)
-    descriptor.pop("id", None)
-    return descriptor
-
-
 def _source_node(
     graph: UIGraph,
     point: tuple[float, float] | None,
@@ -523,24 +478,6 @@ def _source_node(
 
 def _has_stable_identity(node: UINode) -> bool:
     return bool(node.resource_id or node.text or node.content_desc)
-
-
-def _occurrence(graph: UIGraph, source: UINode) -> tuple[int, int]:
-    identity = _identity_key(source)
-    matches = sorted(
-        (
-            node
-            for node in graph.nodes
-            if node.bbox is not None
-            and node.enabled
-            and _identity_key(node) == identity
-        ),
-        key=lambda node: (node.bbox[1], node.bbox[0], node.node_id),
-    )
-    for index, node in enumerate(matches):
-        if node is source or node.node_id == source.node_id:
-            return index, len(matches)
-    return 0, len(matches)
 
 
 def _identity_key(node: UINode) -> tuple[Any, ...]:
@@ -591,18 +528,6 @@ def _offset(
     )
 
 
-def _unclamped_offset(
-    point: tuple[float, float],
-    bounds: tuple[float, float, float, float],
-) -> tuple[float, float]:
-    width = max(1.0, bounds[2] - bounds[0])
-    height = max(1.0, bounds[3] - bounds[1])
-    return (
-        (float(point[0]) - bounds[0]) / width,
-        (float(point[1]) - bounds[1]) / height,
-    )
-
-
 def _clamp(value: float) -> float:
     return max(0.0, min(1.0, value))
 
@@ -629,24 +554,6 @@ def _node_dict(node: UINode) -> dict[str, Any]:
         "editable": node.editable,
         "scrollable": node.scrollable,
     }
-
-
-def _candidate_dicts(
-    ranked: list[tuple[float, UINode]],
-    top_k: int,
-) -> list[dict[str, Any]]:
-    return [
-        {
-            "candidate_id": _public_node_id(candidate),
-            "resource_id": candidate.resource_id,
-            "text": candidate.text,
-            "content_desc": candidate.content_desc,
-            "class": candidate.class_name,
-            "bbox": list(candidate.bbox or ()),
-            "score": candidate_score,
-        }
-        for candidate_score, candidate in ranked[: max(1, int(top_k))]
-    ]
 
 
 def _public_node_id(node: UINode) -> str:

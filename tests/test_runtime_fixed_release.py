@@ -3,6 +3,9 @@ from types import SimpleNamespace
 import pytest
 
 import omnitransfer.runtime as runtime
+from omnitransfer.learned_matcher import (
+    DIRECT_TEXT_EVIDENCE_ENCODER,
+)
 
 
 SOURCE_XML = """<hierarchy bounds="[0,0][100,100]"><node text="Submit" class="android.widget.Button" clickable="true" enabled="true" bounds="[10,20][50,60]" /></hierarchy>"""
@@ -12,11 +15,11 @@ TARGET_XML = """<hierarchy bounds="[0,0][200,400]"><node text="Cancel" class="an
 def test_runtime_ignores_checkpoint_override_and_loads_frozen_artifacts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[tuple[str, str, str]] = []
-    sentinel = SimpleNamespace(backend="numpy")
+    calls: list[tuple[str, str]] = []
+    sentinel = SimpleNamespace(backend="pytorch")
 
-    def load(checkpoint: str, numpy_checkpoint: str, device: str):
-        calls.append((checkpoint, numpy_checkpoint, device))
+    def load(checkpoint: str, device: str):
+        calls.append((checkpoint, device))
         return sentinel
 
     monkeypatch.setattr(runtime, "_load_matcher", load)
@@ -30,32 +33,35 @@ def test_runtime_ignores_checkpoint_override_and_loads_frozen_artifacts(
     assert calls == [
         (
             str(runtime._DEFAULT_MATCHER_CHECKPOINT.resolve()),
-            str(runtime._DEFAULT_NUMPY_MATCHER_CHECKPOINT.resolve()),
             "cpu",
         )
     ]
 
 
-def test_frozen_checkpoint_hashes_match_release_manifest() -> None:
+def test_frozen_checkpoint_hash_matches_release_manifest() -> None:
     assert (
         runtime.hashlib.sha256(
             runtime._DEFAULT_MATCHER_CHECKPOINT.read_bytes()
         ).hexdigest()
         == runtime._DEFAULT_MATCHER_SHA256
     )
-    assert (
-        runtime.hashlib.sha256(
-            runtime._DEFAULT_NUMPY_MATCHER_CHECKPOINT.read_bytes()
-        ).hexdigest()
-        == runtime._DEFAULT_NUMPY_MATCHER_SHA256
-    )
+
+
+def test_frozen_release_has_no_learned_token_lookup() -> None:
+    runtime._load_matcher.cache_clear()
+    matcher = runtime._get_matcher()
+
+    assert matcher.backend == "numpy-v9"
+    assert matcher.config.text_encoder == DIRECT_TEXT_EVIDENCE_ENCODER
+    assert not any("token_embedding" in name for name in matcher.weights)
+    assert not any("text_projection" in name for name in matcher.weights)
 
 
 def test_learned_result_records_frozen_release_and_unambiguous_scores(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class Matcher:
-        backend = "numpy"
+        backend = "pytorch"
 
         def predict(
             self,
@@ -67,8 +73,8 @@ def test_learned_result_records_frozen_release_and_unambiguous_scores(
             min_margin,
             **_kwargs,
         ):
-            assert min_probability == 0.5
-            assert min_margin == 0.15
+            assert min_probability == 0.0
+            assert min_margin == 0.0
             candidates = [
                 node for node in target.nodes if node.node_id in candidate_node_ids
             ]
@@ -93,45 +99,25 @@ def test_learned_result_records_frozen_release_and_unambiguous_scores(
         top_k=2,
     )
 
-    assert result["mapped"] is True
-    assert result["mapping_mode"] == "mutual_graph_matcher_no_null_v3"
-    assert result["matcher_release"] == "pair-evidence-mutual-matcher-v3.0.1"
-    assert result["matcher_backend"] == "numpy"
+    assert result["candidates"]
+    assert "mapped" not in result
+    assert result["mapping_mode"] == "omnitransfer_direct_text_alignment_v9"
+    assert result["matcher_release"] == (
+        "omnitransfer-direct-text-alignment-v9.3.1-mobile"
+    )
+    assert result["matcher_backend"] == "pytorch"
     assert (
         result["matcher_checkpoint_sha256"]
-        == runtime._DEFAULT_NUMPY_MATCHER_SHA256
+        == runtime._DEFAULT_MATCHER_SHA256
     )
-    assert result["matcher_feature_schema"] == "pemm-v3-node-context-v1"
+    assert result["matcher_feature_schema"] == (
+        "omnitransfer-direct-text-spatial-xml-v9"
+    )
     assert (
         result["matcher_feature_schema_sha256"]
-        == "171735252bbdaea3da8c2fd21967963698f89e45c085cc6801172dfff66d2e58"
+        == "fc1706baeff6d8b0e43f5da9b03a62a51086472764d440ed7b4c3a41f71c52f8"
     )
     assert result["score"] == pytest.approx(0.91)
     assert result["pair_confidence"] == pytest.approx(0.91)
     assert result["rank_probability"] == pytest.approx(0.73)
     assert result["margin"] == pytest.approx(0.51)
-
-
-def test_runtime_manifest_names_fixed_model_and_gates(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        runtime,
-        "_get_matcher",
-        lambda: SimpleNamespace(backend="pytorch"),
-    )
-
-    manifest = runtime.runtime_matcher_manifest()
-
-    assert manifest == {
-        "matcher_release": "pair-evidence-mutual-matcher-v3.0.1",
-        "matcher_backend": "pytorch",
-        "matcher_checkpoint_sha256": runtime._DEFAULT_MATCHER_SHA256,
-        "matcher_feature_schema": "pemm-v3-node-context-v1",
-        "matcher_feature_schema_sha256": (
-            "171735252bbdaea3da8c2fd21967963698f89e45c085cc6801172dfff66d2e58"
-        ),
-        "mapping_mode": "mutual_graph_matcher_no_null_v3",
-        "min_pair_confidence": 0.5,
-        "min_rank_margin": 0.15,
-    }
