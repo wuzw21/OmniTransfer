@@ -202,7 +202,7 @@ def test_action_transfer_allows_matcher_to_disambiguate_duplicate_identity(
     ) == 2
 
 
-def test_action_transfer_fails_closed_when_matcher_cannot_disambiguate() -> None:
+def test_action_transfer_returns_top_candidate_when_matcher_cannot_disambiguate() -> None:
     target_xml = TARGET_XML.replace(
         "</hierarchy>",
         '<node resource-id="com.example:id/submit" text="Submit" class="android.widget.Button" clickable="true" bounds="[20,20][180,100]" /></hierarchy>',
@@ -215,9 +215,16 @@ def test_action_transfer_fails_closed_when_matcher_cannot_disambiguate() -> None
         top_k=3,
     )
 
-    assert result["mapped"] is False
+    assert result["mapped"] is True
     assert result["mapping_mode"] == "mutual_graph_matcher_no_null_v3"
-    assert result["reason"] == "learned_low_confidence"
+    assert result["selection_policy"] == "top_candidate_required"
+    assert result["matcher_reason"] == "learned_low_confidence"
+    assert result["target_bbox"] in (
+        [20.0, 20.0, 180.0, 100.0],
+        [200.0, 220.0, 360.0, 300.0],
+    )
+    assert isinstance(result["new_x"], float)
+    assert isinstance(result["new_y"], float)
     assert sum(
         candidate["resource_id"] == "com.example:id/submit"
         for candidate in result["top_candidates"]

@@ -53,3 +53,15 @@ text and icon nodes remain attention context but are never relabeled or lifted
 to an actionable ancestor. Every retained same-screen actionable node is a
 candidate hard negative. Ambiguous evidence or a low calibrated ranking margin
 is transfer failure and returns control to the VLM.
+
+# Replay Coordinate Return Long-Term Rule
+
+When replay produces one or more ranked target nodes with valid target bounds,
+OmniTransfer must return the top-ranked target coordinate even when confidence
+or margin is low. Preserve score, margin, the ranked candidates, the original
+matcher reason, and `selection_policy=top_candidate_required` as evidence.
+
+Return a structured transfer failure only when no valid target candidate exists,
+the source or target page contract is invalid, page identity mismatches, or the
+matcher is unavailable. Never manufacture a coordinate from the recorded source
+coordinate and never pass source-device coordinates through to the target.

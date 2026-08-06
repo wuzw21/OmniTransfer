@@ -141,6 +141,13 @@ def action_transfer(
         }
     ranked = _learned_candidates(target, match.scores)
     target_node = match.target_node
+    selection_evidence: dict[str, str] = {}
+    if target_node is None and ranked:
+        target_node = ranked[0][1]
+        selection_evidence = {
+            "selection_policy": "top_candidate_required",
+            "matcher_reason": str(match.reason or "matcher_abstained"),
+        }
     if target_node is None or target_node.bbox is None:
         return {
             "mapped": False,
@@ -156,7 +163,7 @@ def action_transfer(
             "top_candidates": _candidate_dicts(ranked, top_k),
             **matcher_metadata,
         }
-    return _mapped_result(
+    mapped = _mapped_result(
         source=source,
         target=target,
         source_node=source_node,
@@ -172,6 +179,8 @@ def action_transfer(
         target_activity_name=target_activity_name,
         matcher_metadata=matcher_metadata,
     )
+    mapped.update(selection_evidence)
+    return mapped
 
 
 def _mapped_result(
