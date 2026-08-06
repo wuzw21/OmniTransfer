@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 import math
 import re
@@ -69,7 +69,15 @@ def graph_from_record(record: dict[str, Any], *, graph_id: str | None = None) ->
     if isinstance(payload, str):
         stripped = payload.strip()
         if stripped.startswith("<"):
-            return _graph_from_xml(stripped, graph_id=resolved_id, width=width, height=height)
+            return _with_record_metadata(
+                _graph_from_xml(
+                    stripped,
+                    graph_id=resolved_id,
+                    width=width,
+                    height=height,
+                ),
+                record,
+            )
         try:
             payload = json.loads(stripped)
         except json.JSONDecodeError as exc:
@@ -87,13 +95,24 @@ def graph_from_record(record: dict[str, Any], *, graph_id: str | None = None) ->
     if width is None or height is None:
         width, height = _infer_screen_size(nodes, width=width, height=height)
 
-    return UIGraph(
+    return _with_record_metadata(UIGraph(
         graph_id=resolved_id,
         nodes=tuple(nodes),
         width=width,
         height=height,
         metadata={"source_format": "json"},
-    )
+    ), record)
+
+
+def _with_record_metadata(graph: UIGraph, record: dict[str, Any]) -> UIGraph:
+    metadata = dict(graph.metadata)
+    screenshot_path = record.get("screenshot_path")
+    if isinstance(screenshot_path, str) and screenshot_path.strip():
+        metadata["screenshot_path"] = screenshot_path.strip()
+    visual_rgb = record.get("visual_rgb")
+    if isinstance(visual_rgb, dict):
+        metadata["visual_rgb"] = dict(visual_rgb)
+    return replace(graph, metadata=metadata)
 
 
 def graph_to_record(graph: UIGraph) -> dict[str, Any]:

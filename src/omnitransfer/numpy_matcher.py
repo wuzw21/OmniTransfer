@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import math
+import zlib
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict
 from pathlib import Path
@@ -75,8 +77,6 @@ class NumpyMutualGraphMatcher:
             return LearnedMatch(None, 0.0, 0.0, "source_node_missing", ())
         if not is_actionable(source_node):
             return LearnedMatch(None, 0.0, 0.0, "source_node_not_actionable", ())
-        if source.metadata.get("screenshot_path") or target.metadata.get("screenshot_path"):
-            raise RuntimeError("numpy_matcher_requires_xml_only_graphs")
         if len(source.nodes) > self.config.source_context_nodes:
             source = local_context_graph(
                 source,
@@ -163,13 +163,35 @@ class NumpyMutualGraphMatcher:
             ),
             dtype=np.float32,
         )
-        source_states, source_semantic, source_attributes = self._encode_nodes(
+        source_visual, source_visual_mask = _visual_inputs(
+            source,
+            patch_size=self.config.visual_patch_size,
+        )
+        target_visual, target_visual_mask = _visual_inputs(
+            target,
+            patch_size=self.config.visual_patch_size,
+        )
+        (
+            source_states,
+            source_semantic,
+            source_attributes,
+            source_visual_states,
+        ) = self._encode_nodes(
             source_token_ids,
             source_numeric,
+            source_visual,
+            source_visual_mask,
         )
-        target_states, target_semantic, target_attributes = self._encode_nodes(
+        (
+            target_states,
+            target_semantic,
+            target_attributes,
+            target_visual_states,
+        ) = self._encode_nodes(
             target_token_ids,
             target_numeric,
+            target_visual,
+            target_visual_mask,
         )
         for layer_index in range(self.config.num_layers):
             source_states = self._relation_layer(
@@ -195,8 +217,12 @@ class NumpyMutualGraphMatcher:
             norm=True,
             final_index=3,
         ).squeeze(-1)
-        visual = np.zeros_like(semantic)
-        visual_available = np.zeros_like(semantic)
+        visual_available = source_visual_mask * target_visual_mask.T
+        visual = self._pair_head(
+            "visual_score.network",
+            source_visual_states,
+            target_visual_states,
+        ) * visual_available
         anchor_seed = self._mlp(
             np.stack(
                 (
@@ -238,9 +264,16 @@ class NumpyMutualGraphMatcher:
             "affinity": affinity,
             "source_relations": source_relations,
             "target_relations": target_relations,
+            "visual_available": visual_available,
         }
 
-    def _encode_nodes(self, token_ids: Any, numeric: Any) -> tuple[Any, Any, Any]:
+    def _encode_nodes(
+        self,
+        token_ids: Any,
+        numeric: Any,
+        visual_patches: Any,
+        visual_mask: Any,
+    ) -> tuple[Any, Any, Any, Any]:
         np = _require_numpy()
         mask = token_ids != 0
         embedded = self.weights["node_encoder.token_embedding.weight"][token_ids]
@@ -261,12 +294,53 @@ class NumpyMutualGraphMatcher:
             numeric_states,
             "node_encoder.numeric_projection.3",
         )
+        visual_states = self._visual_encoder(visual_patches)
         missing_visual = self.weights["node_encoder.missing_visual"][None, :]
+        fused_visual = (
+            visual_mask * visual_states
+            + (np_float(1.0) - visual_mask) * missing_visual
+        )
         states = self._layer_norm(
-            token_states + numeric_states + missing_visual,
+            token_states + numeric_states + fused_visual,
             "node_encoder.output_norm",
         )
-        return states, token_states, numeric_states
+        return states, token_states, numeric_states, visual_states
+
+    def _visual_encoder(self, patches: Any) -> Any:
+        states = patches
+        for index in (0, 2, 4):
+            states = _gelu(
+                self._conv2d(
+                    states,
+                    f"node_encoder.visual_encoder.{index}",
+                    stride=2,
+                )
+            )
+        return states.mean(axis=(2, 3), dtype=_require_numpy().float32)
+
+    def _conv2d(self, values: Any, prefix: str, *, stride: int) -> Any:
+        np = _require_numpy()
+        weight = self.weights[f"{prefix}.weight"]
+        bias = self.weights[f"{prefix}.bias"]
+        kernel_height, kernel_width = weight.shape[-2:]
+        padded = np.pad(
+            values,
+            (
+                (0, 0),
+                (0, 0),
+                (kernel_height // 2, kernel_height // 2),
+                (kernel_width // 2, kernel_width // 2),
+            ),
+        )
+        windows = np.lib.stride_tricks.sliding_window_view(
+            padded,
+            (kernel_height, kernel_width),
+            axis=(2, 3),
+        )[:, :, ::stride, ::stride]
+        return (
+            np.einsum("nchwkl,ockl->nohw", windows, weight, optimize=True)
+            + bias[None, :, None, None]
+        )
 
     def _relation_layer(
         self,
@@ -419,6 +493,94 @@ def _mutual_assignment_logits(
         + column_log
     )
     return mutual, mutual.T
+
+
+def _visual_inputs(graph: UIGraph, *, patch_size: int) -> tuple[Any, Any]:
+    np = _require_numpy()
+    patches = np.zeros(
+        (len(graph.nodes), 3, patch_size, patch_size),
+        dtype=np.float32,
+    )
+    mask = np.zeros((len(graph.nodes), 1), dtype=np.float32)
+    image = _graph_rgb(graph)
+    if image is None:
+        return patches, mask
+    image_height, image_width = image.shape[:2]
+    graph_width = float(graph.width or image_width)
+    graph_height = float(graph.height or image_height)
+    if graph_width <= 0.0 or graph_height <= 0.0:
+        return patches, mask
+    for index, node in enumerate(graph.nodes):
+        if bool(node.metadata.get("visual_disabled")) or node.bbox is None:
+            continue
+        left, top, right, bottom = node.bbox
+        x1 = int(math.floor(left / graph_width * image_width))
+        y1 = int(math.floor(top / graph_height * image_height))
+        x2 = int(math.ceil(right / graph_width * image_width))
+        y2 = int(math.ceil(bottom / graph_height * image_height))
+        x1 = min(max(x1, 0), image_width)
+        x2 = min(max(x2, 0), image_width)
+        y1 = min(max(y1, 0), image_height)
+        y2 = min(max(y2, 0), image_height)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        crop = image[y1:y2, x1:x2]
+        patches[index] = _resize_rgb(crop, patch_size).transpose(2, 0, 1)
+        mask[index, 0] = np_float(1.0)
+    return patches, mask
+
+
+def _graph_rgb(graph: UIGraph) -> Any | None:
+    np = _require_numpy()
+    payload = graph.metadata.get("visual_rgb")
+    if isinstance(payload, Mapping):
+        try:
+            width = int(payload["width"])
+            height = int(payload["height"])
+            encoded = str(payload["data_base64"])
+            raw = base64.b64decode(encoded, validate=True)
+            if str(payload.get("compression") or "") == "zlib":
+                raw = zlib.decompress(raw)
+            image = np.frombuffer(raw, dtype=np.uint8)
+            if image.size != width * height * 3:
+                return None
+            return image.reshape(height, width, 3)
+        except (KeyError, TypeError, ValueError, zlib.error):
+            return None
+    screenshot_path = str(graph.metadata.get("screenshot_path") or "")
+    if not screenshot_path:
+        return None
+    try:
+        from PIL import Image
+
+        with Image.open(screenshot_path) as image:
+            return np.asarray(image.convert("RGB"), dtype=np.uint8)
+    except (ImportError, OSError, ValueError):
+        return None
+
+
+def _resize_rgb(image: Any, size: int) -> Any:
+    np = _require_numpy()
+    source_height, source_width = image.shape[:2]
+    if source_height == size and source_width == size:
+        return image.astype(np.float32) / np_float(255.0)
+    ys = np.linspace(0.0, max(0, source_height - 1), size, dtype=np.float32)
+    xs = np.linspace(0.0, max(0, source_width - 1), size, dtype=np.float32)
+    y0 = np.floor(ys).astype(np.int64)
+    x0 = np.floor(xs).astype(np.int64)
+    y1 = np.minimum(y0 + 1, source_height - 1)
+    x1 = np.minimum(x0 + 1, source_width - 1)
+    wy = (ys - y0)[:, None, None]
+    wx = (xs - x0)[None, :, None]
+    top = (
+        image[y0[:, None], x0[None, :]].astype(np.float32) * (np_float(1.0) - wx)
+        + image[y0[:, None], x1[None, :]].astype(np.float32) * wx
+    )
+    bottom = (
+        image[y1[:, None], x0[None, :]].astype(np.float32) * (np_float(1.0) - wx)
+        + image[y1[:, None], x1[None, :]].astype(np.float32) * wx
+    )
+    return (top * (np_float(1.0) - wy) + bottom * wy) / np_float(255.0)
 
 
 def _gelu(values: Any) -> Any:

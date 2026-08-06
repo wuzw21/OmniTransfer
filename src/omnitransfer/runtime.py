@@ -48,6 +48,10 @@ def action_transfer(
     source_offset: tuple[float, float] | None = None,
     source_coordinate_space: str | None = None,
     target_display_size: tuple[float, float] | None = None,
+    source_screenshot_path: str | None = None,
+    target_screenshot_path: str | None = None,
+    source_visual_rgb: dict[str, Any] | None = None,
+    target_visual_rgb: dict[str, Any] | None = None,
     source_package_name: str | None = None,
     target_package_name: str | None = None,
     source_activity_name: str | None = None,
@@ -79,8 +83,22 @@ def action_transfer(
             "source_package_name": source_package,
             "target_package_name": target_package,
         }
-    source = graph_from_record({"xml": source_xml}, graph_id="source")
-    target = graph_from_record({"xml": target_xml}, graph_id="target")
+    source = graph_from_record(
+        {
+            "xml": source_xml,
+            "screenshot_path": source_screenshot_path,
+            "visual_rgb": source_visual_rgb,
+        },
+        graph_id="source",
+    )
+    target = graph_from_record(
+        {
+            "xml": target_xml,
+            "screenshot_path": target_screenshot_path,
+            "visual_rgb": target_visual_rgb,
+        },
+        graph_id="target",
+    )
     source_node = _source_node(source, source_point, source_element_id)
     if source_node is None:
         return {
