@@ -23,10 +23,9 @@ viewer.
 
 # Unified Matching Dataset Long-Term Rule
 
-Normalize MobileViews and every admissible action-target correspondence source
-into one `omnitransfer.ui_correspondence_pair.v1` pool before assigning splits.
-Dataset origin never creates another trainer, objective, or model path.
-GUIOdyssey remains outside these matcher splits.
+All reviewed correspondences must already use
+`omnitransfer.ui_correspondence_pair.v1` before entering this repository.
+Do not add source-specific import adapters, trainers, objectives, or model paths.
 
 Split inside each canonical App by page-connected components. The same App
 should appear in train, dev, and test when it has enough independent
@@ -41,27 +40,35 @@ never reported as reviewed-gold evaluation. Other non-gold dev/test assignments
 remain review candidates. Unmatched nodes remain ignored unless a human
 explicitly labels NULL.
 
-# Shortcut-Free Actionable Matching Long-Term Rule
+# Unified iOS/Android XML Matching Long-Term Rule
 
-The learned node representation uses only the node's text/content description,
-class and action state, and visual crop. Raw resource ids, absolute coordinates,
-absolute box size, and page order are not model inputs. Geometry may appear
-only as within-page relative relations between selected node tokens.
+The core model input is one iOS XML tree, one Android XML tree, and a source XML
+node. Both trees are converted by the same platform-neutral converter into the
+same graph schema. Existing dataset source-node/target-node pairs are the only
+supervision; the converter must not rewrite labels, mark labeled nodes as
+clickable, lift labels to ancestors, or create canonical actionable groups.
 
-Training supervision is actionable-node to actionable-node only. Non-actionable
-text and icon nodes remain attention context but are never relabeled or lifted
-to an actionable ancestor. Every retained same-screen actionable node is a
-candidate hard negative. Ambiguous evidence or a low calibrated ranking margin
-is transfer failure and returns control to the VLM.
+Every XML node is preserved as model evidence and as a possible output node.
+TextView, ImageView, containers, and other non-actionable nodes must not be
+filtered. A training page may not be skipped because it has too few actionable
+correspondences. Training, validation, and inference use the same all-node
+candidate policy inside the matcher, not an evaluation harness.
 
-# Replay Coordinate Return Long-Term Rule
+The learned node representation uses text/content description, class and action
+state, visual crop, XML hierarchy, and normalized within-page spatial relations.
+Raw absolute device coordinates and page order are not model inputs. The only
+trainable architecture is geometric-v9 with the all-node candidate policy.
 
-When replay produces one or more ranked target nodes with valid target bounds,
-OmniTransfer must return the top-ranked target coordinate even when confidence
-or margin is low. Preserve score, margin, the ranked candidates, the original
-matcher reason, and `selection_policy=top_candidate_required` as evidence.
+# Candidate-Only Runtime Boundary
 
-Return a structured transfer failure only when no valid target candidate exists,
-the source or target page contract is invalid, page identity mismatches, or the
-matcher is unavailable. Never manufacture a coordinate from the recorded source
-coordinate and never pass source-device coordinates through to the target.
+OmniTransfer is a policy-free candidate generator. Its runtime API returns the
+complete ranked target candidates, their target bounds and projected points,
+scores, margin, and matcher provenance. It must not accept or reject a mapping,
+select an action for execution, enforce page identity, decide fallback, or own a
+runtime/evaluation harness. Those responsibilities belong to OmniFlow.
+
+The only public runtime operation is `rank_action_candidates`. Do not add an
+alias, compatibility wrapper, selected target, or selection policy. Invalid
+inputs and unavailable matchers may be represented as an empty candidate
+response with diagnostic status, but OmniTransfer must never manufacture or
+pass through source-device coordinates.

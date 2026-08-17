@@ -10,7 +10,7 @@ from typing import Any, Iterable
 
 from PIL import Image
 
-from omnitransfer.mapping_dataset import validate_mapping_page_pair
+from omnitransfer.mapping_dataset import validate_ui_correspondence_pair
 
 
 def build_mapping_pair_review(
@@ -18,6 +18,10 @@ def build_mapping_pair_review(
     output_dir: str | Path,
     *,
     pair_limit: int = 0,
+    complex_only: bool = False,
+    complex_limit: int = 0,
+    external_payload: bool = False,
+    method_tag: str | None = None,
 ) -> dict[str, Any]:
     """Materialize screenshots and a standalone review page for pair JSONL files."""
 
@@ -32,7 +36,7 @@ def build_mapping_pair_review(
             if not line.strip():
                 continue
             try:
-                records.append(validate_mapping_page_pair(json.loads(line)))
+                records.append(validate_ui_correspondence_pair(json.loads(line)))
             except Exception as exc:
                 raise ValueError(f"invalid pair at {path}:{line_number}") from exc
     if pair_limit:
@@ -48,8 +52,42 @@ def build_mapping_pair_review(
         _review_item(record, screenshots=screenshots, copied=copied)
         for record in records
     ]
+    queue.sort(
+        key=lambda item: (
+            not bool(item.get("method_tags")),
+            -float(item["difficulty_score"]),
+            item["pair_id"],
+        )
+    )
+    if method_tag:
+        queue = [
+            item
+            for item in queue
+            if method_tag in {
+                tag if isinstance(tag, str) else tag.get("id")
+                for tag in item.get("method_tags", [])
+            }
+        ]
+    if complex_only:
+        queue = [item for item in queue if item["difficulty_score"] > 0]
+    if complex_limit:
+        if complex_limit < 0:
+            raise ValueError("complex_limit must be non-negative")
+        queue = queue[:complex_limit]
+    if not queue:
+        raise ValueError(
+            "review input contains no complex pairs" if complex_only else "review input contains no pairs"
+        )
+    payload = _review_payload(queue)
     review_path = output / "review.html"
-    review_path.write_text(_review_html(queue), encoding="utf-8")
+    review_path.write_text(
+        _review_html(payload, external_payload=external_payload), encoding="utf-8"
+    )
+    sidecar = output / "review.html.payload.json"
+    sidecar.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     manifest = {
         "schema_version": "omnitransfer.mapping_pair_review_manifest.v1",
         "pairs": len(queue),
@@ -67,12 +105,75 @@ def build_mapping_pair_review(
         "screenshots": len(copied),
         "inputs": [str(path) for path in input_paths],
         "review_file": "review.html",
+        "sidecar": sidecar.name,
+        "complex_only": complex_only,
+        "complex_pairs": sum(item["difficulty_score"] > 0 for item in queue),
+        "external_payload": external_payload,
     }
     (output / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
     return manifest
+
+
+def _complexity(record: dict[str, Any]) -> tuple[float, list[str]]:
+    """Rank review effort from observable ambiguity, without changing matching."""
+
+    matches = record["matches"]
+    source_nodes = {
+        str(node["node_id"]): node for node in record["source"]["graph"].get("nodes", [])
+    }
+    target_nodes = {
+        str(node["node_id"]): node for node in record["target"]["graph"].get("nodes", [])
+    }
+    score = 0.0
+    reasons: list[str] = []
+    if len(matches) > 1:
+        score += min(0.3, 0.12 * (len(matches) - 1))
+        reasons.append(f"multi_mapping:{len(matches)}")
+    alternatives = sum(max(0, len(match["target_node_ids"]) - 1) for match in matches)
+    if alternatives:
+        score += min(0.3, 0.1 * alternatives)
+        reasons.append(f"target_alternatives:{alternatives}")
+    source_semantics = []
+    icon_only = 0
+    for match in matches:
+        node = source_nodes.get(str(match["source_node_id"]), {})
+        semantic = " ".join(
+            str(node.get(field) or "").strip()
+            for field in ("text", "content_desc", "resource_id")
+        ).strip().lower()
+        source_semantics.append(semantic)
+        if not semantic:
+            icon_only += 1
+    if icon_only:
+        score += min(0.25, 0.12 * icon_only)
+        reasons.append(f"icon_or_no_text:{icon_only}")
+    repeated = len(source_semantics) - len(set(source_semantics))
+    if repeated > 0:
+        score += min(0.2, 0.1 * repeated)
+        reasons.append(f"repeated_source_semantics:{repeated}")
+    displacements = []
+    for match in matches:
+        source = source_nodes.get(str(match["source_node_id"]), {})
+        target = target_nodes.get(str(match["target_node_ids"][0]), {}) if match["target_node_ids"] else {}
+        source_box, target_box = source.get("bbox"), target.get("bbox")
+        if source_box and target_box:
+            source_center = ((source_box[0] + source_box[2]) / 2, (source_box[1] + source_box[3]) / 2)
+            target_center = ((target_box[0] + target_box[2]) / 2, (target_box[1] + target_box[3]) / 2)
+            displacements.append(abs(source_center[0] - target_center[0]) + abs(source_center[1] - target_center[1]))
+    if displacements and max(displacements) > 0:
+        score += 0.05
+        reasons.append("layout_position_changes")
+    external = record.get("provenance", {}).get("difficulty_score")
+    if external is not None:
+        try:
+            score += min(0.2, max(0.0, float(external)))
+            reasons.append("upstream_uncertainty")
+        except (TypeError, ValueError):
+            pass
+    return min(1.0, score), reasons or ["low_ambiguity"]
 
 
 def _review_item(
@@ -94,12 +195,17 @@ def _review_item(
         for node_id in match["target_node_ids"]
     }
     dataset = str(record["provenance"].get("dataset") or "unknown")
+    difficulty_score, difficulty_reasons = _complexity(record)
     return {
         "pair_id": record["pair_id"],
         "dataset": dataset,
         "label_status": record["label_status"],
         "slices": record["slices"],
         "provenance": record["provenance"],
+        "difficulty_score": difficulty_score,
+        "difficulty_reasons": difficulty_reasons,
+        "method_tags": record.get("method_tags", []),
+        "method_comparison": record.get("method_comparison"),
         "source": _review_side(
             record["source"],
             nodes=[source_nodes[node_id] for node_id in sorted(source_ids)],
@@ -132,18 +238,21 @@ def _review_side(
         shutil.copy2(source, destination)
         copied[source] = f"screenshots/{destination.name}"
     graph = page["graph"]
-    width = float(graph.get("width") or 0)
-    height = float(graph.get("height") or 0)
+    width = float(page.get("display_width") or graph.get("width") or 0)
+    height = float(page.get("display_height") or graph.get("height") or 0)
     if width <= 0 or height <= 0:
         with Image.open(source) as image:
             width, height = image.size
+    review_nodes = [_review_node(node) for node in nodes]
+    all_nodes = [_review_node(node) for node in graph.get("nodes", [])]
     return {
         "page_id": page["page_id"],
         "platform": page["platform"],
         "image_url": copied[source],
         "width": width,
         "height": height,
-        "nodes": [_review_node(node) for node in nodes],
+        "nodes": review_nodes,
+        "candidates": all_nodes,
     }
 
 
@@ -157,7 +266,9 @@ def _review_node(node: dict[str, Any]) -> dict[str, Any]:
         "resource_id": str(node.get("resource_id") or ""),
         "class_name": str(node.get("class_name") or ""),
         "bbox": [float(value) for value in bbox] if bbox else None,
+        "visual_bbox": [float(value) for value in node.get("visual_bbox", [])] if node.get("visual_bbox") else None,
         "clickable": bool(node.get("clickable")),
+        "editable": bool(node.get("editable")),
     }
 
 
@@ -168,99 +279,111 @@ def _counts(values: Iterable[str]) -> dict[str, int]:
     return counts
 
 
-def _review_html(queue: list[dict[str, Any]]) -> str:
-    payload = json.dumps(queue, ensure_ascii=False).replace("</", "<\\/")
-    return f"""<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<link rel="icon" href="data:,">
-<title>OmniTransfer · Mapping Pair Pilot</title>
-<style>
-:root {{ color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }}
-* {{ box-sizing: border-box; }}
-body {{ margin: 0; background: #090c13; color: #edf2f8; }}
-header {{ position: sticky; top: 0; z-index: 20; display: flex; flex-wrap: wrap; align-items: center; gap: 9px; padding: 10px 15px; border-bottom: 1px solid #293145; background: #0d111bdd; backdrop-filter: blur(14px); }}
-button, select {{ padding: 7px 10px; border: 1px solid #39445d; border-radius: 7px; background: #161c29; color: inherit; font: inherit; cursor: pointer; }}
-button:hover {{ border-color: #6f81a5; }}
-main {{ max-width: 1780px; margin: auto; padding: 14px; }}
-.meta {{ display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; margin-bottom: 10px; color: #a8b5cc; font-size: 13px; }}
-.screens {{ display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }}
-.screen {{ min-width: 0; padding: 11px; border: 1px solid #273044; border-radius: 10px; background: #0f141f; }}
-.screen h3 {{ margin: 0 0 9px; font-size: 14px; color: #bac6da; }}
-.image-wrap {{ position: relative; overflow: hidden; min-height: 220px; background: #03050a; }}
-.image-wrap img {{ display: block; width: 100%; height: auto; }}
-.box {{ position: absolute; z-index: 3; min-width: 5px; min-height: 5px; border: 3px solid #63e6be; background: #63e6be22; box-shadow: 0 0 0 1px #06110e, 0 2px 7px #000b; pointer-events: none; }}
-.box.target {{ border-color: #ffd166; background: #ffd16622; }}
-.box.context {{ opacity: .22; border-width: 2px; }}
-.box span {{ position: absolute; top: -22px; left: -2px; padding: 2px 5px; border-radius: 4px; background: #0a1113e8; color: #a9ffe4; font-size: 11px; white-space: nowrap; }}
-.box.target span {{ color: #ffe6a8; }}
-.details {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(260px, .7fr); gap: 13px; margin-top: 13px; }}
-.node-card, .match-list {{ padding: 12px; border: 1px solid #273044; border-radius: 9px; background: #0f141f; }}
-.node-card h4 {{ margin: 0 0 8px; }}
-.node-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }}
-.node-info {{ min-width: 0; color: #bac6da; font-size: 13px; line-height: 1.55; overflow-wrap: anywhere; }}
-.match-list {{ max-height: 330px; overflow: auto; }}
-.match-row {{ width: 100%; margin-bottom: 6px; text-align: left; color: #b8c4d8; }}
-.match-row.active {{ border-color: #63e6be; background: #193126; color: #eafff8; }}
-.null {{ color: #ff9f9f; }}
-.tag {{ display: inline-block; margin-right: 5px; padding: 2px 6px; border-radius: 999px; background: #202a3d; color: #aebfe0; font-size: 11px; }}
-@media (max-width: 920px) {{ .screens, .details, .node-grid {{ grid-template-columns: 1fr; }} }}
-</style>
-</head>
-<body>
-<header><strong>OmniTransfer · Mapping Pair Pilot</strong><span id="progress"></span><button id="prevPair">上一组</button><button id="nextPair">下一组</button><button id="prevMatch">上一个节点</button><button id="nextMatch">下一个节点</button><label><input type="checkbox" id="showAll"> 显示全部框</label><select id="dataset"></select></header>
-<main><div class="meta"><div id="identity"></div><div id="stats"></div></div><div class="screens"><section class="screen" id="source"></section><section class="screen" id="target"></section></div><div class="details"><section class="node-card" id="nodeCard"></section><section class="match-list" id="matchList"></section></div></main>
-<script>
-const queue = {payload};
-let filtered = queue.slice(), pairIndex = 0, matchIndex = 0;
-const byId = id => document.getElementById(id);
-const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[char]));
-function label(node) {{ return node?.text || node?.content_desc || node?.resource_id || node?.class_name || node?.node_id || '—'; }}
-function nodeMap(side) {{ return Object.fromEntries(side.nodes.map(node => [node.node_id, node])); }}
-function box(node, side, page, context=false) {{
-  if (!node?.bbox) return '';
-  const [x1,y1,x2,y2] = node.bbox;
-  const left = Math.max(0, Math.min(100, x1/page.width*100)), top = Math.max(0, Math.min(100, y1/page.height*100));
-  const width = Math.max(.3, Math.min(100-left, (x2-x1)/page.width*100)), height = Math.max(.3, Math.min(100-top, (y2-y1)/page.height*100));
-  return `<div class="box ${{side}}${{context?' context':''}}" style="left:${{left}}%;top:${{top}}%;width:${{width}}%;height:${{height}}%"><span>${{side==='source'?'S':'T'}} · ${{esc(label(node).slice(0,42))}}</span></div>`;
-}}
-function panel(sideName, item, match) {{
-  const page = item[sideName], nodes = nodeMap(page), activeIds = sideName === 'source' ? [match.source_node_id] : match.target_node_ids;
-  let overlays = '';
-  if (byId('showAll').checked) overlays += page.nodes.filter(node => !activeIds.includes(node.node_id)).map(node => box(node, sideName, page, true)).join('');
-  overlays += activeIds.map(id => box(nodes[id], sideName, page)).join('');
-  return `<h3>${{sideName === 'source' ? 'Source' : 'Target'}} · ${{esc(page.page_id)}} · ${{page.width}}×${{page.height}}</h3><div class="image-wrap"><img src="${{esc(page.image_url)}}" alt="${{esc(page.page_id)}}">${{overlays}}</div>`;
-}}
-function info(node) {{
-  if (!node) return '<span class="null">目标视口无对应节点（NULL）</span>';
-  return `<strong>${{esc(label(node))}}</strong><br><span class="tag">${{esc(node.class_name)}}</span>${{node.clickable?'<span class="tag">clickable</span>':''}}<br>node: ${{esc(node.node_id)}}<br>origin(label-only): ${{esc(node.origin_id)}}<br>bbox: ${{esc(JSON.stringify(node.bbox))}}`;
-}}
-function render() {{
-  if (!filtered.length) return;
-  const item = filtered[pairIndex], match = item.matches[matchIndex], sourceNodes = nodeMap(item.source), targetNodes = nodeMap(item.target);
-  byId('progress').textContent = `${{pairIndex+1}} / ${{filtered.length}} · 节点 ${{matchIndex+1}} / ${{item.matches.length}}`;
-  byId('identity').innerHTML = `<span class="tag">${{esc(item.dataset)}}</span><span class="tag">${{esc(item.label_status)}}</span>${{esc(item.pair_id)}}`;
-  const nulls = item.matches.filter(value => value.label === 'no_correspondence').length;
-  byId('stats').textContent = `${{item.matches.length}} anchors · ${{nulls}} NULL`;
-  byId('source').innerHTML = panel('source', item, match);
-  byId('target').innerHTML = panel('target', item, match);
-  const sourceNode = sourceNodes[match.source_node_id], targets = match.target_node_ids.map(id => targetNodes[id]);
-  byId('nodeCard').innerHTML = `<h4>${{esc(match.label)}}</h4><div class="node-grid"><div class="node-info"><b>Source</b><br>${{info(sourceNode)}}</div><div class="node-info"><b>Target set (${{targets.length}})</b><br>${{targets.length ? targets.map(info).join('<hr>') : info(null)}}</div></div>`;
-  byId('matchList').innerHTML = item.matches.map((value, index) => `<button class="match-row${{index===matchIndex?' active':''}}" data-index="${{index}}">${{index+1}} · ${{esc(label(sourceNodes[value.source_node_id]).slice(0,52))}} → ${{value.target_node_ids.length || 'NULL'}}</button>`).join('');
-  document.querySelectorAll('.match-row').forEach(button => button.onclick = () => {{ matchIndex = Number(button.dataset.index); render(); }});
-}}
-function movePair(delta) {{ pairIndex = (pairIndex + delta + filtered.length) % filtered.length; matchIndex = 0; render(); }}
-function moveMatch(delta) {{ const count = filtered[pairIndex].matches.length; matchIndex = (matchIndex + delta + count) % count; render(); }}
-const datasets = ['全部', ...new Set(queue.map(item => item.dataset))];
-byId('dataset').innerHTML = datasets.map(value => `<option>${{esc(value)}}</option>`).join('');
-byId('dataset').onchange = () => {{ filtered = byId('dataset').value === '全部' ? queue.slice() : queue.filter(item => item.dataset === byId('dataset').value); pairIndex = 0; matchIndex = 0; render(); }};
-byId('prevPair').onclick = () => movePair(-1); byId('nextPair').onclick = () => movePair(1);
-byId('prevMatch').onclick = () => moveMatch(-1); byId('nextMatch').onclick = () => moveMatch(1);
-byId('showAll').onchange = render;
-document.onkeydown = event => {{ if (event.key === 'ArrowLeft') movePair(-1); if (event.key === 'ArrowRight') movePair(1); if (event.key === 'ArrowUp') moveMatch(-1); if (event.key === 'ArrowDown') moveMatch(1); }};
-render();
-</script>
-</body>
-</html>"""
+def _review_payload(queue: list[dict[str, Any]]) -> dict[str, Any]:
+    tasks = []
+    for item in queue:
+        source_nodes = {node["node_id"]: node for node in item["source"]["nodes"]}
+        target_nodes = {node["node_id"]: node for node in item["target"]["nodes"]}
+        mappings = []
+        for match_index, match in enumerate(item["matches"]):
+            source_node = source_nodes[match["source_node_id"]]
+            target_nodes_for_match = [
+                target_nodes[node_id] for node_id in match["target_node_ids"]
+            ]
+            source_label = f"S{match_index + 1}"
+            target_label = f"M{match_index + 1}"
+            mappings.append(
+                {
+                    "mapping_id": f"{source_label}-{target_label}",
+                    "source_label": source_label,
+                    "target_label": target_label,
+                    "label": f"{source_label} → {target_label}",
+                    "source_node": source_node,
+                    "target_nodes": target_nodes_for_match,
+                    "target_node_ids": list(match["target_node_ids"]),
+                    "label_hint": match["label"],
+                    "matcher_prediction": {
+                        "node": None,
+                        "top1_node": None,
+                        "accepted": False,
+                        "reason": "not_evaluated",
+                        "probability": 0.0,
+                        "margin": 0.0,
+                    },
+                }
+            )
+        tasks.append(
+            {
+                "task_id": item["pair_id"],
+                "pair_id": item["pair_id"],
+                "app": item["dataset"],
+                "label_status": item["label_status"],
+                "difficulty_score": item["difficulty_score"],
+                "difficulty_reasons": item["difficulty_reasons"],
+                "method_tags": item.get("method_tags", []),
+                "method_comparison": item.get("method_comparison"),
+                "source": _workbench_page(item["source"], None),
+                "target": _workbench_page(item["target"], None),
+                "mappings": mappings,
+                "provenance": item["provenance"],
+            }
+        )
+    return {
+        "summary": {
+            "schema_version": "omnitransfer.mapping_pair_review.v2",
+            "task_count": len(tasks),
+            "review_ui": {
+                "protocol": "mapping_pair_correspondence",
+                "multi_mapping": True,
+                "template_ids": [
+                    "correct_correspondence",
+                    "wrong_correspondence",
+                    "ambiguous_or_absent",
+                    "discard_bad_evidence",
+                ],
+                "template_overrides": {},
+                "diagnostic_overlay": {
+                    "enabled": True,
+                    "methods": ["gold_proposal"],
+                    "coordinate_space": "page_pixels",
+                },
+            },
+        },
+        "pairs": tasks,
+    }
+
+
+def _workbench_page(
+    page: dict[str, Any],
+    node: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        "page_id": page["page_id"],
+        "width": page["width"],
+        "height": page["height"],
+        "screenshot_path": page["image_url"],
+        "node": node,
+        "nodes": page.get("nodes", []),
+        "candidates": page.get("candidates", page.get("nodes", [])),
+    }
+
+
+def _review_html(payload: dict[str, Any], *, external_payload: bool = False) -> str:
+    template_path = (
+        Path(__file__).resolve().parents[2]
+        / "tests"
+        / "vector"
+        / "review_annotation_template.html"
+    )
+    if not template_path.is_file():
+        raise FileNotFoundError(f"canonical review template missing: {template_path}")
+    template = template_path.read_text(encoding="utf-8")
+    marker = "__OMNITRANSFER_REVIEW_PAYLOAD__"
+    if template.count(marker) != 1:
+        raise ValueError("canonical review template payload marker invalid")
+    embedded = (
+        "await fetch('./review.html.payload.json').then(response => response.json())"
+        if external_payload
+        else json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
+    )
+    return template.replace(marker, embedded)

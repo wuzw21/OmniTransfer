@@ -7,7 +7,7 @@ SOURCE_XML = """<hierarchy bounds="[0,0][720,1280]"><node text="Phone" class="an
 TARGET_XML = """<hierarchy bounds="[0,0][2208,1840]"><node text="Phone" class="android.widget.EditText" clickable="true" enabled="true" bounds="[1083,1061][2061,1210]" /><node text="Name" class="android.widget.EditText" clickable="true" enabled="true" bounds="[1083,665][2061,814]" /></hierarchy>"""
 
 
-def test_low_confidence_with_ranked_targets_returns_top_coordinate(monkeypatch) -> None:
+def test_low_confidence_returns_ranked_targets_without_a_decision(monkeypatch) -> None:
     class Matcher:
         backend = "test"
 
@@ -27,24 +27,26 @@ def test_low_confidence_with_ranked_targets_returns_top_coordinate(monkeypatch) 
 
     monkeypatch.setattr(runtime, "_get_matcher", lambda: Matcher())
 
-    result = runtime.action_transfer(
+    result = runtime.rank_action_candidates(
         source_xml=SOURCE_XML,
         target_xml=TARGET_XML,
         source_point=(356.0, 937.5),
         top_k=2,
     )
 
-    assert result["mapped"] is True
-    assert result["target_bbox"] == [1083.0, 1061.0, 2061.0, 1210.0]
-    assert result["selection_policy"] == "top_candidate_required"
-    assert result["matcher_reason"] == "learned_low_confidence"
-    assert (result["new_x"], result["new_y"]) == (1572.0, 1135.5)
+    assert result["reason"] == "learned_low_confidence"
+    assert result["candidates"][0]["bbox"] == [1083.0, 1061.0, 2061.0, 1210.0]
+    assert result["candidates"][0]["score"] == 0.51
+    assert (
+        result["candidates"][0]["new_x"],
+        result["candidates"][0]["new_y"],
+    ) == (1572.0, 1135.5)
+    assert "mapped" not in result
+    assert "selection_policy" not in result
 
 
 def test_no_ranked_target_still_returns_structured_failure(monkeypatch) -> None:
     class Matcher:
-        backend = "test"
-
         def predict(self, *_args, **_kwargs):
             return SimpleNamespace(
                 target_node=None,
@@ -56,13 +58,14 @@ def test_no_ranked_target_still_returns_structured_failure(monkeypatch) -> None:
 
     monkeypatch.setattr(runtime, "_get_matcher", lambda: Matcher())
 
-    result = runtime.action_transfer(
+    result = runtime.rank_action_candidates(
         source_xml=SOURCE_XML,
         target_xml="<hierarchy />",
         source_point=(356.0, 937.5),
     )
 
-    assert result["mapped"] is False
+    assert result["candidates"] == []
     assert result["reason"] == "target_candidates_missing"
+    assert "mapped" not in result
     assert "new_x" not in result
     assert "new_y" not in result

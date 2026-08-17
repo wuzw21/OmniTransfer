@@ -26,6 +26,9 @@ src/foundation/
 src/omniflow/
 src/utg/
 tests/vector/
+!tests/vector/
+tests/vector/*
+!tests/vector/review_annotation_template.html
 tests/scripts/
 tests/utg_core/
 docs/reference/

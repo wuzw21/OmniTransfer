@@ -1,0 +1,820 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" href="data:,">
+<title>OmniTransfer · Unified Review Workbench</title>
+<style>
+:root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+* { box-sizing: border-box; }
+body { margin: 0; background: #080b12; color: #edf3fb; }
+header { position: sticky; top: 0; z-index: 30; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid #2a3347; background: #0c111bdd; backdrop-filter: blur(14px); }
+button, select, textarea { border: 1px solid #3a4660; border-radius: 7px; background: #151c29; color: inherit; font: inherit; }
+button, select { padding: 7px 10px; cursor: pointer; }
+button:hover { border-color: #8195bb; }
+button.selected { border-color: #63e6be; background: #183229; }
+button:disabled { cursor: default; opacity: .45; }
+label.control { display: inline-flex; align-items: center; gap: 5px; color: #aebbd0; font-size: 12px; }
+.spacer { flex: 1; }
+main { max-width: 1800px; margin: auto; padding: 14px; }
+.meta { display: grid; grid-template-columns: 1fr auto; gap: 10px; margin-bottom: 11px; color: #aebbd0; font-size: 13px; }
+.screens { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.screens.three-device { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.screens.cluster-review { grid-template-columns: repeat(auto-fit, minmax(min(520px, 100%), 1fr)); align-items: start; }
+.screen { min-width: 0; padding: 10px; border: 1px solid #273146; border-radius: 10px; background: #0f151f; }
+.screen h3 { margin: 0 0 8px; font-size: 14px; color: #c5d1e4; overflow-wrap: anywhere; }
+.image-wrap { overflow: hidden; min-height: 240px; background: #020409; }
+.image-stage { position: relative; width: 100%; line-height: 0; }
+.image-stage img { display: block; width: 100%; height: auto; }
+.overlay { position: absolute; z-index: 4; min-width: 5px; min-height: 5px; border: 3px solid var(--color); background: color-mix(in srgb, var(--color) 18%, transparent); box-shadow: 0 0 0 1px #02040a, 0 4px 12px #000a; pointer-events: none; }
+.overlay .tag { position: absolute; left: -2px; top: -24px; padding: 2px 5px; border-radius: 4px; background: #050911e8; color: var(--color); font-size: 11px; font-weight: 750; white-space: nowrap; }
+.overlay .point { position: absolute; left: 50%; top: 50%; display: grid; place-items: center; width: 27px; height: 27px; transform: translate(-50%, -50%); border: 3px solid #050911; border-radius: 50%; background: var(--color); color: #04100d; font-size: 10px; font-weight: 900; box-shadow: 0 0 0 4px color-mix(in srgb, var(--color) 35%, transparent); }
+.manual-point { position: absolute; z-index: 8; width: 26px; height: 26px; transform: translate(-50%, -50%); border: 3px solid #050911; border-radius: 50%; background: #ffffff; color: #050911; display: grid; place-items: center; font-size: 10px; font-weight: 900; pointer-events: none; }
+.source-query-point { position: absolute; z-index: 10; width: 28px; height: 28px; transform: translate(-50%, -50%); border: 3px solid #050911; border-radius: 50%; background: #ffffff; color: #050911; display: grid; place-items: center; font-size: 10px; font-weight: 900; box-shadow: 0 0 0 5px #63e6be66; pointer-events: none; }
+.matcher-point { position: absolute; z-index: 10; width: 30px; height: 30px; transform: translate(-50%, -50%); border: 3px solid #050911; border-radius: 50%; background: #55c2ff; color: #050911; display: grid; place-items: center; font-size: 10px; font-weight: 900; box-shadow: 0 0 0 5px #55c2ff66; pointer-events: none; }
+.method-point { position: absolute; z-index: 11; width: 32px; height: 28px; transform: translate(-50%, -50%); border: 3px solid #050911; border-radius: 50%; color: #050911; display: grid; place-items: center; font-size: 9px; font-weight: 900; box-shadow: 0 0 0 4px color-mix(in srgb, var(--method-color) 38%, transparent); pointer-events: none; }
+.method-point.ours { --method-color: #55c2ff; background: #55c2ff; }
+.method-point.selector { --method-color: #ff70c7; background: #ff70c7; }
+.method-toggle { display: none; }
+.method-toggle.visible { display: inline-block; }
+.payload-point { position: absolute; z-index: 9; width: 30px; height: 30px; transform: translate(-50%, -50%); border: 3px solid #050911; border-radius: 50%; background: var(--color); color: #050911; display: grid; place-items: center; font-size: 10px; font-weight: 900; box-shadow: 0 0 0 5px color-mix(in srgb, var(--color) 38%, transparent); pointer-events: none; }
+.multi-mapping-list { display: grid; gap: 7px; margin-top: 10px; }
+.multi-mapping-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 8px; border: 1px solid #29354c; border-left: 4px solid var(--mapping-color); border-radius: 8px; background: #0b1019; cursor: pointer; }
+.multi-mapping-row.selected { border-color: var(--mapping-color); box-shadow: 0 0 0 2px color-mix(in srgb, var(--mapping-color) 28%, transparent); }
+.multi-mapping-chip { display: inline-grid; place-items: center; min-width: 42px; padding: 3px 6px; border-radius: 999px; background: var(--mapping-color); color: #04100d; font-weight: 800; font-size: 11px; }
+.multi-mapping-row .mapping-label { min-width: 0; overflow-wrap: anywhere; }
+.multi-mapping-row .mapping-status { color: #aebbd0; font-size: 11px; white-space: nowrap; }
+.multi-overlay { border-width: 3px; }
+.multi-overlay .tag { font-weight: 850; }
+.source { --color: #63e6be; }
+.gold { --color: #ffd166; }
+.matcher { --color: #55c2ff; }
+.selector { --color: #ff70c7; }
+.candidate { --color: #aebbd0; opacity: .42; border-width: 1px; box-shadow: none; }
+.candidate .tag, .candidate .point { display: none; }
+.details { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(330px, .75fr); gap: 14px; margin-top: 14px; }
+.card { padding: 12px; border: 1px solid #273146; border-radius: 10px; background: #0f151f; }
+.card h3 { margin: 0 0 10px; font-size: 14px; }
+.diagnostics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 9px; }
+.diagnostic { min-width: 0; padding: 9px; border: 1px solid #29354c; border-radius: 8px; background: #0b1019; color: #b7c4d8; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.diagnostic strong { display: block; margin-bottom: 5px; color: #eef4fb; }
+.tag-chip { display: inline-block; margin: 2px 4px 2px 0; padding: 2px 6px; border-radius: 999px; background: #222d42; color: #bbcae3; font-size: 11px; }
+.review-buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+.review-buttons button { min-height: 42px; text-align: left; }
+textarea { width: 100%; min-height: 92px; margin-top: 9px; padding: 8px; resize: vertical; }
+.legend { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 8px; color: #aebbd0; font-size: 12px; }
+.legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; margin-right: 5px; border-radius: 50%; background: var(--color); }
+.muted { color: #8998b0; }
+.timing-summary { color: #91a2bb; font-size: 12px; white-space: nowrap; }
+.cluster-group { min-width: 0; padding: 10px; border: 1px solid #273146; border-radius: 10px; background: #0f151f; }
+.cluster-group > h3 { margin: 0 0 8px; font-size: 14px; }
+.cluster-members { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(210px, 100%), 1fr)); gap: 8px; }
+.cluster-member { position: relative; min-width: 0; padding: 7px; border: 1px solid #29354c; border-radius: 8px; background: #0b1019; cursor: pointer; transition: border-color 120ms ease, box-shadow 120ms ease, transform 120ms ease; }
+.cluster-member:hover { border-color: #627493; transform: translateY(-1px); }
+.cluster-member.selected-page { border-color: #ff7b72; box-shadow: 0 0 0 2px #ff7b7244; }
+.cluster-member:focus-visible { outline: 2px solid #63e6be; outline-offset: 2px; }
+.exclude-page { position: absolute; z-index: 12; top: 5px; right: 5px; display: grid; place-items: center; width: 28px; height: 28px; padding: 0; border-color: #6d3940; background: #29151aee; color: #ff9b94; font-size: 18px; line-height: 1; }
+.exclude-page:hover { border-color: #ff7b72; background: #4a2027; }
+.cluster-member h4 { margin: 0 0 6px; color: #c5d1e4; font-size: 11px; overflow-wrap: anywhere; }
+.cluster-member .image-wrap { display: grid; place-items: center; height: clamp(170px, 30vh, 340px); min-height: 0; }
+.cluster-member .image-wrap { position: relative; overflow: hidden; }
+.cluster-member .image-stage { position: absolute; inset: 0; width: auto; height: auto; min-height: 0; }
+.cluster-member .image-stage img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+.cluster-meta { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; color: #aebbd0; font-size: 11px; }
+.transition-details { margin-top: 6px; color: #aebbd0; font-size: 11px; }
+.transition-details summary { cursor: pointer; color: #91a2bb; }
+.transition-list { max-height: 130px; overflow: auto; margin-top: 6px; line-height: 1.45; }
+.pairwise-details { margin-top: 6px; }
+.pairwise-details summary { cursor: pointer; color: #91a2bb; }
+.cluster-protocol { height: 100vh; overflow: hidden; }
+.cluster-protocol header { position: relative; flex-wrap: nowrap; height: 56px; padding: 8px 12px; overflow-x: auto; }
+.cluster-protocol header strong, .cluster-protocol header button, .cluster-protocol header select, .cluster-protocol .timing-summary { flex: 0 0 auto; white-space: nowrap; }
+.cluster-protocol header .control, .cluster-protocol #clearSource, .cluster-protocol #clearPoints { display: none; }
+.cluster-protocol main { display: grid; grid-template-rows: auto minmax(0, 1fr) auto minmax(150px, 0.55fr); gap: 7px; height: calc(100vh - 56px); max-width: none; padding: 8px 12px; overflow: hidden; }
+.cluster-protocol .meta { margin: 0; }
+.cluster-protocol .screens { min-height: 0; overflow: auto; }
+.cluster-protocol .cluster-group { min-height: 0; overflow: auto; }
+.cluster-protocol .cluster-member .image-wrap { height: clamp(170px, 34vh, 280px); }
+.cluster-protocol .legend { margin: 0; }
+.cluster-protocol .details { min-height: 0; margin: 0; overflow: hidden; }
+.cluster-protocol .details .card { min-height: 0; overflow: auto; }
+.minimal-mapping-review .details { grid-template-columns: minmax(0, 1fr) minmax(330px, 520px); }
+.minimal-mapping-review .meta { display: none; }
+.minimal-mapping-review #clearSource, .minimal-mapping-review header .control { display: none; }
+.minimal-mapping-review .legend span::before { display: none; }
+@media (max-width: 980px) { .screens, .details, .diagnostics { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <strong>OmniTransfer · Unified Review Workbench</strong>
+  <span id="progress"></span>
+  <button id="previous">上一条</button>
+  <button id="next">下一条</button>
+  <select id="stageFilter" hidden aria-label="审核阶段"><option value="cluster_audit" selected>Cluster 筛选</option><option value="cluster_merge_candidate">Cluster 合并候选</option><option value="all">全部阶段</option></select>
+  <select id="filter"><option value="all">全部</option><option value="pending">未审核</option><option value="confirmed">已审核</option></select>
+  <select id="methodFilter" hidden aria-label="方法差异"><option value="all">所有方法组</option><option value="ours_vs_selector_disagree">只看 ours ≠ selector</option><option value="ours_correct_selector_wrong">只看我们的对 / selector 错</option><option value="selector_correct_ours_wrong">只看 selector 对 / 我们的错</option><option value="ours_rank_advantage">只看我们的排序更靠前</option><option value="selector_rank_advantage">只看 selector 排序更靠前</option></select>
+  <button id="showOurs" class="method-toggle" type="button">1 · 我们的方案</button>
+  <button id="showSelector" class="method-toggle" type="button">2 · selector</button>
+  <span id="methodOverlayStatus" class="method-toggle"></span>
+  <button id="restoreExcluded" hidden>恢复最近排除</button>
+  <label class="control"><input type="checkbox" id="showCandidates">显示全部可选节点</label>
+  <button id="clearSource">重置 Source</button>
+  <button id="clearPoints">清空人工点</button>
+  <span class="timing-summary" id="timingSummary"></span>
+  <span class="spacer"></span>
+  <button id="export">导出审核 JSONL</button>
+</header>
+<main>
+  <div class="meta"><div id="identity"></div><div id="difficulty"></div></div>
+  <div class="screens" id="screens"><section class="screen" id="sourcePanel"></section><section class="screen" id="targetPanel"></section><section class="screen" id="foldPanel" hidden></section></div>
+  <div class="legend" id="legend"></div>
+  <div class="details">
+    <section class="card"><h3>方法诊断</h3><div class="diagnostics" id="diagnostics"></div></section>
+    <section class="card"><h3>人工裁决</h3><div class="review-buttons" id="reviewButtons"></div><textarea id="notes" placeholder="备注：错误原因、歧义、遮挡、页面不一致等"></textarea><div class="muted" id="saved"></div></section>
+  </div>
+</main>
+<script type="module">
+const payload = __OMNITRANSFER_REVIEW_PAYLOAD__;
+const summary = payload.summary || {};
+const queue = payload.pairs || [];
+const pagePairReview = summary.review_ui?.protocol === 'page_pair_prior';
+const multiMappingReview = summary.review_ui?.protocol === 'mapping_pair_correspondence' && summary.review_ui?.multi_mapping === true;
+const utgPageMerge = summary.review_ui?.protocol === 'utg_page_merge';
+const utgClusterReview = summary.review_ui?.protocol === 'utg_cluster_review';
+const minimalMappingReview = summary.review_ui?.minimal === true;
+const fixedSourceReview = summary.review_ui?.fixed_source === true;
+document.body.classList.toggle('cluster-protocol', utgClusterReview);
+document.body.classList.toggle('minimal-mapping-review', minimalMappingReview);
+const idleThresholdMs = Number(summary.review_ui?.idle_threshold_ms || 10000);
+const storageKey = `omnitransfer-review:${summary.schema_version || 'v1'}:${summary.checkpoint || location.pathname}`;
+const exclusionStorageKey = `${storageKey}:excluded-pages`;
+let annotations = JSON.parse(localStorage.getItem(storageKey) || '{}');
+let excludedPages = JSON.parse(localStorage.getItem(exclusionStorageKey) || '{}');
+let filtered = queue.slice();
+let index = 0;
+let selectedPageKey = null;
+let visibleTaskId = null;
+let visibleIntervalStartedAt = null;
+let selectedMappingId = null;
+let methodOverlayMode = 'ours';
+const mappingPalette = ['#63e6be','#ffd166','#55c2ff','#ff70c7','#ff7b72','#b197fc','#8ce99a','#ffa94d','#74c0fc','#f783ac','#a9e34b','#e599f7'];
+const byId = value => document.getElementById(value);
+byId('stageFilter').hidden = !utgClusterReview;
+byId('methodFilter').hidden = !queue.some(task => (task.method_tags || []).length);
+const hasMethodComparison = queue.some(task => task.method_comparison);
+byId('showOurs').classList.toggle('visible', hasMethodComparison);
+byId('showSelector').classList.toggle('visible', hasMethodComparison);
+byId('methodOverlayStatus').classList.toggle('visible', hasMethodComparison);
+byId('clearSource').hidden = fixedSourceReview;
+byId('showCandidates').closest('label').hidden = summary.review_ui?.show_candidate_toggle === false;
+const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+const label = node => node?.text || node?.content_desc || node?.resource_id || node?.class_name || node?.node_id || 'NULL';
+const overlayLabel = node => node?.node_id ? `${node.node_id} · ${label(node).slice(0,28)}` : label(node);
+function save() { localStorage.setItem(storageKey, JSON.stringify(annotations)); }
+function saveExclusions() { localStorage.setItem(exclusionStorageKey, JSON.stringify(excludedPages)); }
+function annotation(task) { return annotations[task.task_id] || {}; }
+function setAnnotation(task, patch) { annotations[task.task_id] = {...annotation(task), ...patch, updated_at: new Date().toISOString()}; save(); render(); }
+function pageKey(page) { return page?.page_key || `${page?.device_role || page?.device_serial || 'device'}:${page?.page_id || 'page'}`; }
+function isExcluded(page) { return Boolean(excludedPages[pageKey(page)]); }
+function visibleMembers(cluster) { return (cluster?.members || []).filter(page => !isExcluded(page)); }
+function taskExcludedPageKeys(task) {
+  return [...new Set((task.clusters || []).flatMap(cluster => (cluster.members || []).map(pageKey)).filter(key => excludedPages[key]))];
+}
+function taskAutoExcludedPageKeys(task) {
+  return [...new Set((task.clusters || []).flatMap(cluster => (cluster.excluded_members || []).map(member => member.page_key)))];
+}
+function updateExclusionControls() {
+  const keys = Object.keys(excludedPages);
+  const restore = byId('restoreExcluded');
+  restore.hidden = !utgClusterReview;
+  restore.disabled = keys.length === 0;
+  restore.textContent = keys.length ? `恢复最近排除（${keys.length}）` : '恢复最近排除';
+}
+function selectPage(key) {
+  selectedPageKey = key;
+  document.querySelectorAll('.cluster-member').forEach(card => {
+    const selected = card.dataset.pageKey === key;
+    card.classList.toggle('selected-page', selected);
+    card.setAttribute('aria-selected', String(selected));
+  });
+}
+function excludePage(key) {
+  if (!utgClusterReview || !key || excludedPages[key]) return;
+  if (filtered.length) recordActivity(filtered[index], 'page_exclude');
+  excludedPages[key] = {excluded_at:new Date().toISOString()};
+  selectedPageKey = null;
+  saveExclusions();
+  applyFilter(true);
+}
+function restoreLatestExcluded() {
+  const latest = Object.entries(excludedPages).sort((left, right) => String(right[1]?.excluded_at || '').localeCompare(String(left[1]?.excluded_at || '')))[0];
+  if (!latest) return;
+  delete excludedPages[latest[0]];
+  selectedPageKey = latest[0];
+  saveExclusions();
+  applyFilter(true);
+}
+function timingRecord(task) {
+  const review = annotation(task), now = new Date().toISOString();
+  if (!review.timing) review.timing = {item_first_visible_at:now,item_last_visible_at:now,first_interaction_at:null,decision_started_at:null,visible_intervals:[],activity_events:[],revisit_count:0,verdict_change_count:0,candidate_click_count:0,notes_edit_count:0,visibility_pause_count:0};
+  return review.timing;
+}
+function closeVisibleInterval(at = new Date().toISOString()) {
+  if (!visibleTaskId || !visibleIntervalStartedAt) return;
+  const task = queue.find(row => row.task_id === visibleTaskId);
+  if (!task) return;
+  const timing = timingRecord(task);
+  timing.visible_intervals.push({start:visibleIntervalStartedAt,end:at});
+  timing.item_last_visible_at = at;
+  visibleIntervalStartedAt = null;
+  save();
+}
+function showTaskTiming(task) {
+  if (visibleTaskId === task.task_id && visibleIntervalStartedAt) return;
+  const now = new Date().toISOString();
+  if (visibleTaskId && visibleTaskId !== task.task_id) closeVisibleInterval(now);
+  const timing = timingRecord(task);
+  if (visibleTaskId && visibleTaskId !== task.task_id) timing.revisit_count += Number(timing.item_last_visible_at !== timing.item_first_visible_at);
+  timing.item_last_visible_at = now;
+  visibleTaskId = task.task_id;
+  visibleIntervalStartedAt = document.visibilityState === 'visible' ? now : null;
+  save();
+}
+function recordActivity(task, type) {
+  const timing = timingRecord(task), now = new Date().toISOString();
+  if (!timing.first_interaction_at) timing.first_interaction_at = now;
+  timing.activity_events.push({at:now,type});
+  if (type === 'candidate_click') timing.candidate_click_count += 1;
+  if (type === 'notes_edit') timing.notes_edit_count += 1;
+  save();
+}
+function timingMetrics(review, taskIsVisible=false) {
+  const timing = review.timing;
+  if (!timing) return {wall_ms:0,active_ms:0,idle_ms:0,reading_ms:0,interaction_ms:0,decision_ms:0};
+  const now = new Date().toISOString();
+  const intervals = [...(timing.visible_intervals || [])];
+  if (taskIsVisible && visibleIntervalStartedAt) intervals.push({start:visibleIntervalStartedAt,end:now});
+  const events = (timing.activity_events || []).map(row => Date.parse(row.at)).filter(Number.isFinite).sort((a,b)=>a-b);
+  let wallMs = 0, activeMs = 0;
+  intervals.forEach(interval => {
+    const start = Date.parse(interval.start), end = Date.parse(interval.end);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return;
+    wallMs += end-start;
+    const inside = events.filter(value => start <= value && value <= end);
+    let cursor = start;
+    inside.forEach(value => { activeMs += Math.min(Math.max(0,value-cursor),idleThresholdMs); cursor=value; });
+    activeMs += Math.min(Math.max(0,end-cursor),idleThresholdMs);
+  });
+  const firstVisible = Date.parse(timing.item_first_visible_at), firstInteraction = Date.parse(timing.first_interaction_at);
+  const decisionStarted = Date.parse(timing.decision_started_at), confirmed = Date.parse(review.confirmed_at);
+  const readingMs = Number.isFinite(firstVisible) && Number.isFinite(firstInteraction) ? Math.max(0,firstInteraction-firstVisible) : activeMs;
+  const decisionMs = Number.isFinite(decisionStarted) && Number.isFinite(confirmed) ? Math.max(0,confirmed-decisionStarted) : 0;
+  return {wall_ms:Math.round(wallMs),active_ms:Math.round(activeMs),idle_ms:Math.round(Math.max(0,wallMs-activeMs)),reading_ms:Math.round(Math.min(readingMs,activeMs)),interaction_ms:Math.round(Math.max(0,activeMs-Math.min(readingMs,activeMs))),decision_ms:Math.round(decisionMs)};
+}
+function median(values) { if (!values.length) return 0; const sorted=[...values].sort((a,b)=>a-b), middle=Math.floor(sorted.length/2); return sorted.length%2?sorted[middle]:(sorted[middle-1]+sorted[middle])/2; }
+function renderTimingSummary() {
+  const completed = queue.map(task => ({review:annotation(task),task})).filter(row => row.review.verdict);
+  const metrics = completed.map(row => timingMetrics(row.review, row.task.task_id===visibleTaskId));
+  const revisitRate = completed.length ? completed.filter(row => (row.review.timing?.revisit_count||0)>0).length/completed.length : 0;
+  const changeRate = completed.length ? completed.filter(row => (row.review.timing?.verdict_change_count||0)>0).length/completed.length : 0;
+  byId('timingSummary').textContent = completed.length ? `active 中位 ${Math.round(median(metrics.map(row=>row.active_ms))/100)/10}s · wall 中位 ${Math.round(median(metrics.map(row=>row.wall_ms))/100)/10}s · 回访 ${Math.round(revisitRate*100)}% · 改判 ${Math.round(changeRate*100)}%` : '尚无时延统计';
+}
+function manualPoints(review) {
+  if (Array.isArray(review.target_points)) return review.target_points;
+  return review.target_point ? [review.target_point] : [];
+}
+function taskMappings(task) { return Array.isArray(task.mappings) ? task.mappings : []; }
+function mappingColor(mapping, index) { return mapping?.color || mappingPalette[index % mappingPalette.length]; }
+function mappingAnnotation(task, mapping) {
+  const review = annotation(task);
+  return review.mappings?.[mapping.mapping_id] || {};
+}
+function methodTagText(tag) { return typeof tag === 'string' ? tag : (tag?.label || tag?.id || 'method tag'); }
+function methodTagCount(tag) { return tag && typeof tag === 'object' && Number.isFinite(Number(tag.count)) ? ` · ${tag.count}` : ''; }
+function methodTagIds(task) { return new Set((task.method_tags || []).map(tag => typeof tag === 'string' ? tag : tag?.id).filter(Boolean)); }
+function methodPoint(point, labelText, role, page, index) {
+  const position = pointPercent(point && {x:point[0], y:point[1], coordinate_space:'page_pixels'}, page);
+  if (!position) return '';
+  const roleName = labelText === '源' ? '源动作点' : role === 'ours' ? '我们的方案' : 'selector';
+  return `<i class="method-point ${role}" style="left:${position.x}%;top:${position.y}%" title="${esc(`${roleName} · 对应动作点 ${index+1}`)}">${esc(labelText)}${index+1}</i>`;
+}
+function methodPointOverlays(task, side, page) {
+  const anchors = task.method_comparison?.anchors || [];
+  return anchors.map((anchor, index) => side === 'source'
+    ? methodPoint(anchor.source_point, '源', 'ours', page, index)
+    : methodOverlayMode === 'selector'
+      ? methodPoint(anchor.selector_point, '选', 'selector', page, index)
+      : methodPoint(anchor.ours_point, '我', 'ours', page, index)
+  ).join('');
+}
+function methodComparisonDiagnostics(task) {
+  const comparison = task.method_comparison;
+  if (!comparison) return '';
+  const counts = Object.entries(comparison.category_counts || {}).map(([key, value]) => `${key}: ${value}`).join(' · ');
+  const anchors = (comparison.anchors || []).map((anchor, index) => `${index+1}. ${anchor.category} · ours rank=${anchor.ours_rank ?? '—'} · selector rank=${anchor.selector_rank ?? '—'}`).join('<br>');
+  return `<div class="diagnostic"><strong>方法差异 · ours vs selector</strong><br>${comparison.anchor_count} 个对应动作点 · ${esc(counts)}<br>对应关系：源N → 我N（我们的方案）或 选N（selector）；同一个 N 表示同一个对应动作点。<br>当前显示：${methodOverlayMode === 'selector' ? 'selector（按 2 切换）' : '我们的方案（按 1 切换）'}<details class="pairwise-details"><summary>查看各对应动作点</summary><span class="muted">${esc(anchors)}</span></details></div>`;
+}
+function setMappingAnnotation(task, mapping, patch) {
+  const review = annotation(task), mappings = {...(review.mappings || {})};
+  mappings[mapping.mapping_id] = {...(mappings[mapping.mapping_id] || {}), ...patch, updated_at:new Date().toISOString()};
+  setAnnotation(task, {mappings});
+}
+function multiOverlay(node, side, mapping, index, page) {
+  const bbox = nodeBbox(node);
+  if (!bbox || !page.width || !page.height) return '';
+  const [x1,y1,x2,y2] = bbox;
+  const left = Math.max(0, Math.min(100, x1/page.width*100));
+  const top = Math.max(0, Math.min(100, y1/page.height*100));
+  const width = Math.max(.25, Math.min(100-left, (x2-x1)/page.width*100));
+  const height = Math.max(.25, Math.min(100-top, (y2-y1)/page.height*100));
+  const labelText = side === 'source' ? (mapping.source_label || `S${index+1}`) : (mapping.target_label || `M${index+1}`);
+  return `<div class="overlay multi-overlay" style="--color:${esc(mappingColor(mapping,index))};left:${left}%;top:${top}%;width:${width}%;height:${height}%"><span class="tag" title="${esc(`${labelText} · ${label(node)}`)}">${esc(labelText)} · ${esc(label(node).slice(0,28))}</span><i class="point">${esc(labelText)}</i></div>`;
+}
+function multiPanel(task, side) {
+  const page = task[side], mappings = taskMappings(task);
+  let overlays = [];
+  mappings.forEach((mapping, index) => {
+    if (side === 'source') {
+      overlays.push(multiOverlay(mapping.source_node, side, mapping, index, page));
+    } else {
+      (mapping.target_nodes || []).forEach(node => overlays.push(multiOverlay(node, side, mapping, index, page)));
+      const review = mappingAnnotation(task, mapping);
+      manualPoints(review).forEach(point => {
+        const position = pointPercent(point, page);
+        if (position) overlays.push(`<i class="payload-point" style="--color:${esc(mappingColor(mapping,index))};left:${position.x}%;top:${position.y}%" title="${esc(mapping.label)} 人工点">${esc(mapping.target_label || `M${index+1}`)}</i>`);
+      });
+    }
+  });
+  if (byId('showCandidates').checked && side === 'target') overlays = (page.candidates || []).map(node => overlay(node, 'candidate', page)).concat(overlays);
+  return `<h3>${side === 'source' ? 'Source' : 'Target'} · ${esc(page.page_id)} · ${page.width}×${page.height}</h3><div class="image-wrap"><div class="image-stage" data-side="${side}"><img src="${esc(page.screenshot_path)}" alt="${esc(page.page_id)}">${overlays.join('')}${methodPointOverlays(task, side, page)}</div></div>`;
+}
+function multiDiagnostics(task) {
+  const rows = taskMappings(task).map((mapping, index) => {
+    const review = mappingAnnotation(task, mapping), verdict = review.verdict || '未审核';
+    const target = (mapping.target_nodes || []).map(node => label(node)).join(' / ') || '待选择';
+    return `<button class="multi-mapping-row${selectedMappingId === mapping.mapping_id ? ' selected' : ''}" data-mapping-id="${esc(mapping.mapping_id)}" style="--mapping-color:${esc(mappingColor(mapping,index))}"><span class="multi-mapping-chip">${esc(mapping.source_label || `S${index+1}`)} → ${esc(mapping.target_label || `M${index+1}`)}</span><span class="mapping-label">${esc(label(mapping.source_node))} → ${esc(target)}</span><span class="mapping-status">${esc(verdict)}</span></button>`;
+  }).join('');
+  return `<div class="diagnostic"><strong>页面内映射（${taskMappings(task).length} 组）</strong>点击一行切换当前映射；Target 图上的点击只写入当前行。<div class="multi-mapping-list">${rows}</div></div>`;
+}
+function queryFor(task, review) {
+  const requested = review.source_node_id;
+  const fallback = task.source?.node?.node_id;
+  return task.source_queries?.[requested] || task.source_queries?.[fallback] || null;
+}
+function activeTask(task, review) {
+  if (review.source_query_point && !review.source_node_id) {
+    return {
+      ...task,
+      source: {...task.source, node: null},
+      gold_proposal: null,
+      gold_proposals: [],
+      matcher_prediction: null,
+      selector_prediction: null,
+    };
+  }
+  const query = queryFor(task, review);
+  if (!query) return task;
+  return {
+    ...task,
+    source: {...task.source, node: query.source_node || task.source?.node},
+    gold_proposal: Object.hasOwn(query, 'gold_proposal') ? query.gold_proposal : task.gold_proposal,
+    gold_proposals: Object.hasOwn(query, 'gold_proposals') ? query.gold_proposals : task.gold_proposals,
+    matcher_prediction: query.matcher_prediction || task.matcher_prediction,
+    selector_prediction: query.selector_prediction || task.selector_prediction,
+  };
+}
+function clamp01(value) { return Math.max(0, Math.min(1, value)); }
+function nodeBbox(node) { return node?.visual_bbox || node?.bbox || null; }
+function matcherMappedPoint(task, review) {
+  const explicitPoint = task.matcher_prediction?.point;
+  if (explicitPoint) return explicitPoint;
+  const sourcePoint = review.source_query_point || task.source?.point;
+  const sourceNode = task.source?.node;
+  const targetNode = task.matcher_prediction?.node;
+  const sourceBbox = nodeBbox(sourceNode), targetBbox = nodeBbox(targetNode);
+  if (!sourcePoint || !sourceBbox || !targetBbox) return null;
+  const sourceWidth = Math.max(1e-9, sourceBbox[2] - sourceBbox[0]);
+  const sourceHeight = Math.max(1e-9, sourceBbox[3] - sourceBbox[1]);
+  const offsetX = clamp01((sourcePoint.x - sourceBbox[0]) / sourceWidth);
+  const offsetY = clamp01((sourcePoint.y - sourceBbox[1]) / sourceHeight);
+  return {
+    x: targetBbox[0] + offsetX * (targetBbox[2] - targetBbox[0]),
+    y: targetBbox[1] + offsetY * (targetBbox[3] - targetBbox[1]),
+    coordinate_space: 'page_pixels',
+    node_id: targetNode.node_id,
+    offset_x: offsetX,
+    offset_y: offsetY,
+  };
+}
+function overlay(node, role, page) {
+  const bbox = nodeBbox(node);
+  if (!bbox || !page.width || !page.height) return '';
+  const [x1,y1,x2,y2] = bbox;
+  const left = Math.max(0, Math.min(100, x1/page.width*100));
+  const top = Math.max(0, Math.min(100, y1/page.height*100));
+  const width = Math.max(.25, Math.min(100-left, (x2-x1)/page.width*100));
+  const height = Math.max(.25, Math.min(100-top, (y2-y1)/page.height*100));
+  const names = {source:'S',gold:'G',matcher:'M',selector:'R'};
+  return `<div class="overlay ${role}" style="left:${left}%;top:${top}%;width:${width}%;height:${height}%"><span class="tag" title="${esc(`${label(node)} · ${node?.node_id || 'NULL'}`)}">${names[role]} · ${esc(overlayLabel(node))}</span><i class="point">${names[role]}</i></div>`;
+}
+function pointPercent(point, page) {
+  if (!point) return null;
+  const space = point.coordinate_space;
+  let x = Number(point.x), y = Number(point.y);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+  if (space === 'page_pixels') { if (!page.width || !page.height) return null; x = x/page.width*100; y = y/page.height*100; }
+  else if (space === 'relative_0_1000') { x = x/10; y = y/10; }
+  else if (space === 'normalized_0_1') { x = x*100; y = y*100; }
+  else if (space !== 'percent_0_100') return null;
+  return {x:Math.max(0,Math.min(100,x)),y:Math.max(0,Math.min(100,y))};
+}
+function payloadPoint(point, role, page) {
+  const position = pointPercent(point, page);
+  if (!position) return '';
+  const marker = role === 'source' ? (minimalMappingReview ? 'Q' : 'S') : 'G';
+  const title = `${role === 'source' ? (minimalMappingReview ? 'Fixed Source query' : 'Source') : 'Gold target'} point · ${point.coordinate_space}`;
+  return `<i class="payload-point ${role}" title="${esc(title)}" style="left:${position.x}%;top:${position.y}%">${marker}</i>`;
+}
+function queryPoint(point, page) {
+  const position = pointPercent(point, page);
+  if (!position) return '';
+  return `<i class="source-query-point" title="Source query · node=${esc(point.node_id || '未吸附')}" style="left:${position.x}%;top:${position.y}%">Q</i>`;
+}
+function matcherPoint(point, page) {
+  const position = pointPercent(point, page);
+  if (!position) return '';
+  return `<i class="matcher-point" title="自动 Target 候选（非金标） · node=${esc(point.node_id || 'NULL')} · (${Number(point.x).toFixed(4)}, ${Number(point.y).toFixed(4)})" style="left:${position.x}%;top:${position.y}%">P</i>`;
+}
+function panel(task, side, review) {
+  const page = task[side];
+  if (utgPageMerge) {
+    const names = {source:'Source · 1080×2400',small:'Small · 720×1280',fold:'Fold · 2208×1840'};
+    return `<h3>${names[side]} · ${esc(page.device_serial)} · ${esc(page.page_id)} · nodes=${page.node_count}</h3><div class="image-wrap"><div class="image-stage" data-side="${side}"><img src="${esc(page.screenshot_path)}" alt="${esc(page.page_id)}"></div></div>`;
+  }
+  const goldNodes = task.gold_proposals || [task.gold_proposal];
+  let overlays = side === 'source' ? overlay(page.node, 'source', page) : [...goldNodes.map(node => overlay(node, 'gold', page)), overlay(task.matcher_prediction?.node, 'matcher', page), overlay(task.selector_prediction?.node, 'selector', page)].join('');
+  if (byId('showCandidates').checked) overlays = (page.candidates || []).map(node => overlay(node, 'candidate', page)).join('') + overlays;
+  if (!(side === 'source' && review.source_query_point)) overlays += payloadPoint(page.point, side === 'source' ? 'source' : 'gold', page);
+  if (side === 'source') overlays += queryPoint(review.source_query_point, page);
+  if (side === 'target') overlays += matcherPoint(matcherMappedPoint(task, review), page);
+  const manual = side === 'target' ? manualPoints(review).map((point, pointIndex) => `<i class="manual-point" title="${esc(point.node_id ? `node=${point.node_id}` : '未吸附到节点')}" style="left:${point.screen_x_pct}%;top:${point.screen_y_pct}%">H${pointIndex+1}</i>`).join('') : '';
+  return `<h3>${side === 'source' ? 'Source' : 'Target'} · ${esc(page.page_id)} · ${page.width}×${page.height}</h3><div class="image-wrap"><div class="image-stage" data-side="${side}"><img src="${esc(page.screenshot_path)}" alt="${esc(page.page_id)}">${overlays}${manual}</div></div>`;
+}
+function diagnostic(title, node, extras='') { return `<div class="diagnostic"><strong>${esc(title)}</strong>${esc(label(node))}<br><span class="muted">${esc(node?.node_id || 'NULL')}</span>${node?.view_str ? `<br><span class="muted">view_str=${esc(node.view_str)}</span>` : ''}${node?.origin_id ? `<br><span class="muted">origin=${esc(node.origin_id)}</span>` : ''}${extras}</div>`; }
+function rankText(rows) { return (rows || []).map((row,index) => `${index+1}. ${row.page_id.slice(0,10)} · ${Number(row.score).toFixed(4)} · n=${row.node_count}`).join('<br>'); }
+function utgDiagnostics(task) {
+  const oursDecision = task.ours_merge_decision ? 'MERGE' : 'DO NOT MERGE';
+  const baselineDecision = task.baseline_merge_decision ? 'MERGE' : 'DO NOT MERGE';
+  const pairRows = Object.entries(task.ours_pairwise_scores || {}).map(([pair,score]) => `${pair}: ${Number(score).toFixed(4)}`).join('<br>');
+  const baselinePairRows = Object.entries(task.baseline_pairwise_scores || {}).map(([pair,score]) => `${pair}: ${Number(score).toFixed(4)}`).join('<br>');
+  const cards = [`<div class="diagnostic"><strong>Pairwise merge gate</strong><span class="tag-chip">OmniTransfer: ${oursDecision}</span><br>要求每一对 ≥ ${Number(task.merge_threshold).toFixed(2)}；min=${Number(task.ours_min_pairwise_score).toFixed(4)}<br>${pairRows}<br><span class="muted">mean=${Number(task.ours_mean_score).toFixed(4)}，仅作诊断，不参与门控</span></div>`,`<div class="diagnostic"><strong>Native baseline gate</strong><span class="tag-chip">OmniFlow: ${baselineDecision}</span><br>min=${Number(task.baseline_min_pairwise_score).toFixed(4)}<br>${baselinePairRows}<br><span class="muted">mean=${Number(task.baseline_mean_score).toFixed(4)}，仅作诊断</span></div>`];
+  (task.proposals || []).forEach(proposal => {
+    Object.keys(proposal.ours || {}).forEach(targetRole => cards.push(`<div class="diagnostic"><strong>${esc(proposal.anchor_role)} → ${esc(targetRole)}</strong><span class="tag-chip">OmniTransfer 1024D</span><br>${rankText(proposal.ours[targetRole])}<br><span class="tag-chip">OmniFlow 512D</span><br>${rankText(proposal.baseline[targetRole])}</div>`));
+  });
+  return cards.join('');
+}
+function actionLabel(edge) {
+  const action = edge?.action || {};
+  return action.text || action.resource_id || action.note || action.type || 'transition';
+}
+function clusterMember(page) {
+  const outgoing = page.transitions?.outgoing || [], incoming = page.transitions?.incoming || [];
+  const transitionRows = [...outgoing.map(edge => `[${edge.scope}] → ${actionLabel(edge)} · ${(edge.target_page_key||edge.target_package||'external').slice(0,28)}`),...incoming.map(edge => `[${edge.scope}] ← ${actionLabel(edge)} · ${(edge.source_page_key||'external').slice(0,28)}`)];
+  const utgIn = incoming.filter(edge=>edge.scope==='utg').length, utgOut = outgoing.filter(edge=>edge.scope==='utg').length;
+  const explorationIn = incoming.length-utgIn, explorationOut = outgoing.length-utgOut;
+  const key = pageKey(page), selected = selectedPageKey === key;
+  return `<article class="cluster-member${selected?' selected-page':''}" data-page-key="${esc(key)}" tabindex="0" role="button" aria-selected="${selected}" title="点击选中，按 X 排除此页"><button class="exclude-page" data-exclude-page-key="${esc(key)}" title="排除此页（不删除原始 XML）" aria-label="排除此页">×</button><h4>${esc(page.device_serial)} · ${esc(page.page_id)} · nodes=${page.node_count}</h4><div class="image-wrap"><div class="image-stage"><img src="${esc(page.screenshot_path)}" alt="${esc(page.page_id)}"></div></div><div class="cluster-meta"><span>${esc(page.activity)}</span><span>UTG ${utgIn}入/${utgOut}出</span><span>explore ${explorationIn}入/${explorationOut}出</span></div><details class="transition-details"><summary>查看转移边（${transitionRows.length}）</summary><div class="transition-list">${transitionRows.length?transitionRows.map(row=>`<div>${esc(row)}</div>`).join(''):'<span class="muted">当前页没有记录到转移边</span>'}</div></details></article>`;
+}
+function clusterPanel(cluster) {
+  const members = visibleMembers(cluster);
+  const content = members.length ? members.map(clusterMember).join('') : '<div class="muted">当前 Cluster 暂无保留 page，可用“恢复最近排除”撤销。</div>';
+  const originalCount = cluster.original_member_count || cluster.member_count;
+  const exactXmlDedup = cluster.excluded_members?.length ? ` · exact XML 去重=${cluster.excluded_members.length}` : '';
+  return `<section class="cluster-group"><h3>${esc(cluster.cluster_id)} · members=${members.length}/${originalCount}${exactXmlDedup} · ${cluster.auto_merged?'auto-merged':'singleton'}</h3><div class="cluster-members">${content}</div></section>`;
+}
+function pairwiseText(rows) { return (rows || []).map(row => `${row.left_page_key} ↔ ${row.right_page_key}: ${Number(row.score).toFixed(4)}`).join('<br>'); }
+function trainingDiagnostics() {
+  const training = summary.training_summary || {}, data = training.data || {}, ours = training.ours || {}, structural = training.ours_structure_only || {}, baselines = training.baselines || {};
+  if (!data.train_pairs) return '';
+  return `<div class="diagnostic"><strong>v7 training & held-out score</strong><span class="tag-chip">XML + UTG Action</span><br>${Number(data.train_pairs).toLocaleString()} pairs · ${Number(data.train_pages).toLocaleString()} pages · ${Number(data.train_clusters).toLocaleString()} clusters · 63 Apps<br>Test Top-1=${(100*Number(ours.hit_at_1)).toFixed(2)}% · Top-3=${(100*Number(ours.hit_at_3)).toFixed(2)}%<br><span class="muted">Structure-only Top-1=${(100*Number(structural.hit_at_1)).toFixed(2)}% · SoftGate=${(100*Number(baselines.softgate_1024d?.hit_at_1)).toFixed(2)}% · Fixed=${(100*Number(baselines.fixed_pooling_1024d?.hit_at_1)).toFixed(2)}%<br>63 Apps 中 13 个来自 B-MOCA 动作轨迹，50 个来自 ASE 跨平台 XML。</span></div>`;
+}
+function clusterDiagnostics(task) {
+  const training = trainingDiagnostics();
+  if (task.review_kind === 'cluster_merge_candidate') {
+    const evidence = task.candidate_evidence || {}, ours = evidence.ours_cross_scores || {}, baseline = evidence.baseline_cross_scores || {};
+    return training + `<div class="diagnostic"><strong>Cluster merge candidate</strong>候选阈值 ≥ ${Number(evidence.candidate_threshold).toFixed(2)} · 自动合并阈值 ≥ ${Number(evidence.merge_threshold).toFixed(2)}<br>v7 max=${Number(ours.maximum).toFixed(4)} · mean=${Number(ours.mean).toFixed(4)} · min=${Number(ours.minimum).toFixed(4)}<details class="pairwise-details"><summary>全部跨簇 Pair</summary><span class="muted">${pairwiseText(evidence.ours_cross_pairwise)}</span></details></div><div class="diagnostic"><strong>Native baseline</strong>max=${Number(baseline.maximum).toFixed(4)} · mean=${Number(baseline.mean).toFixed(4)} · min=${Number(baseline.minimum).toFixed(4)}<details class="pairwise-details"><summary>全部跨簇 Pair</summary><span class="muted">${pairwiseText(evidence.baseline_cross_pairwise)}</span></details></div>`;
+  }
+  return training + (task.clusters || []).map(cluster => `<div class="diagnostic"><strong>${esc(cluster.cluster_id)}</strong>${cluster.auto_merged?'complete-link 自动集群':'单页集群'}<br>v7 min=${Number(cluster.ours_scores?.minimum).toFixed(4)} · mean=${Number(cluster.ours_scores?.mean).toFixed(4)}<details class="pairwise-details"><summary>Cluster 内全部 Pair</summary><span class="muted">${pairwiseText(cluster.ours_pairwise)}</span></details><br>UTG internal=${cluster.transitions?.internal?.length||0} · incoming=${cluster.transitions?.incoming?.length||0} · outgoing=${cluster.transitions?.outgoing?.length||0}</div>`).join('');
+}
+function render() {
+  updateExclusionControls();
+  if (!filtered.length) {
+    byId('progress').textContent = utgClusterReview ? `已排除 ${Object.keys(excludedPages).length} 页` : '';
+    byId('identity').textContent = '当前筛选无任务';
+    byId('screens').innerHTML = '';
+    return;
+  }
+  const baseTask = filtered[index], review = annotation(baseTask), task = activeTask(baseTask, review);
+  showTaskTiming(baseTask);
+  renderTimingSummary();
+  const exclusionProgress = utgClusterReview ? ` · 已排除 ${Object.keys(excludedPages).length} 页` : '';
+  const autoDedupProgress = utgClusterReview && summary.review_ui?.exact_xml_deduplication?.excluded_pages ? ` · exact XML 去重 ${summary.review_ui.exact_xml_deduplication.excluded_pages} 页` : '';
+  byId('progress').textContent = `${index+1} / ${filtered.length} · 已审核 ${Object.values(annotations).filter(row => row.verdict).length}${exclusionProgress}${autoDedupProgress}`;
+  const methodTags = (task.method_tags || []).map(tag => `<span class="tag-chip">${esc(methodTagText(tag))}${esc(methodTagCount(tag))}</span>`).join('');
+  byId('identity').innerHTML = `<span class="tag-chip">${esc(task.app)}</span><span class="tag-chip">${esc(task.label_status)}</span>${methodTags}${esc(task.task_id)}${review.source_node_id ? ` · source=${esc(review.source_node_id)}` : ''}`;
+  byId('methodOverlayStatus').textContent = task.method_comparison ? `当前落点：${methodOverlayMode === 'selector' ? 'selector' : '我们的方案'}` : '';
+  byId('difficulty').innerHTML = `difficulty ${Number(task.difficulty_score).toFixed(3)} · ${(task.difficulty_reasons || []).map(reason => `<span class="tag-chip">${esc(reason)}</span>`).join('')}`;
+  if (multiMappingReview) {
+    const mappings = taskMappings(task);
+    if (!mappings.some(mapping => mapping.mapping_id === selectedMappingId)) selectedMappingId = mappings[0]?.mapping_id || null;
+    byId('screens').className = 'screens';
+    if (!byId('sourcePanel')) byId('screens').innerHTML = '<section class="screen" id="sourcePanel"></section><section class="screen" id="targetPanel"></section><section class="screen" id="foldPanel" hidden></section>';
+    byId('foldPanel').hidden = true;
+    byId('sourcePanel').innerHTML = multiPanel(task, 'source');
+    byId('targetPanel').innerHTML = multiPanel(task, 'target');
+    byId('legend').innerHTML = '<span>每一行是一组独立映射：S1→M1、S2→M2；颜色只标识组，不改变模型分数。</span><span>先选择左侧映射行，再点击右侧 Target，可连续标注多组。</span>';
+    byId('diagnostics').innerHTML = methodComparisonDiagnostics(task) + multiDiagnostics(task);
+    document.querySelectorAll('[data-mapping-id]').forEach(button => button.onclick = () => { selectedMappingId = button.dataset.mappingId; render(); });
+  } else if (utgClusterReview) {
+    byId('screens').className = 'screens cluster-review';
+    byId('screens').innerHTML = (task.clusters || []).map(clusterPanel).join('');
+    document.querySelectorAll('.cluster-member').forEach(card => {
+      card.onclick = event => { if (!event.target.closest('.exclude-page')) selectPage(card.dataset.pageKey); };
+      card.onkeydown = event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selectPage(card.dataset.pageKey); } };
+    });
+    document.querySelectorAll('[data-exclude-page-key]').forEach(button => button.onclick = event => { event.stopPropagation(); excludePage(button.dataset.excludePageKey); });
+    byId('legend').innerHTML = task.review_kind === 'cluster_merge_candidate' ? '<span>Hard negative：这是当前模型认为最相似、但尚未自动合并的两个 Cluster。请判断它们是否应保持分开；“保持两个 Cluster”即模型判断正确。</span>' : '<span>补充簇内审核：当前 Cluster 的全部成员同时显示；UTG 转移边默认折叠。</span>';
+    byId('diagnostics').innerHTML = clusterDiagnostics(task);
+  } else if (utgPageMerge) {
+    byId('screens').className = 'screens three-device';
+    if (!byId('sourcePanel')) byId('screens').innerHTML = '<section class="screen" id="sourcePanel"></section><section class="screen" id="targetPanel"></section><section class="screen" id="foldPanel"></section>';
+    byId('foldPanel').hidden = false;
+    byId('sourcePanel').innerHTML = panel(task, 'source', review);
+    byId('targetPanel').innerHTML = panel(task, 'small', review);
+    byId('foldPanel').innerHTML = panel(task, 'fold', review);
+    byId('legend').innerHTML = '<span>Top-1 组合只用于审核证据。系统仅在三条两两相似度都达到阈值时合并；任意一条不足即不合并。</span>';
+    byId('diagnostics').innerHTML = utgDiagnostics(task);
+  } else {
+    byId('screens').className = 'screens';
+    if (!byId('sourcePanel')) byId('screens').innerHTML = '<section class="screen" id="sourcePanel"></section><section class="screen" id="targetPanel"></section><section class="screen" id="foldPanel" hidden></section>';
+    byId('foldPanel').hidden = true;
+    byId('sourcePanel').innerHTML = panel(task, 'source', review);
+    byId('targetPanel').innerHTML = panel(task, 'target', review);
+    const proposalLabel = summary.review_ui?.proposal_label || '自动 proposal（非 gold）';
+    const predictionLabel = summary.review_ui?.prediction_label || 'OmniTransfer Top-1（提示）';
+    byId('legend').innerHTML = minimalMappingReview
+      ? `<span>Q = 固定 Source 点；P = ${esc(predictionLabel)}；P 正确可直接确认，错误时点击 Target 生成 H；不存在时选 NULL。</span>`
+      : `<span class="source">Source</span>${task.gold_proposal ? `<span class="gold">${esc(proposalLabel)}</span>` : ''}${task.matcher_prediction?.node ? '<span class="matcher">OmniTransfer Top-1（提示）</span>' : ''}${task.selector_prediction?.node ? '<span class="selector">Identity selector（诊断）</span>' : ''}<span>左侧白点 Q：查询点；右侧蓝点 P：映射点；H：人工 target 点，可标多个</span>`;
+    const matcherTop1 = task.matcher_prediction?.top1_node;
+    const matcherGate = task.matcher_prediction?.accepted === false ? `<br><span class="muted">runtime 拒识；仅诊断 Top-1=${esc(label(matcherTop1))}</span>` : '';
+    const diagnosticCards = [];
+    if (minimalMappingReview) diagnosticCards.push(diagnostic('固定 Source 节点 Q', task.source?.node, `<br><span class="muted">point=(${Number(task.source?.point?.x).toFixed(1)}, ${Number(task.source?.point?.y).toFixed(1)})</span>`));
+    if (task.gold_proposal) diagnosticCards.push(diagnostic(proposalLabel, task.gold_proposal, '<br><span class="muted">仅为候选，必须人工确认</span>'));
+    const mappedPoint = matcherMappedPoint(task, review);
+    const mappedText = mappedPoint ? `<br><span class="muted">candidate=(${Number(mappedPoint.x).toFixed(1)}, ${Number(mappedPoint.y).toFixed(1)})${Number.isFinite(mappedPoint.offset_x)&&Number.isFinite(mappedPoint.offset_y)?` · offset=(${Number(mappedPoint.offset_x).toFixed(3)}, ${Number(mappedPoint.offset_y).toFixed(3)})`:''}</span>` : '';
+    if (task.matcher_prediction) diagnosticCards.push(diagnostic(minimalMappingReview ? predictionLabel : 'OmniTransfer matcher', task.matcher_prediction?.node, `<br>${esc(task.matcher_prediction?.reason || '')} · p=${Number(task.matcher_prediction?.probability || 0).toFixed(3)} · margin=${Number(task.matcher_prediction?.margin || 0).toFixed(3)}${mappedText}${matcherGate}`));
+    if (task.selector_prediction?.node) diagnosticCards.push(diagnostic('Identity selector', task.selector_prediction?.node, `<br>${esc(task.selector_prediction?.reason || '')} · candidates=${task.selector_prediction?.candidate_count || 0}`));
+    byId('diagnostics').innerHTML = diagnosticCards.join('');
+  }
+  const catalog = {correct_correspondence:'对应正确',wrong_correspondence:'对应错误',ambiguous_or_absent:'歧义/目标不存在',confirm_mapping:'确认人工映射',no_correspondence:'目标不存在（NULL）',ambiguous_mapping:'映射有歧义',confirm_pair:'确认 pair',reject_pair:'拒绝 pair',ambiguous_pair:'pair 有歧义',discard_bad_evidence:'截图或结构不可用'};
+  const configured = task.verdict_ids || summary.review_ui?.template_ids || ['confirm_mapping','no_correspondence','ambiguous_mapping','discard_bad_evidence'];
+  const overrides = summary.review_ui?.template_overrides || {};
+  const templates = configured.map(value => [value, overrides[value] || catalog[value] || value]);
+  byId('reviewButtons').innerHTML = templates.map(([value,text]) => `<button data-verdict="${value}" class="${review.verdict===value?'selected':''}">${text}</button>`).join('');
+  document.querySelectorAll('[data-verdict]').forEach(button => button.onclick = () => {
+    const verdict = button.dataset.verdict;
+    if (multiMappingReview) {
+      const mapping = taskMappings(baseTask).find(row => row.mapping_id === selectedMappingId) || taskMappings(baseTask)[0];
+      if (!mapping) return;
+      const current = mappingAnnotation(baseTask, mapping), now = new Date().toISOString();
+      if ((verdict === 'confirm_mapping' || verdict === 'correct_correspondence') && !manualPoints(current).length && !(mapping.target_nodes || []).length) {
+        byId('saved').textContent = '当前映射没有目标候选，请先在 Target 图上点击目标';
+        return;
+      }
+      recordActivity(baseTask, 'mapping_verdict');
+      setMappingAnnotation(baseTask, mapping, {verdict, confirmed_at:now});
+      return;
+    }
+    const currentReview = annotation(task);
+    const automaticPoint = matcherMappedPoint(task, currentReview);
+    if (verdict === 'confirm_mapping' && !manualPoints(currentReview).length && !automaticPoint) {
+      byId('saved').textContent = '没有自动候选，请先在 Target 图上点击一个或多个对应点';
+      return;
+    }
+    const current = annotation(baseTask), timing = timingRecord(baseTask), now = new Date().toISOString();
+    recordActivity(baseTask, 'verdict');
+    if (!timing.decision_started_at) timing.decision_started_at = timing.first_interaction_at || now;
+    if (current.verdict && current.verdict !== verdict) timing.verdict_change_count += 1;
+    const patch = {verdict, confirmed_at: now};
+    if (verdict === 'confirm_mapping' && !manualPoints(currentReview).length) patch.target_points = [{...automaticPoint,screen_x_pct:pointPercent(automaticPoint,task.target)?.x,screen_y_pct:pointPercent(automaticPoint,task.target)?.y,node_ids:[automaticPoint.node_id].filter(Boolean),source:'confirmed_automatic_proposal'}];
+    if (verdict === 'no_correspondence') patch.target_points = [];
+    setAnnotation(baseTask, patch);
+    move(1, true);
+  });
+  byId('notes').value = review.notes || '';
+  byId('notes').onchange = () => { recordActivity(baseTask, 'notes_edit'); setAnnotation(baseTask, {notes: byId('notes').value}); };
+  const selectedPoints = manualPoints(review);
+  const targetSnapped = selectedPoints.filter(point => point.node_id).length;
+  const sourceStatus = review.source_node_id ? `Source 已选 ${review.source_node_id}` : (review.source_query_point ? '未命中可匹配 Source 节点' : (task.source_queries ? '请点击 Source 图选择查询点' : 'Source 使用固定节点'));
+  if (multiMappingReview) {
+    const mapping = taskMappings(task).find(row => row.mapping_id === selectedMappingId) || taskMappings(task)[0];
+    const mappingReview = mapping ? mappingAnnotation(baseTask, mapping) : {};
+    const points = mapping ? manualPoints(mappingReview) : [];
+    byId('saved').textContent = mapping ? `${mapping.label} · ${mappingReview.verdict || '未审核'} · 人工点 ${points.length} · 选择行后点击 Target` : '当前页面对没有映射';
+    const targetWrap = document.querySelector('.image-stage[data-side="target"]');
+    if (targetWrap && mapping) targetWrap.onclick = event => {
+      recordActivity(baseTask, 'candidate_click');
+      const rect = targetWrap.querySelector('img').getBoundingClientRect();
+      const xPct = Math.max(0, Math.min(100, (event.clientX-rect.left)/rect.width*100));
+      const yPct = Math.max(0, Math.min(100, (event.clientY-rect.top)/rect.height*100));
+      const pageX = xPct/100*task.target.width, pageY = yPct/100*task.target.height;
+      const containing = (task.target.candidates || []).filter(node => { const bbox = nodeBbox(node); return bbox && bbox[0] <= pageX && pageX <= bbox[2] && bbox[1] <= pageY && pageY <= bbox[3]; }).sort((a,b) => { const bboxA = nodeBbox(a), bboxB = nodeBbox(b); return ((bboxA[2]-bboxA[0])*(bboxA[3]-bboxA[1])) - ((bboxB[2]-bboxB[0])*(bboxB[3]-bboxB[1])); });
+      const snappedNode = containing[0] || null;
+      const point = {screen_x_pct:xPct,screen_y_pct:yPct,x:pageX,y:pageY,page_x:pageX,page_y:pageY,coordinate_space:'page_pixels',node_id:snappedNode?.node_id || null,node_ids:containing.map(node => node.node_id)};
+      const points = manualPoints(mappingAnnotation(baseTask, mapping)).slice();
+      const duplicate = points.findIndex(value => (point.node_id && value.node_id === point.node_id) || Math.hypot(value.screen_x_pct-xPct,value.screen_y_pct-yPct) < 1.5);
+      if (duplicate >= 0) points.splice(duplicate, 1); else points.push(point);
+      setMappingAnnotation(baseTask, mapping, {target_points:points, verdict:null, confirmed_at:null});
+    };
+    return;
+  }
+  byId('saved').textContent = (utgPageMerge || utgClusterReview) ? (review.updated_at ? `已保存 ${review.updated_at}` : '请选择 Cluster 裁决；模型分数仅作为审核证据') : (review.updated_at ? `${sourceStatus} · 已保存 ${review.updated_at} · 人工点 ${selectedPoints.length} · Target 吸附 ${targetSnapped}` : `${sourceStatus}；点击 Target 图可补充人工点`);
+  if (utgPageMerge || utgClusterReview) return;
+  const sourceWrap = document.querySelector('.image-stage[data-side="source"]');
+  if (!fixedSourceReview) sourceWrap.onclick = event => {
+    recordActivity(baseTask, 'candidate_click');
+    const rect = sourceWrap.querySelector('img').getBoundingClientRect();
+    const xPct = Math.max(0, Math.min(100, (event.clientX-rect.left)/rect.width*100));
+    const yPct = Math.max(0, Math.min(100, (event.clientY-rect.top)/rect.height*100));
+    const pageX = xPct/100*task.source.width, pageY = yPct/100*task.source.height;
+    const containing = (task.source.candidates || []).filter(node => { const bbox = nodeBbox(node); return bbox && bbox[0] <= pageX && pageX <= bbox[2] && bbox[1] <= pageY && pageY <= bbox[3]; }).sort((a,b) => { const bboxA = nodeBbox(a), bboxB = nodeBbox(b); return ((bboxA[2]-bboxA[0])*(bboxA[3]-bboxA[1])) - ((bboxB[2]-bboxB[0])*(bboxB[3]-bboxB[1])); });
+    const snappedNode = containing.find(node => task.source_queries?.[node.node_id] || (!task.source_queries && node.node_id === task.source?.node?.node_id)) || null;
+    const point = {screen_x_pct:xPct,screen_y_pct:yPct,x:pageX,y:pageY,page_x:pageX,page_y:pageY,coordinate_space:'page_pixels',node_id:snappedNode?.node_id || null,node_ids:containing.map(node => node.node_id)};
+    setAnnotation(baseTask, {source_node_id:snappedNode?.node_id || null,source_query_point:point,target_points:[],target_point:null,verdict:null,confirmed_at:null});
+  };
+  const targetWrap = document.querySelector('.image-stage[data-side="target"]');
+  targetWrap.onclick = event => {
+    recordActivity(baseTask, 'candidate_click');
+    const rect = targetWrap.querySelector('img').getBoundingClientRect();
+    const xPct = Math.max(0, Math.min(100, (event.clientX-rect.left)/rect.width*100));
+    const yPct = Math.max(0, Math.min(100, (event.clientY-rect.top)/rect.height*100));
+    const pageX = xPct/100*task.target.width, pageY = yPct/100*task.target.height;
+    const containing = (task.target.candidates || []).filter(node => { const bbox = nodeBbox(node); return bbox && bbox[0] <= pageX && pageX <= bbox[2] && bbox[1] <= pageY && pageY <= bbox[3]; }).sort((a,b) => { const bboxA = nodeBbox(a), bboxB = nodeBbox(b); return ((bboxA[2]-bboxA[0])*(bboxA[3]-bboxA[1])) - ((bboxB[2]-bboxB[0])*(bboxB[3]-bboxB[1])); });
+    const snappedNode = containing[0] || null;
+    const point = {screen_x_pct:xPct,screen_y_pct:yPct,x:pageX,y:pageY,page_x:pageX,page_y:pageY,coordinate_space:'page_pixels',node_id:snappedNode?.node_id || null,node_ids:containing.map(node => node.node_id)};
+    const points = manualPoints(annotation(task)).slice();
+    const duplicate = points.findIndex(value => (point.node_id && value.node_id === point.node_id) || Math.hypot(value.screen_x_pct-xPct,value.screen_y_pct-yPct) < 1.5);
+    if (duplicate >= 0) points.splice(duplicate, 1); else points.push(point);
+    setAnnotation(baseTask, {target_points:points, target_point:null, verdict:null, confirmed_at:null});
+  };
+}
+function move(delta, pendingOnly=false) {
+  if (!filtered.length) return;
+  for (let count=0; count<filtered.length; count++) {
+    index = (index + delta + filtered.length) % filtered.length;
+    if (!pendingOnly || !annotation(filtered[index]).verdict) break;
+  }
+  render();
+}
+function applyFilter(preserveTask=false) {
+  const previousTaskId = preserveTask ? filtered[index]?.task_id : null;
+  const previousIndex = index;
+  const value = byId('filter').value;
+  const stage = utgClusterReview ? byId('stageFilter').value : 'all';
+  const visibleQueue = stage === 'all' ? queue.slice() : queue.filter(task => task.review_kind === stage);
+  const methodValue = byId('methodFilter').value;
+  const methodQueue = methodValue === 'all' ? visibleQueue : visibleQueue.filter(task => methodTagIds(task).has(methodValue));
+  filtered = value === 'all' ? methodQueue : methodQueue.filter(task => value === 'pending' ? !annotation(task).verdict : Boolean(annotation(task).verdict));
+  const preservedIndex = previousTaskId ? filtered.findIndex(task => task.task_id === previousTaskId) : -1;
+  index = preservedIndex >= 0 ? preservedIndex : (preserveTask ? Math.min(previousIndex, Math.max(0, filtered.length-1)) : 0);
+  render();
+}
+function exportTiming(task, review) {
+  const timing = review.timing || {}, metrics = timingMetrics(review, task.task_id===visibleTaskId);
+  return {item_first_visible_at:timing.item_first_visible_at||null,item_last_visible_at:timing.item_last_visible_at||null,first_interaction_at:timing.first_interaction_at||null,decision_started_at:timing.decision_started_at||null,wall_ms:metrics.wall_ms,active_ms:metrics.active_ms,idle_ms:metrics.idle_ms,reading_ms:metrics.reading_ms,interaction_ms:metrics.interaction_ms,decision_ms:metrics.decision_ms,revisit_count:timing.revisit_count||0,verdict_change_count:timing.verdict_change_count||0,candidate_click_count:timing.candidate_click_count||0,notes_edit_count:timing.notes_edit_count||0,visibility_pause_count:timing.visibility_pause_count||0};
+}
+function canonicalNode(node) {
+  if (!node?.node_id) return null;
+  return {...node,node_id:String(node.node_id),origin_id:String(node.origin_id||node.node_id)};
+}
+function canonicalNodes(page, extraNodes=[]) {
+  const byNodeId = new Map();
+  [...(page?.candidates||[]),page?.node,...extraNodes].map(canonicalNode).filter(Boolean).forEach(node => byNodeId.set(node.node_id,node));
+  return [...byNodeId.values()];
+}
+function canonicalPage(page, extraNodes=[]) {
+  return {page_id:page?.page_id,platform:page?.platform||'android',screenshot_path:page?.screenshot_path||page?.image_url||'',graph:{graph_id:page?.page_id,width:page?.width,height:page?.height,nodes:canonicalNodes(page,extraNodes)}};
+}
+byId('previous').onclick = () => move(-1); byId('next').onclick = () => move(1); byId('stageFilter').onchange = () => applyFilter(); byId('filter').onchange = () => applyFilter(); byId('methodFilter').onchange = () => applyFilter(); byId('showCandidates').onchange = render;
+byId('showOurs').onclick = () => { methodOverlayMode = 'ours'; render(); };
+byId('showSelector').onclick = () => { methodOverlayMode = 'selector'; render(); };
+byId('restoreExcluded').onclick = restoreLatestExcluded;
+byId('clearSource').onclick = () => { if (!fixedSourceReview && !multiMappingReview && filtered.length) setAnnotation(filtered[index], {source_node_id:null,source_query_point:null,target_points:[],target_point:null,verdict:null,confirmed_at:null}); };
+byId('clearPoints').onclick = () => {
+  if (!filtered.length) return;
+  if (multiMappingReview) {
+    const task = filtered[index], mapping = taskMappings(task).find(row => row.mapping_id === selectedMappingId) || taskMappings(task)[0];
+    if (mapping) setMappingAnnotation(task, mapping, {target_points:[], verdict:null, confirmed_at:null});
+    return;
+  }
+  setAnnotation(filtered[index], {target_points:[], target_point:null, verdict:null, confirmed_at:null});
+};
+byId('export').onclick = () => {
+  if (filtered.length) recordActivity(filtered[index], 'export');
+  if (utgClusterReview) {
+    const rows = queue.map(task => {
+      const review = annotation(task);
+      const manuallyExcludedPageKeys = taskExcludedPageKeys(task), autoExcludedPageKeys = taskAutoExcludedPageKeys(task), excludedPageKeys = [...new Set([...autoExcludedPageKeys,...manuallyExcludedPageKeys])];
+      return {schema_version:'omnitransfer.utg_cluster_annotation.v1',task_id:task.task_id,review_kind:task.review_kind,cluster_ids:task.cluster_ids,clusters:(task.clusters||[]).map(cluster=>{const originalMembers=cluster.original_members||cluster.members||[],members=visibleMembers(cluster),manuallyExcludedMembers=(cluster.members||[]).filter(isExcluded),autoExcludedMembers=cluster.excluded_members||[],excludedMemberPageKeys=[...new Set([...autoExcludedMembers.map(member=>member.page_key),...manuallyExcludedMembers.map(pageKey)])];return {cluster_id:cluster.cluster_id,original_member_page_keys:originalMembers.map(pageKey),member_page_keys:members.map(pageKey),excluded_member_page_keys:excludedMemberPageKeys,member_page_ids:members.map(member=>member.page_id),exact_xml_duplicate_groups:cluster.exact_xml_duplicate_groups||[],device_roles:cluster.device_roles,ours_scores:cluster.ours_scores,baseline_scores:cluster.baseline_scores,transitions:cluster.transitions};}),excluded_page_keys:excludedPageKeys,excluded_at_by_page_key:Object.fromEntries(excludedPageKeys.map(key=>[key,excludedPages[key]?.excluded_at||null])),candidate_evidence:task.candidate_evidence||null,label_status:['confirm_cluster','keep_singleton','confirm_cluster_merge','reject_cluster_merge','split_cluster'].includes(review.verdict)?'gold':'unreviewed',verdict:review.verdict||null,notes:review.notes||'',confirmed_at:review.confirmed_at||null,updated_at:review.updated_at||null,...exportTiming(task,review)};
+    });
+    const blob = new Blob([rows.map(row => JSON.stringify(row)).join('\n')+'\n'], {type:'application/x-ndjson'});
+    const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = 'omnitransfer_utg_cluster_annotations.jsonl'; link.click(); URL.revokeObjectURL(link.href);
+    return;
+  }
+  if (utgPageMerge) {
+    const rows = queue.map(task => {
+      const review = annotation(task);
+      return {schema_version:'omnitransfer.utg_page_merge_annotation.v1',task_id:task.task_id,pair_id:task.pair_id,app:task.app,page_ids:{source:task.source?.page_id,small:task.small?.page_id,fold:task.fold?.page_id},device_serials:{source:task.source?.device_serial,small:task.small?.device_serial,fold:task.fold?.device_serial},merge_threshold:task.merge_threshold,ours_pairwise_scores:task.ours_pairwise_scores,baseline_pairwise_scores:task.baseline_pairwise_scores,ours_min_pairwise_score:task.ours_min_pairwise_score,baseline_min_pairwise_score:task.baseline_min_pairwise_score,ours_merge_decision:task.ours_merge_decision,baseline_merge_decision:task.baseline_merge_decision,ours_mean_score:task.ours_mean_score,baseline_mean_score:task.baseline_mean_score,proposals:task.proposals||[],label_status:review.verdict==='confirm_merge_group'?'gold':'unreviewed',verdict:review.verdict||null,notes:review.notes||'',confirmed_at:review.confirmed_at||null,updated_at:review.updated_at||null,...exportTiming(task,review)};
+    });
+    const blob = new Blob([rows.map(row => JSON.stringify(row)).join('\n')+'\n'], {type:'application/x-ndjson'});
+    const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = 'omnitransfer_utg_page_merge_annotations.jsonl'; link.click(); URL.revokeObjectURL(link.href);
+    return;
+  }
+  if (multiMappingReview) {
+    const rows = queue.map(task => {
+      const review = annotation(task), mappings = taskMappings(task);
+      const matches = mappings.map(mapping => {
+        const mappingReview = mappingAnnotation(task, mapping);
+        const targetPoints = manualPoints(mappingReview);
+        const reviewedTargetIds = [...new Set(targetPoints.map(point => point.node_id).filter(Boolean))];
+        const confirmed = ['confirm_mapping','correct_correspondence'].includes(mappingReview.verdict);
+        const isNull = mappingReview.verdict === 'no_correspondence';
+        const targetIds = isNull ? [] : (reviewedTargetIds.length ? reviewedTargetIds : (confirmed ? mapping.target_node_ids : []));
+        const sourceBbox = nodeBbox(mapping.source_node);
+        return {source_node_id:mapping.source_node?.node_id,target_node_ids:targetIds,label:isNull?'no_correspondence':'correspondence',source_point:sourceBbox ? {x:(sourceBbox[0]+sourceBbox[2])/2,y:(sourceBbox[1]+sourceBbox[3])/2,coordinate_space:'page_pixels',node_id:mapping.source_node.node_id} : null,target_points:targetPoints,mapping_id:mapping.mapping_id};
+      });
+      const isGold = matches.length > 0 && mappings.every(mapping => ['confirm_mapping','correct_correspondence','no_correspondence'].includes(mappingAnnotation(task, mapping).verdict));
+      return {schema_version:'omnitransfer.ui_correspondence_pair.v1',pair_id:task.task_id,split:'diagnostic',label_status:isGold?'gold':'unreviewed',source:canonicalPage(task.source,(task.mappings||[]).map(mapping=>mapping.source_node)),target:canonicalPage(task.target,(task.mappings||[]).flatMap(mapping=>mapping.target_nodes||[])),matches,partition_keys:[`review:app:${task.app}`,`review:page-pair:${task.source?.page_id}:${task.target?.page_id}`],provenance:{...(task.provenance||{}),annotation:'human_mapping_review',multi_mapping:true},slices:{app:task.app},review:{verdict:review.verdict||null,notes:review.notes||'',mapping_annotations:review.mappings||{},confirmed_at:review.confirmed_at||null,updated_at:review.updated_at||null,...exportTiming(task,review)}};
+    });
+    const blob = new Blob([rows.map(row => JSON.stringify(row)).join('\n')+'\n'], {type:'application/x-ndjson'});
+    const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = 'omnitransfer_ui_correspondence_pairs.jsonl'; link.click(); URL.revokeObjectURL(link.href);
+    return;
+  }
+  if (pagePairReview) {
+    const rows = queue.map(task => {
+      const review = annotation(task);
+      return {schema_version:'omnitransfer.mobileviews_page_pair_annotation.v1',task_id:task.task_id,pair_id:task.pair_id,app:task.app,activity:task.activity,source_page_id:task.source?.page_id,target_page_id:task.target?.page_id,label_status:review.verdict==='confirm_pair'?'gold':'unreviewed',verdict:review.verdict||null,prior_score:task.prior_score,v9_page_prior:task.v9_page_prior,corner_cases:task.corner_cases||[],notes:review.notes||'',confirmed_at:review.confirmed_at||null,updated_at:review.updated_at||null,...exportTiming(task,review)};
+    });
+    const blob = new Blob([rows.map(row => JSON.stringify(row)).join('\n')+'\n'], {type:'application/x-ndjson'});
+    const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = 'omnitransfer_mobileviews_page_pair_annotations.jsonl'; link.click(); URL.revokeObjectURL(link.href);
+    return;
+  }
+  const rows = queue.map(task => {
+    const review = annotation(task), active = activeTask(task, review), targetPoints = manualPoints(review);
+    const sourceNode = active.source?.node;
+    const sourceBbox = nodeBbox(sourceNode);
+    const sourcePoint = review.source_query_point || active.source?.point || (sourceBbox ? {x:(sourceBbox[0]+sourceBbox[2])/2,y:(sourceBbox[1]+sourceBbox[3])/2,coordinate_space:'page_pixels',node_id:sourceNode.node_id} : null);
+    const matcherPoint = matcherMappedPoint(active, review);
+    const reviewedTargetIds = [...new Set(targetPoints.map(point => point.node_id).filter(Boolean))];
+    const confirmedGoldIds = review.verdict==='correct_correspondence' ? [...new Set((active.gold_proposals||[active.gold_proposal]).map(node=>node?.node_id).filter(Boolean))] : [];
+    const targetNodeIds = reviewedTargetIds.length ? reviewedTargetIds : confirmedGoldIds;
+    const isNull = review.verdict==='no_correspondence';
+    const isGold = ['confirm_mapping','correct_correspondence','no_correspondence'].includes(review.verdict);
+    const proposalTargetId = active.matcher_prediction?.node?.node_id || active.gold_proposal?.node_id || null;
+    const matchTargetIds = isNull ? [] : (targetNodeIds.length ? targetNodeIds : [proposalTargetId].filter(Boolean));
+    const targetNodesForGraph = [...(active.gold_proposals||[]),active.gold_proposal,active.matcher_prediction?.node,...targetPoints.map(point=>(active.target?.candidates||[]).find(node=>node.node_id===point.node_id))].filter(Boolean);
+    return {schema_version:'omnitransfer.ui_correspondence_pair.v1',pair_id:task.task_id,split:'diagnostic',label_status:isGold?'gold':'unreviewed',source:canonicalPage(active.source,[sourceNode]),target:canonicalPage(active.target,targetNodesForGraph),matches:[{source_node_id:sourceNode?.node_id,target_node_ids:matchTargetIds,label:isNull?'no_correspondence':'correspondence',source_point:sourcePoint,target_points:targetPoints}],partition_keys:[`review:app:${task.app}`,`review:page-pair:${active.source?.page_id}:${active.target?.page_id}`],provenance:{...(active.provenance||{}),annotation:'human_mapping_review',automatic_proposal:{target_node_id:active.matcher_prediction?.node?.node_id||null,target_point:matcherPoint,reason:active.matcher_prediction?.reason||null,score:active.matcher_prediction?.probability??null}},slices:{app:task.app,target_role:active.provenance?.target_role||null},review:{verdict:review.verdict||null,notes:review.notes||'',confirmed_at:review.confirmed_at||null,updated_at:review.updated_at||null,...exportTiming(task,review)}};
+  });
+  const blob = new Blob([rows.map(row => JSON.stringify(row)).join('\n')+'\n'], {type:'application/x-ndjson'});
+  const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = 'omnitransfer_ui_correspondence_pairs.jsonl'; link.click(); URL.revokeObjectURL(link.href);
+};
+document.onkeydown = event => {
+  const editable = ['INPUT','TEXTAREA','SELECT','BUTTON'].includes(event.target?.tagName) || event.target?.isContentEditable;
+  if (filtered.length) recordActivity(filtered[index], 'keydown');
+  if (!editable && event.key === '1' && hasMethodComparison) { methodOverlayMode = 'ours'; render(); return; }
+  if (!editable && event.key === '2' && hasMethodComparison) { methodOverlayMode = 'selector'; render(); return; }
+  const selectedCard = document.querySelector('.cluster-member.selected-page');
+  if (!editable && utgClusterReview && event.key.toLowerCase() === 'x' && selectedCard) { event.preventDefault(); excludePage(selectedCard.dataset.pageKey); return; }
+  if (event.key === 'ArrowLeft') move(-1);
+  if (event.key === 'ArrowRight') move(1);
+};
+document.addEventListener('visibilitychange', () => {
+  if (!visibleTaskId) return;
+  const task = queue.find(row => row.task_id === visibleTaskId);
+  if (!task) return;
+  if (document.visibilityState !== 'visible') {
+    timingRecord(task).visibility_pause_count += 1;
+    closeVisibleInterval();
+  } else {
+    visibleIntervalStartedAt = new Date().toISOString();
+    timingRecord(task).item_last_visible_at = visibleIntervalStartedAt;
+    save();
+  }
+});
+window.addEventListener('beforeunload', () => closeVisibleInterval());
+applyFilter();
+</script>
+</body>
+</html>

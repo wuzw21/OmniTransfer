@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 from io import BytesIO
@@ -9,38 +10,24 @@ from collections.abc import Iterable, Mapping
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
+import zlib
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 from omnitransfer.learned_matcher import (
     ALIGNMENT_RELATION_FEATURE_INDICES,
-    ALL_NODE_CANDIDATE_POLICY,
     DIRECT_SEMANTIC_EVIDENCE_NAMES,
+    GEOMETRIC_FEATURE_SCHEMA_ID,
     LearnedMatch,
     MatcherConfig,
     OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE,
-    OMNITRANSFER_V7_FEATURE_SCHEMA_ID,
-    RELATION_FEATURE_DIM,
     TEXT_DESCRIPTOR_DIM,
     TYPED_RELATION_NAMES,
     VISUAL_DESCRIPTOR_DIM,
-    XML_DESCRIPTOR_DIM,
     cross_relation_features,
     encode_graph,
-    is_actionable,
     spatial_xml_alignment_choice,
 )
-from omnitransfer.numpy_matcher import (
-    _decode,
-    _encode,
-    _gelu,
-    _log_softmax,
-    _require_numpy,
-    _sigmoid,
-    _softmax,
-    _visual_inputs,
-    np_float,
-)
-from omnitransfer.ui_graph import UIGraph, local_context_graph
+from omnitransfer.ui_graph import UIGraph
 
 NUMPY_GEOMETRIC_V9_SCHEMA = "omnitransfer_numpy_geometric_alignment_v9_v1"
 
@@ -48,7 +35,7 @@ NUMPY_GEOMETRIC_V9_SCHEMA = "omnitransfer_numpy_geometric_alignment_v9_v1"
 class NumpyGeometricAlignmentMatcher:
     """Inference-only v9 matcher for the Android Python/NumPy runtime."""
 
-    feature_schema_id = OMNITRANSFER_V7_FEATURE_SCHEMA_ID
+    feature_schema_id = GEOMETRIC_FEATURE_SCHEMA_ID
     backend = "numpy-v9"
 
     def __init__(self, weights: Mapping[str, Any], *, config: MatcherConfig) -> None:
@@ -89,20 +76,6 @@ class NumpyGeometricAlignmentMatcher:
         )
         if source_node is None:
             return LearnedMatch(None, 0.0, 0.0, "source_node_missing", ())
-        if (
-            self.config.candidate_policy != ALL_NODE_CANDIDATE_POLICY
-            and not is_actionable(source_node)
-        ):
-            return LearnedMatch(None, 0.0, 0.0, "source_node_not_actionable", ())
-        if (
-            self.config.candidate_policy != ALL_NODE_CANDIDATE_POLICY
-            and len(source.nodes) > self.config.source_context_nodes
-        ):
-            source = local_context_graph(
-                source,
-                anchor_node_id=source_node_id,
-                max_nodes=self.config.source_context_nodes,
-            )
         source_index = next(
             (
                 index
@@ -118,10 +91,6 @@ class NumpyGeometricAlignmentMatcher:
             index
             for index, node in enumerate(target.nodes)
             if node.node_id in allowed
-            and (
-                self.config.candidate_policy == ALL_NODE_CANDIDATE_POLICY
-                or is_actionable(node)
-            )
         ]
         if not candidate_indices:
             return LearnedMatch(None, 0.0, 0.0, "target_candidates_missing", ())
@@ -312,7 +281,7 @@ class NumpyGeometricAlignmentMatcher:
             affinity,
             source_numeric,
             target_numeric,
-            all_nodes=self.config.candidate_policy == ALL_NODE_CANDIDATE_POLICY,
+            all_nodes=True,
         )
         score_components = np.stack(
             (
@@ -362,7 +331,7 @@ class NumpyGeometricAlignmentMatcher:
             final_affinity,
             source_numeric,
             target_numeric,
-            all_nodes=self.config.candidate_policy == ALL_NODE_CANDIDATE_POLICY,
+            all_nodes=True,
         )
         return {"logits_ab": final_assignment, "affinity": final_affinity}
 
@@ -869,3 +838,167 @@ def _standardize(values: Any) -> Any:
 def _softplus(value: Any) -> Any:
     np = _require_numpy()
     return np.logaddexp(np_float(0.0), value)
+
+
+def _visual_inputs(
+    graph: UIGraph,
+    *,
+    patch_size: int,
+    canvas_size: int = 0,
+) -> tuple[Any, Any]:
+    np = _require_numpy()
+    patches = np.zeros(
+        (len(graph.nodes), 3, patch_size, patch_size),
+        dtype=np.float32,
+    )
+    mask = np.zeros((len(graph.nodes), 1), dtype=np.float32)
+    image = _graph_rgb(graph)
+    if image is None:
+        return patches, mask
+    if canvas_size > 0 and max(image.shape[:2]) > canvas_size:
+        scale = float(canvas_size) / float(max(image.shape[:2]))
+        image = _resize_rgb_shape(
+            image,
+            height=max(1, round(image.shape[0] * scale)),
+            width=max(1, round(image.shape[1] * scale)),
+        )
+    image_height, image_width = image.shape[:2]
+    graph_width = float(graph.width or image_width)
+    graph_height = float(graph.height or image_height)
+    if graph_width <= 0.0 or graph_height <= 0.0:
+        return patches, mask
+    for index, node in enumerate(graph.nodes):
+        if bool(node.metadata.get("visual_disabled")) or node.bbox is None:
+            continue
+        left, top, right, bottom = node.bbox
+        x1 = int(math.floor(left / graph_width * image_width))
+        y1 = int(math.floor(top / graph_height * image_height))
+        x2 = int(math.ceil(right / graph_width * image_width))
+        y2 = int(math.ceil(bottom / graph_height * image_height))
+        x1 = min(max(x1, 0), image_width)
+        x2 = min(max(x2, 0), image_width)
+        y1 = min(max(y1, 0), image_height)
+        y2 = min(max(y2, 0), image_height)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        crop = image[y1:y2, x1:x2]
+        patches[index] = _resize_rgb(crop, patch_size).transpose(2, 0, 1)
+        mask[index, 0] = np_float(1.0)
+    return patches, mask
+
+
+def _graph_rgb(graph: UIGraph) -> Any | None:
+    np = _require_numpy()
+    payload = graph.metadata.get("visual_rgb")
+    if isinstance(payload, Mapping):
+        try:
+            width = int(payload["width"])
+            height = int(payload["height"])
+            raw = base64.b64decode(str(payload["data_base64"]), validate=True)
+            if str(payload.get("compression") or "") == "zlib":
+                raw = zlib.decompress(raw)
+            image = np.frombuffer(raw, dtype=np.uint8)
+            if image.size != width * height * 3:
+                return None
+            return image.reshape(height, width, 3)
+        except (KeyError, TypeError, ValueError, zlib.error):
+            return None
+    screenshot_path = str(graph.metadata.get("screenshot_path") or "")
+    if not screenshot_path:
+        return None
+    try:
+        from PIL import Image
+
+        with Image.open(screenshot_path) as image:
+            return np.asarray(image.convert("RGB"), dtype=np.uint8)
+    except (ImportError, OSError, ValueError):
+        return None
+
+
+def _resize_rgb(image: Any, size: int) -> Any:
+    return _resize_rgb_shape(image, height=size, width=size).astype(
+        _require_numpy().float32,
+        copy=False,
+    ) / np_float(255.0)
+
+
+def _resize_rgb_shape(image: Any, *, height: int, width: int) -> Any:
+    np = _require_numpy()
+    source_height, source_width = image.shape[:2]
+    if source_height == height and source_width == width:
+        return image.copy()
+    ys = np.linspace(0.0, max(0, source_height - 1), height, dtype=np.float32)
+    xs = np.linspace(0.0, max(0, source_width - 1), width, dtype=np.float32)
+    y0 = np.floor(ys).astype(np.int64)
+    x0 = np.floor(xs).astype(np.int64)
+    y1 = np.minimum(y0 + 1, source_height - 1)
+    x1 = np.minimum(x0 + 1, source_width - 1)
+    wy = (ys - y0)[:, None, None]
+    wx = (xs - x0)[None, :, None]
+    top = (
+        image[y0[:, None], x0[None, :]].astype(np.float32) * (np_float(1.0) - wx)
+        + image[y0[:, None], x1[None, :]].astype(np.float32) * wx
+    )
+    bottom = (
+        image[y1[:, None], x0[None, :]].astype(np.float32) * (np_float(1.0) - wx)
+        + image[y1[:, None], x1[None, :]].astype(np.float32) * wx
+    )
+    return top * (np_float(1.0) - wy) + bottom * wy
+
+
+def _gelu(values: Any) -> Any:
+    np = _require_numpy()
+    scaled = values * np_float(1.0 / math.sqrt(2.0))
+    sign = np.sign(scaled)
+    absolute = np.abs(scaled)
+    factor = np_float(1.0) / (np_float(1.0) + np_float(0.3275911) * absolute)
+    polynomial = (
+        ((((np_float(1.061405429) * factor - np_float(1.453152027)) * factor
+           + np_float(1.421413741)) * factor - np_float(0.284496736)) * factor
+         + np_float(0.254829592)) * factor
+    )
+    error_function = sign * (
+        np_float(1.0) - polynomial * np.exp(-(absolute * absolute))
+    )
+    return np_float(0.5) * values * (np_float(1.0) + error_function)
+
+
+def _softmax(values: Any, *, axis: int) -> Any:
+    np = _require_numpy()
+    shifted = values - np.max(values, axis=axis, keepdims=True)
+    exponential = np.exp(shifted)
+    return exponential / exponential.sum(axis=axis, keepdims=True)
+
+
+def _log_softmax(values: Any, *, axis: int) -> Any:
+    np = _require_numpy()
+    maximum = np.max(values, axis=axis, keepdims=True)
+    shifted = values - maximum
+    return shifted - np.log(np.exp(shifted).sum(axis=axis, keepdims=True))
+
+
+def _sigmoid(values: Any) -> Any:
+    np = _require_numpy()
+    return np_float(1.0) / (np_float(1.0) + np.exp(-values))
+
+
+def _encode(value: str) -> Any:
+    np = _require_numpy()
+    return np.frombuffer(value.encode("utf-8"), dtype=np.uint8).copy()
+
+
+def _decode(value: Any) -> str:
+    np = _require_numpy()
+    return value.astype(np.uint8, copy=False).tobytes().decode("utf-8")
+
+
+def np_float(value: float) -> Any:
+    return _require_numpy().float32(value)
+
+
+def _require_numpy() -> Any:
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError("NumPy is required for OmniTransfer runtime") from exc
+    return np

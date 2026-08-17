@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 from omnitransfer.mapping_training import load_ui_correspondence_pairs
-from omnitransfer.learned_matcher import MatcherConfig
+from omnitransfer.learned_matcher import ALL_NODE_CANDIDATE_POLICY, MatcherConfig
 
 
 def _node(node_id: str) -> dict[str, object]:
@@ -140,7 +140,7 @@ def test_adapter_retains_set_valued_and_shared_target_labels(tmp_path: Path) -> 
     assert manifest["shared_target_rows_retained"] == 2
 
 
-def test_adapter_supervises_only_actionable_to_actionable_pairs(tmp_path: Path) -> None:
+def test_adapter_preserves_non_actionable_correspondence_labels(tmp_path: Path) -> None:
     record = _record()
     record["matches"] = record["matches"][:2]
     record["source"]["graph"]["nodes"][1]["clickable"] = False
@@ -154,14 +154,41 @@ def test_adapter_supervises_only_actionable_to_actionable_pairs(tmp_path: Path) 
     )
 
     assert len(pairs) == 1
-    assert pairs[0].origin_ids == ("s0->t0",)
-    assert manifest["non_actionable_correspondences_filtered"] == 1
+    assert pairs[0].origin_ids == ("s0->t0", "s1->t1")
     assert {node.node_id for node in pairs[0].graph_a.nodes} == {
         "s0",
         "s1",
         "s2",
         "s3",
     }
+
+
+def test_all_node_adapter_retains_raw_pairs_and_complete_xml_pages(
+    tmp_path: Path,
+) -> None:
+    record = _record()
+    record["matches"] = record["matches"][:2]
+    record["source"]["graph"]["nodes"][1]["clickable"] = False
+    record["target"]["graph"]["nodes"][1]["clickable"] = False
+    path = tmp_path / "all-nodes.jsonl"
+    path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    pairs, _, manifest = load_ui_correspondence_pairs(
+        [path],
+        matcher_config=MatcherConfig(
+            candidate_policy=ALL_NODE_CANDIDATE_POLICY,
+            source_context_nodes=1,
+            target_context_nodes=1,
+        ),
+        allow_unreviewed_pseudo=True,
+    )
+
+    assert len(pairs) == 1
+    assert pairs[0].origin_ids == ("s0->t0", "s1->t1")
+    assert len(pairs[0].graph_a.nodes) == 4
+    assert len(pairs[0].graph_b.nodes) == 5
+    assert manifest["accepted_correspondences"] == 2
+    assert manifest["training_boundary"]["all_xml_nodes_are_candidates"] is True
 
 
 def test_adapter_resolves_materialized_review_screenshot(tmp_path: Path) -> None:
@@ -206,7 +233,33 @@ def test_adapter_resolves_portable_trace_screenshot_suffix(tmp_path: Path) -> No
     assert pairs[0].graph_a.metadata["screenshot_path"] == str(materialized)
 
 
-def test_adapter_bounds_local_context_around_all_matches(tmp_path: Path) -> None:
+def test_adapter_resolves_portable_runtime_screenshot_suffix(
+    tmp_path: Path,
+) -> None:
+    record = _record()
+    record["matches"] = record["matches"][:2]
+    record["source"]["screenshot_path"] = (
+        "/Users/example/OmniTransfer/runtime/evals/widget_mapping/app/iOS/0.png"
+    )
+    path = tmp_path / "diagnostic.jsonl"
+    path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    snapshot = tmp_path / "snapshot"
+    materialized = (
+        snapshot / "runtime/evals/widget_mapping/app/iOS/0.png"
+    )
+    materialized.parent.mkdir(parents=True)
+    materialized.write_bytes(b"not-decoded-during-adaptation")
+
+    pairs, _, _ = load_ui_correspondence_pairs(
+        [path],
+        allow_unreviewed_pseudo=True,
+        screenshot_root=snapshot,
+    )
+
+    assert pairs[0].graph_a.metadata["screenshot_path"] == str(materialized)
+
+
+def test_adapter_preserves_every_xml_node(tmp_path: Path) -> None:
     record = _record()
     record["matches"] = record["matches"][:2]
     source_context_node = _node("s4")
@@ -228,17 +281,14 @@ def test_adapter_bounds_local_context_around_all_matches(tmp_path: Path) -> None
         allow_unreviewed_pseudo=True,
     )
 
-    assert len(pairs[0].graph_a.nodes) == 4
-    assert len(pairs[0].graph_b.nodes) == 5
+    assert len(pairs[0].graph_a.nodes) == 20
+    assert len(pairs[0].graph_b.nodes) == 20
     assert {"s0", "s1"} <= {node.node_id for node in pairs[0].graph_a.nodes}
     assert {"t0", "t1"} <= {node.node_id for node in pairs[0].graph_b.nodes}
-    assert manifest["training_boundary"]["local_context_limits"] == {
-        "source": 4,
-        "target": 5,
-    }
+    assert manifest["training_boundary"]["all_xml_nodes_are_preserved"] is True
 
 
-def test_adapter_keeps_every_actionable_hard_negative_beyond_context_limit(
+def test_adapter_keeps_every_node_beyond_context_metadata(
     tmp_path: Path,
 ) -> None:
     record = _record()
@@ -258,7 +308,7 @@ def test_adapter_keeps_every_actionable_hard_negative_beyond_context_limit(
     assert all(node.clickable for node in pairs[0].graph_b.nodes)
 
 
-def test_adapter_does_not_lift_descendant_labels_to_actionable_ancestors(
+def test_adapter_keeps_descendant_labels_without_lifting_to_ancestors(
     tmp_path: Path,
 ) -> None:
     record = _record()
@@ -356,7 +406,10 @@ def test_adapter_does_not_lift_descendant_labels_to_actionable_ancestors(
         minimum_correspondences=1,
     )
 
-    assert pairs == []
+    assert len(pairs) == 1
+    assert pairs[0].origin_ids == (
+        "source-title->target-sound-title",
+        "source-summary->target-sound-summary",
+    )
     assert manifest["explicit_correspondences"] == 2
-    assert manifest["non_actionable_correspondences_filtered"] == 2
-    assert manifest["accepted_correspondences"] == 0
+    assert manifest["accepted_correspondences"] == 2

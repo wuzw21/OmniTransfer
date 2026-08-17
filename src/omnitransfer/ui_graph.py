@@ -522,6 +522,9 @@ def _node_metadata(payload: dict[str, Any]) -> dict[str, Any]:
             _first_present(payload, ("visible", "is_visible", "isVisible"))
         ),
     }
+    declared_metadata = payload.get("metadata")
+    if isinstance(declared_metadata, dict):
+        metadata.update(declared_metadata)
     visual_bbox = _parse_bounds(
         _first_present(payload, ("visual-bbox", "visual_bbox"))
     )

@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 from typing import Any, Iterable
 
-from omnitransfer.learned_matcher import MatcherConfig
+from omnitransfer.learned_matcher import ALL_NODE_CANDIDATE_POLICY, MatcherConfig
 from omnitransfer.mapping_dataset import validate_ui_correspondence_pair
 from omnitransfer.self_supervised import (
     CorrespondencePair,
@@ -16,9 +16,7 @@ from omnitransfer.self_supervised import (
 )
 from omnitransfer.ui_graph import (
     UIGraph,
-    UINode,
     graph_from_record,
-    multi_anchor_context_graph,
 )
 
 
@@ -46,6 +44,8 @@ def load_ui_correspondence_pairs(
         raise ValueError("reserved splits may contain only dev and test")
     pairs: list[CorrespondencePair] = []
     config = matcher_config or MatcherConfig()
+    if config.candidate_policy != ALL_NODE_CANDIDATE_POLICY:
+        raise ValueError("training accepts only the all-node candidate policy")
     graphs: dict[str, UIGraph] = {}
     skipped: Counter[str] = Counter()
     datasets: Counter[str] = Counter()
@@ -55,7 +55,6 @@ def load_ui_correspondence_pairs(
     explicit_correspondences = 0
     set_valued_rows = 0
     shared_target_rows = 0
-    non_actionable_correspondences = 0
     assets = (
         Path(screenshot_root).expanduser().resolve()
         if screenshot_root is not None
@@ -105,43 +104,9 @@ def load_ui_correspondence_pairs(
                 explicit_correspondences += len(correspondences)
                 set_valued_rows += row_stats["set_valued_rows"]
                 shared_target_rows += row_stats["shared_target_rows"]
-                source_nodes = {node.node_id: node for node in source_graph.nodes}
-                target_nodes = {node.node_id: node for node in target_graph.nodes}
-                actionable_correspondences = [
-                    (source_id, target_id)
-                    for source_id, target_id in correspondences
-                    if _is_actionable(source_nodes[source_id])
-                    and _is_actionable(target_nodes[target_id])
-                ]
-                non_actionable_correspondences += len(correspondences) - len(
-                    actionable_correspondences
-                )
-                correspondences = actionable_correspondences
                 if len(correspondences) < minimum_correspondences:
-                    skipped["too_few_actionable_correspondences"] += 1
+                    skipped["too_few_correspondences"] += 1
                     continue
-                source_actionable_ids = tuple(
-                    node.node_id for node in source_graph.nodes if _is_actionable(node)
-                )
-                target_actionable_ids = tuple(
-                    node.node_id for node in target_graph.nodes if _is_actionable(node)
-                )
-                source_graph = multi_anchor_context_graph(
-                    source_graph,
-                    anchor_node_ids=source_actionable_ids,
-                    max_nodes=max(
-                        config.source_context_nodes,
-                        len(source_actionable_ids),
-                    ),
-                )
-                target_graph = multi_anchor_context_graph(
-                    target_graph,
-                    anchor_node_ids=target_actionable_ids,
-                    max_nodes=max(
-                        config.target_context_nodes,
-                        len(target_actionable_ids),
-                    ),
-                )
                 try:
                     pair = make_correspondence_training_pair(
                         source_graph,
@@ -171,7 +136,7 @@ def load_ui_correspondence_pairs(
         "explicit_correspondences": explicit_correspondences,
         "set_valued_match_rows_retained": set_valued_rows,
         "shared_target_rows_retained": shared_target_rows,
-        "non_actionable_correspondences_filtered": non_actionable_correspondences,
+        "candidate_policy": config.candidate_policy,
         "allow_unreviewed_pseudo": allow_unreviewed_pseudo,
         "minimum_correspondences": minimum_correspondences,
         "allowed_splits": sorted(allowed_splits),
@@ -188,25 +153,16 @@ def load_ui_correspondence_pairs(
             "stable_ids_are_label_only": True,
             "set_valued_rows_are_retained": True,
             "shared_targets_are_retained": True,
-            "actionable_correspondence_only": True,
-            "non_actionable_nodes_are_context_only": True,
-            "same_screen_actionable_nodes_are_candidates": True,
+            "all_xml_nodes_are_candidates": True,
+            "all_xml_nodes_are_preserved": True,
             "raw_resource_id_model_input": False,
             "absolute_position_model_input": False,
-            "local_context_limits": {
-                "source": config.source_context_nodes,
-                "target": config.target_context_nodes,
-            },
             "model_input": (
                 "text_content_desc_class_action_visual_plus_within_page_relations"
             ),
         },
     }
     return pairs, list(graphs.values()), manifest
-
-
-def _is_actionable(node: UINode) -> bool:
-    return bool(node.enabled and (node.clickable or node.editable or node.scrollable))
 
 
 def _page_graph(
@@ -241,7 +197,7 @@ def _resolve_screenshot_path(value: str, *, screenshot_root: Path | None) -> str
         relative = screenshot_root / original
         if relative.is_file():
             return str(relative)
-    for marker in ("traces", "screenshots"):
+    for marker in ("runtime", "traces", "screenshots"):
         if marker not in original.parts:
             continue
         suffix = Path(*original.parts[original.parts.index(marker) :])
@@ -279,7 +235,3 @@ def _correspondence_edges(
             for target_id in match["target_node_ids"]
         ),
     }
-
-
-# Compatibility name for callers written before the RCAM naming migration.
-load_mapping_training_pairs = load_ui_correspondence_pairs

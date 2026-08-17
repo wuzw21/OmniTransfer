@@ -1,11 +1,14 @@
 # OmniTransfer direct-text alignment v9
 
-This directory contains the immutable checkpoint for replay release
-`omnitransfer-direct-text-alignment-v9.3.0`.
+This directory contains the immutable training checkpoint for v9.3.0 and the
+NumPy checkpoint used by replay release
+`omnitransfer-direct-text-alignment-v9.3.1-mobile`.
 
 ```text
 File           v9_direct_text_alignment_seed29.pt
 SHA-256        d1fcbfd3e4a79d74ca0bb5dc2a101360dc4e0942c31be3c83405363c58d212e4
+Runtime file   v9_direct_text_alignment_seed29.npz
+Runtime SHA-256 b8a6735bd97a7163ad186ec4c869eebbb05634522472035bd9c3b9bc323c5e9e
 Architecture   omnitransfer_geometric_alignment_v9
 Text encoder   direct_text_evidence
 Parameters     177,372 total; 7,978 alignment

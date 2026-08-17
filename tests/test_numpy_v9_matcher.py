@@ -3,14 +3,16 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-import torch
+import pytest
 
-from omnitransfer.learned_matcher import RelationAwareMatcher
+from omnitransfer.learned_matcher import GeometricMatcher
 from omnitransfer.numpy_v9_matcher import (
     NumpyGeometricAlignmentMatcher,
     save_numpy_geometric_v9_checkpoint,
 )
 from omnitransfer.ui_graph import graph_from_record
+
+torch = pytest.importorskip("torch", exc_type=ImportError)
 
 
 CHECKPOINT = (
@@ -47,7 +49,7 @@ TARGET_XML = SOURCE_XML.replace(
 
 def _export(path: Path) -> None:
     payload = torch.load(CHECKPOINT, map_location="cpu", weights_only=False)
-    matcher = RelationAwareMatcher.from_checkpoint(CHECKPOINT)
+    matcher = GeometricMatcher.from_checkpoint(CHECKPOINT)
     save_numpy_geometric_v9_checkpoint(
         path,
         payload["state_dict"],
@@ -75,7 +77,7 @@ def test_v9_numpy_matches_pytorch_candidate_ranking(tmp_path: Path) -> None:
     source_node = next(node for node in source.nodes if node.content_desc == "搜索")
     candidates = tuple(node.node_id for node in target.nodes if node.clickable)
 
-    pytorch_match = RelationAwareMatcher.from_checkpoint(CHECKPOINT).predict(
+    pytorch_match = GeometricMatcher.from_checkpoint(CHECKPOINT).predict(
         source,
         target,
         source_node_id=source_node.node_id,

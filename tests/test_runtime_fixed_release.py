@@ -15,11 +15,11 @@ TARGET_XML = """<hierarchy bounds="[0,0][200,400]"><node text="Cancel" class="an
 def test_runtime_ignores_checkpoint_override_and_loads_frozen_artifacts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[tuple[str, str]] = []
-    sentinel = SimpleNamespace(backend="pytorch")
+    calls: list[str] = []
+    sentinel = SimpleNamespace(backend="numpy-v9")
 
-    def load(checkpoint: str, device: str):
-        calls.append((checkpoint, device))
+    def load(checkpoint: str):
+        calls.append(checkpoint)
         return sentinel
 
     monkeypatch.setattr(runtime, "_load_matcher", load)
@@ -30,12 +30,7 @@ def test_runtime_ignores_checkpoint_override_and_loads_frozen_artifacts(
     monkeypatch.setenv("OMNITRANSFER_MATCHER_DEVICE", "cpu")
 
     assert runtime._get_matcher() is sentinel
-    assert calls == [
-        (
-            str(runtime._DEFAULT_MATCHER_CHECKPOINT.resolve()),
-            "cpu",
-        )
-    ]
+    assert calls == [str(runtime._DEFAULT_MATCHER_CHECKPOINT.resolve())]
 
 
 def test_frozen_checkpoint_hash_matches_release_manifest() -> None:
@@ -61,7 +56,7 @@ def test_learned_result_records_frozen_release_and_unambiguous_scores(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class Matcher:
-        backend = "pytorch"
+        backend = "numpy-v9"
 
         def predict(
             self,
@@ -92,7 +87,7 @@ def test_learned_result_records_frozen_release_and_unambiguous_scores(
     monkeypatch.setenv("OMNITRANSFER_MATCHER_MIN_PROBABILITY", "0.99")
     monkeypatch.setenv("OMNITRANSFER_MATCHER_MIN_MARGIN", "0.99")
 
-    result = runtime.action_transfer(
+    result = runtime.rank_action_candidates(
         source_xml=SOURCE_XML,
         target_xml=TARGET_XML,
         source_point=(30.0, 40.0),
@@ -105,7 +100,7 @@ def test_learned_result_records_frozen_release_and_unambiguous_scores(
     assert result["matcher_release"] == (
         "omnitransfer-direct-text-alignment-v9.3.1-mobile"
     )
-    assert result["matcher_backend"] == "pytorch"
+    assert result["matcher_backend"] == "numpy-v9"
     assert (
         result["matcher_checkpoint_sha256"]
         == runtime._DEFAULT_MATCHER_SHA256

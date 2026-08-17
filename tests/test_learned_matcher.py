@@ -1,599 +1,173 @@
-import math
-import random
-from dataclasses import asdict
+from dataclasses import replace
 
 import pytest
 
 from omnitransfer.learned_matcher import (
-    LEGACY_ATTENTION_ARCHITECTURE,
-    RelationAwareMatcher,
-    MatcherConfig,
-    NUMERIC_FEATURE_DIM,
+    ALL_NODE_CANDIDATE_POLICY,
+    DIRECT_PAIR_EVIDENCE_NAMES,
+    DIRECT_TEXT_EVIDENCE_ENCODER,
+    OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE,
     RELATION_FEATURE_DIM,
-    build_relation_aware_matcher,
-    cross_relation_features,
+    XML_NODE_FEATURE_DIM,
+    MatcherConfig,
+    GeometricMatcher,
+    build_geometric_v9_matcher,
+    direct_pair_evidence_features,
     encode_graph,
+    initialize_direct_text_from_lookup,
     matcher_inputs,
-    mutual_log_assignment,
-    parameter_count,
     save_matcher_checkpoint,
+    spatial_xml_alignment_choice,
 )
-from omnitransfer.self_supervised import (
-    AugmentConfig,
-    make_correspondence_training_pair,
-    make_training_pair,
-    matching_loss,
-)
-from omnitransfer.ui_graph import UIGraph, UINode, graph_from_record
+from omnitransfer.ui_graph import graph_from_record
 
 
-def _graph(graph_id: str, *, delete_y: int = 10):
+def _graph(graph_id: str, *, first_x: int = 10, second_x: int = 80):
     return graph_from_record(
         {
             "screen_id": graph_id,
             "width": 100,
             "height": 100,
             "nodes": [
-                {"node_id": "root", "class": "Root", "bounds": [0, 0, 100, 100]},
                 {
-                    "node_id": "delete",
-                    "parent_id": "root",
-                    "text": "Delete item",
-                    "resource-id": "app:id/delete_item",
-                    "class": "Button",
-                    "clickable": True,
-                    "bounds": [5, delete_y, 45, delete_y + 20],
+                    "node_id": "root",
+                    "class": "Root",
+                    "bounds": [0, 0, 100, 100],
                 },
                 {
-                    "node_id": "archive",
+                    "node_id": "list",
                     "parent_id": "root",
-                    "text": "Archive item",
-                    "resource-id": "app:id/archive_item",
-                    "class": "Button",
-                    "clickable": True,
-                    "bounds": [55, 10, 95, 30],
+                    "class": "List",
+                    "bounds": [0, 0, 100, 100],
                 },
                 {
-                    "node_id": "label",
-                    "parent_id": "root",
-                    "text": "Item 1",
+                    "node_id": "first",
+                    "parent_id": "list",
+                    "text": "First control",
+                    "class": "Button",
+                    "clickable": True,
+                    "bounds": [first_x, 10, first_x + 10, 20],
+                },
+                {
+                    "node_id": "second",
+                    "parent_id": "list",
+                    "text": "Different control",
+                    "class": "Button",
+                    "clickable": True,
+                    "bounds": [second_x, 10, second_x + 10, 20],
+                },
+                {
+                    "node_id": "context",
+                    "parent_id": "list",
+                    "text": "Context",
                     "class": "TextView",
-                    "bounds": [5, 40, 95, 60],
+                    "bounds": [40, 50, 60, 60],
                 },
             ],
         }
     )
 
 
-def test_graph_encoder_exposes_learned_tokens_and_relations() -> None:
+def test_default_config_is_the_only_trainable_model() -> None:
+    config = MatcherConfig()
+
+    assert config.architecture == OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE
+    assert config.candidate_policy == ALL_NODE_CANDIDATE_POLICY
+
+
+def test_historical_architectures_are_rejected() -> None:
+    with pytest.raises(ValueError, match="only the geometric-v9"):
+        build_geometric_v9_matcher(MatcherConfig(architecture="removed_model"))
+
+
+def test_graph_encoder_preserves_current_feature_contract() -> None:
     encoded = encode_graph(_graph("source"))
 
-    assert len(encoded.numeric_features[0]) == NUMERIC_FEATURE_DIM
+    assert len(encoded.numeric_features[0]) == XML_NODE_FEATURE_DIM
     assert len(encoded.relation_features[0][0]) == RELATION_FEATURE_DIM
-    assert encoded.token_ids[1] != encoded.token_ids[2]
-    assert encoded.relation_features[0][1][1] == 1.0
-    assert encoded.relation_features[1][2][3] == 1.0
-    assert encoded.relation_features[1][2][7] == 0.0
+    assert encoded.token_ids[2] != encoded.token_ids[3]
+    assert encoded.relation_features[0][2][4] == 1.0
+    assert encoded.relation_features[2][3][3] == 1.0
 
 
-def test_node_encoding_ignores_resource_id_and_absolute_position() -> None:
-    source = graph_from_record(
-        {
-            "screen_id": "source",
-            "width": 100,
-            "height": 100,
-            "nodes": [
-                {
-                    "node_id": "action",
-                    "text": "Search",
-                    "content-desc": "Find items",
-                    "resource-id": "source:id/search",
-                    "class": "EditText",
-                    "clickable": True,
-                    "editable": True,
-                    "bounds": [0, 0, 40, 20],
-                }
-            ],
-        }
-    )
-    target = graph_from_record(
-        {
-            "screen_id": "target",
-            "width": 100,
-            "height": 100,
-            "nodes": [
-                {
-                    "node_id": "action",
-                    "text": "Search",
-                    "content-desc": "Find items",
-                    "resource-id": "target:id/completely_different",
-                    "class": "EditText",
-                    "clickable": True,
-                    "editable": True,
-                    "bounds": [55, 70, 95, 90],
-                }
-            ],
-        }
+def test_direct_pair_evidence_has_one_fixed_schema() -> None:
+    source = _graph("source").nodes[2]
+    target = replace(_graph("target").nodes[2], text=source.text)
+
+    evidence = direct_pair_evidence_features(source, target)
+
+    assert len(evidence) == len(DIRECT_PAIR_EVIDENCE_NAMES)
+    assert evidence[0] == 1.0
+
+
+def test_spatial_xml_alignment_can_resolve_semantic_ambiguity() -> None:
+    source = _graph("source", first_x=10, second_x=80)
+    target = _graph("target", first_x=80, second_x=10)
+    source_node = source.nodes[2]
+    target_nodes = (target.nodes[2], target.nodes[3])
+
+    choice = spatial_xml_alignment_choice(
+        (10.0, 8.5),
+        source_node=source_node,
+        target_nodes=target_nodes,
+        source_graph=source,
+        target_graph=target,
     )
 
-    encoded_source = encode_graph(source)
-    encoded_target = encode_graph(target)
-
-    assert encoded_source.token_ids == encoded_target.token_ids
-    assert encoded_source.numeric_features == encoded_target.numeric_features
-    assert not cross_relation_features(source, target).any()
+    assert choice == 1
 
 
-def test_relation_matcher_forward_and_partial_assignment_loss() -> None:
-    pytest.importorskip("torch")
-    config = MatcherConfig(hidden_dim=64, num_heads=4, num_layers=1, dropout=0.0)
-    graph = _graph("train")
-    pair = make_training_pair(
-        graph,
-        rng=random.Random(9),
-        config=AugmentConfig(
-            drop_node_prob=0.0,
-            distractor_prob=1.0,
-            max_distractors=1,
-            bbox_jitter=0.0,
-            global_translation=0.0,
-            global_scale=0.0,
-        ),
-        matcher_config=config,
-    )
-    assert pair is not None
-    model = build_relation_aware_matcher(config)
-
-    output = model(*matcher_inputs(pair.graph_a, pair.graph_b, config=config))
-    loss = matching_loss(model, pair, matcher_config=config)
-
-    assert output["logits_ab"].shape == (
-        len(pair.graph_a.nodes),
-        len(pair.graph_b.nodes),
-    )
-    assert output["logits_ba"].shape == (
-        len(pair.graph_b.nodes),
-        len(pair.graph_a.nodes),
-    )
-    assert math.isfinite(float(loss.detach()))
-    loss.backward()
-    assert any(parameter.grad is not None for parameter in model.parameters())
-    assert parameter_count(model) < 1_500_000
-    assert len(output["assignment_scores_by_layer"]) == config.num_layers
-    assert len(output["attention_by_layer"]) == config.num_layers
-
-
-def test_mutual_log_assignment_normalizes_both_matching_directions() -> None:
-    torch = pytest.importorskip("torch")
-    affinity = torch.tensor(
-        [[4.0, 1.0, -1.0], [2.0, 3.0, 0.0]],
-        requires_grad=True,
-    )
-
-    scores = mutual_log_assignment(affinity)
-    expected = 0.5 * (
-        torch.log_softmax(affinity, dim=1)
-        + torch.log_softmax(affinity, dim=0)
-    )
-
-    assert torch.allclose(scores, expected)
-    scores.sum().backward()
-    assert affinity.grad is not None
-    assert torch.isfinite(affinity.grad).all()
-
-
-def test_omnitransfer_defaults_to_learned_pair_compatibility() -> None:
-    assert MatcherConfig().assignment_head == "partial_assignment"
-
-
-def test_omnitransfer_public_names_share_one_implementation() -> None:
-    from omnitransfer.learned_matcher import (
-        OmniTransferMatcher,
-        RelationAwareMatcher,
-        build_omnitransfer_matcher,
-        build_relation_aware_matcher,
-    )
-    from omnitransfer.self_supervised import (
-        train_omnitransfer_matcher,
-        train_relation_aware_matcher,
-    )
-
-    assert OmniTransferMatcher is RelationAwareMatcher
-    assert build_omnitransfer_matcher is build_relation_aware_matcher
-    assert train_omnitransfer_matcher is train_relation_aware_matcher
-
-
-def test_omnitransfer_refines_one_soft_assignment_per_attention_layer() -> None:
-    torch = pytest.importorskip("torch")
+def test_geometric_v9_checkpoint_round_trips(tmp_path) -> None:
+    torch = pytest.importorskip("torch", exc_type=ImportError)
     config = MatcherConfig(
         hidden_dim=32,
+        relation_hidden_dim=16,
+        association_dim=24,
         num_heads=4,
         num_layers=2,
         dropout=0.0,
     )
+    model = build_geometric_v9_matcher(config).eval()
     source = _graph("source")
-    target = _graph("target")
-    model = build_relation_aware_matcher(config)
-
-    output = model(*matcher_inputs(source, target, config=config))
-
-    assert len(output["assignment_scores_by_layer"]) == 2
-    assert len(output["affinities_by_layer"]) == 2
-    assert torch.equal(
-        output["logits_ab"],
-        output["assignment_scores_by_layer"][-1],
-    )
-    assert torch.equal(output["logits_ba"], output["logits_ab"].T)
-    assert torch.equal(output["affinity"], output["affinities_by_layer"][-1])
-
-
-def test_graph_attention_learns_anonymous_actions_from_child_text() -> None:
-    torch = pytest.importorskip("torch")
-
-    def anonymous_tabs(
-        graph_id: str,
-        rows: tuple[tuple[str, str], ...],
-    ) -> UIGraph:
-        nodes = [UINode(node_id="root", origin_id="root", class_name="Root")]
-        for node_id, label in rows:
-            label_id = f"{node_id}-label"
-            nodes.extend(
-                (
-                    UINode(
-                        node_id=node_id,
-                        origin_id=node_id,
-                        class_name="LinearLayout",
-                        clickable=True,
-                        parent_id="root",
-                        child_ids=(label_id,),
-                    ),
-                    UINode(
-                        node_id=label_id,
-                        origin_id=label_id,
-                        class_name="TextView",
-                        text=label,
-                        parent_id=node_id,
-                    ),
-                )
-            )
-        return UIGraph(graph_id=graph_id, nodes=tuple(nodes))
-
-    source = anonymous_tabs(
-        "source-tabs",
-        (("source-library", "Library"), ("source-discover", "Discover")),
-    )
-    target = anonymous_tabs(
-        "target-tabs",
-        (("target-discover", "Discover"), ("target-library", "Library")),
-    )
-    config = MatcherConfig(
-        token_dim=24,
-        hidden_dim=32,
-        relation_hidden_dim=16,
-        num_heads=4,
-        num_layers=1,
-        dropout=0.0,
-        source_context_nodes=16,
-        target_context_nodes=16,
-    )
-    pair = make_correspondence_training_pair(
-        source,
-        target,
-        (
-            ("source-library", "target-library"),
-            ("source-discover", "target-discover"),
-        ),
-        matcher_config=config,
-    )
-    torch.manual_seed(17)
-    model = build_relation_aware_matcher(config)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3.0e-3)
-
-    for _ in range(12):
-        optimizer.zero_grad(set_to_none=True)
-        loss = matching_loss(
-            model,
-            pair,
-            matcher_config=config,
-            cycle_weight=0.0,
-        )
-        loss.backward()
-        optimizer.step()
+    target = _graph("target", first_x=15, second_x=75)
 
     with torch.no_grad():
         output = model(*matcher_inputs(source, target, config=config))
-    actionable_scores = output["logits_ab"][[1, 3]][:, [1, 3]]
 
-    assert torch.argmax(actionable_scores, dim=1).tolist() == [1, 0]
+    assert output["logits_ab"].shape == (len(source.nodes), len(target.nodes))
+    assert output["affinity"].shape == output["logits_ab"].shape
+    checkpoint = tmp_path / "geometric-v9.pt"
+    save_matcher_checkpoint(checkpoint, model, config=config)
+    restored = GeometricMatcher.from_checkpoint(checkpoint)
+    assert restored.config == config
 
 
-def test_mutual_projection_reports_one_assignment_per_attention_layer() -> None:
-    torch = pytest.importorskip("torch")
-    config = MatcherConfig(
+def test_direct_text_release_conversion_preserves_zero_lookup(tmp_path) -> None:
+    torch = pytest.importorskip("torch", exc_type=ImportError)
+    learned_config = MatcherConfig(
         hidden_dim=32,
+        relation_hidden_dim=16,
+        association_dim=24,
         num_heads=4,
         num_layers=2,
         dropout=0.0,
-        architecture=LEGACY_ATTENTION_ARCHITECTURE,
-        assignment_head="mutual_projection",
     )
-    source = _graph("source")
-    target = _graph("target")
-    model = build_relation_aware_matcher(config)
-
-    output = model(*matcher_inputs(source, target, config=config))
-
-    assert len(output["assignment_scores_by_layer"]) == 2
-    assert len(output["affinities_by_layer"]) == 2
-    assert torch.equal(
-        output["logits_ab"],
-        output["assignment_scores_by_layer"][-1],
+    direct_config = replace(
+        learned_config,
+        text_encoder=DIRECT_TEXT_EVIDENCE_ENCODER,
     )
-    assert torch.equal(output["logits_ba"], output["logits_ab"].T)
-    assert torch.equal(output["affinity"], output["affinities_by_layer"][-1])
-
-
-def test_context_masking_input_keeps_class_action_and_relations(tmp_path) -> None:
-    torch = pytest.importorskip("torch")
-    image_module = pytest.importorskip("PIL.Image")
-    screenshot = tmp_path / "screen.png"
-    image_module.new("RGB", (100, 100), color=(120, 80, 40)).save(screenshot)
-    base = _graph("masked-source")
-    source = UIGraph(
-        **{
-            **base.__dict__,
-            "metadata": {"screenshot_path": str(screenshot)},
-        }
-    )
-    target = _graph("target")
-    plain = matcher_inputs(source, target)
-
-    masked = matcher_inputs(
-        source,
-        target,
-        source_context_mask_indices=(1,),
-    )
-
-    assert not torch.equal(masked[0][1], plain[0][1])
-    assert torch.equal(masked[0][2], plain[0][2])
-    assert torch.count_nonzero(masked[0][1]) > 0
-    assert torch.equal(masked[1], plain[1])
-    assert torch.equal(masked[2], plain[2])
-    assert masked[8][1].item() == 0.0
-    assert plain[8][1].item() == 1.0
-    assert torch.equal(masked[3], plain[3])
-
-
-def test_visual_modality_dropout_uses_missing_visual_path(tmp_path) -> None:
-    torch = pytest.importorskip("torch")
-    image_module = pytest.importorskip("PIL.Image")
-    screenshot = tmp_path / "screen.png"
-    image_module.new("RGB", (100, 100), color=(80, 120, 160)).save(screenshot)
-    base = _graph("visual-dropout")
-    graph = UIGraph(
-        **{
-            **base.__dict__,
-            "metadata": {"screenshot_path": str(screenshot)},
-        }
-    )
-
-    pair = make_training_pair(
-        graph,
-        rng=random.Random(13),
-        config=AugmentConfig(
-            drop_node_prob=0.0,
-            distractor_prob=0.0,
-            visual_dropout_prob=1.0,
-        ),
-    )
-
-    assert pair is not None
-    inputs = matcher_inputs(pair.graph_a, pair.graph_b)
-    assert torch.count_nonzero(inputs[8]) == 0
-    assert torch.count_nonzero(inputs[10]) == 0
-
-
-def test_inference_adapter_rejects_low_pair_confidence() -> None:
-    torch = pytest.importorskip("torch")
-    source = _graph("source")
-    target = _graph("target", delete_y=60)
-
-    class LowConfidenceModel(torch.nn.Module):
-        def forward(self, *inputs):
-            source_count = inputs[0].shape[0]
-            target_count = inputs[3].shape[0]
-            logits_ab = torch.zeros((source_count, target_count))
-            logits_ab[:, 1] = 2.0
-            logits_ba = torch.zeros((target_count, source_count))
-            affinity = torch.full((source_count, target_count), -10.0)
-            return {
-                "logits_ab": logits_ab,
-                "logits_ba": logits_ba,
-                "affinity": affinity,
-            }
-
-    result = RelationAwareMatcher(LowConfidenceModel()).predict(
-        source,
-        target,
-        source_node_id="delete",
-        min_probability=0.5,
-    )
-
-    assert result.target_node is None
-    assert result.reason == "learned_low_confidence"
-    assert result.probability < 0.5
-
-
-def test_inference_ranks_only_actionable_target_nodes() -> None:
-    torch = pytest.importorskip("torch")
+    learned = build_geometric_v9_matcher(learned_config).eval()
+    direct = build_geometric_v9_matcher(direct_config).eval()
+    learned.token_embedding.weight.data.zero_()
+    initialize_direct_text_from_lookup(direct, learned)
     source = _graph("source")
     target = _graph("target")
 
-    class ContextBiasedModel(torch.nn.Module):
-        def forward(self, *inputs):
-            source_count = inputs[0].shape[0]
-            target_count = inputs[3].shape[0]
-            logits_ab = torch.zeros((source_count, target_count))
-            logits_ab[:, 3] = 100.0
-            logits_ab[:, 1] = 10.0
-            logits_ba = torch.zeros((target_count, source_count))
-            return {
-                "logits_ab": logits_ab,
-                "logits_ba": logits_ba,
-                "affinity": logits_ab,
-            }
+    with torch.no_grad():
+        expected = learned(*matcher_inputs(source, target, config=learned_config))
+        actual = direct(*matcher_inputs(source, target, config=direct_config))
 
-    result = RelationAwareMatcher(ContextBiasedModel()).predict(
-        source,
-        target,
-        source_node_id="delete",
-    )
-
-    assert result.target_node is not None
-    assert result.target_node.node_id == "delete"
-
-
-def test_visual_encoder_is_jointly_trained_when_screenshots_exist(tmp_path) -> None:
-    pytest.importorskip("torch")
-    image_module = pytest.importorskip("PIL.Image")
-    screenshot = tmp_path / "screen.png"
-    image_module.new("RGB", (100, 100), color=(120, 80, 40)).save(screenshot)
-    source_base = _graph("visual-source")
-    target_base = _graph("visual-target", delete_y=60)
-    source = UIGraph(
-        **{
-            **source_base.__dict__,
-            "metadata": {"screenshot_path": str(screenshot)},
-        }
-    )
-    target = UIGraph(
-        **{
-            **target_base.__dict__,
-            "metadata": {"screenshot_path": str(screenshot)},
-        }
-    )
-    config = MatcherConfig(hidden_dim=32, num_heads=4, num_layers=1, dropout=0.0)
-    model = build_relation_aware_matcher(config)
-    inputs = matcher_inputs(source, target, config=config)
-
-    output = model(*inputs)
-    output["logits_ab"].mean().backward()
-
-    assert len(inputs) == 11
-    assert inputs[8].sum().item() == len(source.nodes)
-    assert inputs[10].sum().item() == len(target.nodes)
-    assert model.visual_encoder[0].weight.grad is not None
-
-
-def test_visual_crop_follows_element_identity_during_layout_augmentation(
-    tmp_path,
-) -> None:
-    torch = pytest.importorskip("torch")
-    image_module = pytest.importorskip("PIL.Image")
-    screenshot = tmp_path / "screen.png"
-    image = image_module.new("RGB", (100, 100), color=(0, 0, 255))
-    image.paste((255, 0, 0), (0, 0, 50, 100))
-    image.save(screenshot)
-    node = UINode(
-        node_id="moved",
-        origin_id="element",
-        bbox=(50.0, 0.0, 100.0, 100.0),
-        metadata={"visual_bbox": (0.0, 0.0, 50.0, 100.0)},
-    )
-    graph = UIGraph(
-        graph_id="augmented",
-        nodes=(node,),
-        width=100,
-        height=100,
-        metadata={"screenshot_path": str(screenshot)},
-    )
-
-    source_visual = matcher_inputs(graph, graph)[7]
-
-    assert torch.mean(source_visual[0, 0]) > 0.9
-    assert torch.mean(source_visual[0, 2]) < 0.1
-
-
-def test_train_only_visual_transform_changes_local_appearance(tmp_path) -> None:
-    torch = pytest.importorskip("torch")
-    image_module = pytest.importorskip("PIL.Image")
-    screenshot = tmp_path / "screen.png"
-    image_module.new("RGB", (20, 20), color=(100, 100, 100)).save(screenshot)
-    node = UINode(node_id="node", origin_id="node", bbox=(0, 0, 20, 20))
-    plain = UIGraph(
-        graph_id="plain",
-        nodes=(node,),
-        width=20,
-        height=20,
-        metadata={"screenshot_path": str(screenshot)},
-    )
-    augmented = UIGraph(
-        graph_id="augmented",
-        nodes=(node,),
-        width=20,
-        height=20,
-        metadata={
-            "screenshot_path": str(screenshot),
-            "visual_transform": {
-                "brightness": 0.1,
-                "contrast": 1.0,
-                "channel_scale": [1.0, 1.0, 1.0],
-            },
-        },
-    )
-
-    plain_visual = matcher_inputs(plain, plain)[7]
-    augmented_visual = matcher_inputs(augmented, augmented)[7]
-
-    assert torch.mean(augmented_visual) > torch.mean(plain_visual)
-
-
-def test_visual_checkpoint_round_trip(tmp_path) -> None:
-    torch = pytest.importorskip("torch")
-    config = MatcherConfig(hidden_dim=32, num_heads=4, num_layers=1, dropout=0.0)
-    model = build_relation_aware_matcher(config)
-    checkpoint = tmp_path / "matcher.pt"
-
-    save_matcher_checkpoint(checkpoint, model, config=config, metadata={"mock": True})
-    restored = RelationAwareMatcher.from_checkpoint(checkpoint)
-    payload = torch.load(checkpoint, map_location="cpu")
-
-    assert (
-        payload["schema_version"]
-        == "omnitransfer.graph_cross_attention_matcher.v2"
-    )
-    assert restored.config == config
-    assert parameter_count(restored.model) == parameter_count(model)
-
-
-def test_frozen_v1_checkpoint_loads_with_legacy_architecture(tmp_path) -> None:
-    torch = pytest.importorskip("torch")
-    config = MatcherConfig(
-        hidden_dim=32,
-        num_heads=4,
-        num_layers=1,
-        dropout=0.0,
-        architecture=LEGACY_ATTENTION_ARCHITECTURE,
-        assignment_head="pair_mlp",
-    )
-    model = build_relation_aware_matcher(config)
-    config_payload = asdict(config)
-    del config_payload["architecture"]
-    checkpoint = tmp_path / "legacy-v1.pt"
-    torch.save(
-        {
-            "schema_version": (
-                "omnitransfer.relation_aware_cross_attention_matcher.v1"
-            ),
-            "matcher_config": config_payload,
-            "state_dict": model.state_dict(),
-            "metadata": {"frozen_reference": True},
-        },
-        checkpoint,
-    )
-
-    restored = RelationAwareMatcher.from_checkpoint(checkpoint)
-
-    assert restored.config.architecture == LEGACY_ATTENTION_ARCHITECTURE
-    assert restored.config.assignment_head == "pair_mlp"
-    assert parameter_count(restored.model) == parameter_count(model)
+    assert torch.equal(actual["logits_ab"], expected["logits_ab"])
+    checkpoint = tmp_path / "direct-text-v9.pt"
+    save_matcher_checkpoint(checkpoint, direct, config=direct_config)
+    assert GeometricMatcher.from_checkpoint(checkpoint).config == direct_config

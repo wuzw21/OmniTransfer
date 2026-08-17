@@ -49,15 +49,12 @@ def test_ranking_returns_every_candidate_when_matcher_abstains(monkeypatch) -> N
         source_xml=SOURCE_XML,
         target_xml=TARGET_XML,
         source_point=(30.0, 40.0),
-        source_package_name="com.example.source",
-        target_package_name="com.example.target",
         top_k=1,
     )
 
     assert result["schema_version"] == "omnitransfer.candidate-ranking.v1"
     assert result["status"] == "scored"
     assert result["reason"] == "learned_low_confidence"
-    assert result["page_identity_match"] is False
     assert [candidate["score"] for candidate in result["candidates"]] == [0.6, 0.4]
     assert len(result["candidates"]) == 2
     assert len(result["top_candidates"]) == 1
@@ -103,24 +100,6 @@ def test_ranking_returns_complete_contract_when_matcher_is_unavailable(
         "score",
         "margin",
     }
-
-
-def test_compatibility_action_transfer_is_a_policy_free_alias(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(runtime, "_get_matcher", lambda: AbstainingMatcher())
-
-    result = runtime.action_transfer(
-        source_xml=SOURCE_XML,
-        target_xml=TARGET_XML,
-        source_point=(30.0, 40.0),
-    )
-
-    assert result["score"] == 0.0001
-    assert len(result["candidates"]) == 2
-    assert "mapped" not in result
-    assert "selection_policy" not in result
-    assert "target_candidate_id" not in result
 
 
 def test_ranking_returns_complete_contract_when_graph_parse_fails() -> None:
