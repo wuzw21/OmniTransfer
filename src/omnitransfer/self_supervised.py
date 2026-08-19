@@ -405,8 +405,7 @@ def matching_loss(
     source_visual_mask = output.get("source_visual_mask")
     target_visual_mask = output.get("target_visual_mask")
     visual_descriptor_trainable = bool(
-        config.visual_encoder != DETERMINISTIC_ICON_VISUAL_ENCODER
-        and (
+        (
             getattr(source_visual_descriptors, "requires_grad", False)
             or getattr(target_visual_descriptors, "requires_grad", False)
         )
@@ -1357,7 +1356,7 @@ def _partial_assignment_loss(
     if not supervised_rows:
         raise ValueError("partial assignment has no supervised rows")
     if not candidate_indices:
-        raise ValueError("partial assignment has no actionable target candidates")
+        raise ValueError("partial assignment has no ranked target candidates")
     candidate_positions = {
         index: position for position, index in enumerate(candidate_indices)
     }
@@ -1368,7 +1367,7 @@ def _partial_assignment_loss(
         if target not in candidate_positions
     ]
     if missing:
-        raise ValueError("supervised targets must be actionable")
+        raise ValueError("supervised targets must be ranked candidates")
     row_indices = torch.tensor(supervised_rows, dtype=torch.long, device=device)
     column_indices = torch.tensor(candidate_indices, dtype=torch.long, device=device)
     selected_logits = logits[row_indices][:, column_indices]

@@ -71,8 +71,8 @@ def test_no_ranked_target_still_returns_structured_failure(monkeypatch) -> None:
     assert "new_y" not in result
 
 
-def test_click_candidates_exclude_non_actionable_container(monkeypatch) -> None:
-    target_xml = """<hierarchy bounds="[0,0][1000,1000]"><node class="android.widget.LinearLayout" enabled="true" bounds="[0,400][1000,600]"><node content-desc="Create" class="android.widget.ImageButton" clickable="true" enabled="true" bounds="[870,430][980,490]" /></node></hierarchy>"""
+def test_ranking_keeps_non_actionable_canonical_nodes(monkeypatch) -> None:
+    target_xml = """<hierarchy bounds="[0,0][1000,1000]"><node class="android.widget.LinearLayout" enabled="true" bounds="[0,400][1000,600]"><node content-desc="Create" class="android.widget.ImageButton" clickable="false" enabled="false" bounds="[870,430][980,490]" /></node></hierarchy>"""
     seen: dict[str, tuple[str, ...]] = {}
 
     class Matcher:
@@ -83,14 +83,17 @@ def test_click_candidates_exclude_non_actionable_container(monkeypatch) -> None:
             candidates = [
                 node for node in target.nodes if node.node_id in set(candidate_node_ids)
             ]
-            assert len(candidates) == 1
-            assert candidates[0].content_desc == "Create"
+            assert len(candidates) == 3
+            icon = next(node for node in candidates if node.content_desc == "Create")
             return SimpleNamespace(
-                target_node=candidates[0],
+                target_node=icon,
                 probability=1.0,
                 margin=1.0,
                 reason="learned_match",
-                scores=((candidates[0].node_id, 1.0),),
+                scores=tuple(
+                    (node.node_id, 1.0 if node is icon else 0.1)
+                    for node in candidates
+                ),
             )
 
     monkeypatch.setattr(runtime, "_get_matcher", lambda: Matcher())
@@ -102,4 +105,5 @@ def test_click_candidates_exclude_non_actionable_container(monkeypatch) -> None:
     )
 
     assert result["status"] == "scored"
-    assert len(seen["ids"]) == 1
+    assert len(seen["ids"]) == 3
+    assert len(result["candidates"]) == 3

@@ -3,7 +3,10 @@ from __future__ import annotations
 import numpy as np
 from PIL import Image, ImageDraw
 
-from omnitransfer.visual_descriptor import deterministic_icon_descriptor_numpy
+from omnitransfer.visual_descriptor import (
+    deterministic_icon_descriptor_numpy,
+    multiscale_hash_descriptor_numpy,
+)
 
 
 def _patch(kind: str, *, inverted: bool = False) -> np.ndarray:
@@ -63,3 +66,21 @@ def test_icon_descriptor_is_robust_to_light_dark_theme_inversion() -> None:
     )
 
     assert _cosine(light, dark) > 0.85
+
+
+def test_multiscale_hash_keeps_tight_shape_and_context_separate() -> None:
+    tight_star = _patch("outline_star")
+    tight_plus = _patch("plus")
+    context = _patch("solid_star")
+    descriptors = multiscale_hash_descriptor_numpy(
+        np.stack(
+            [
+                np.concatenate((tight_star, context), axis=0),
+                np.concatenate((tight_plus, context), axis=0),
+            ]
+        )
+    )
+
+    assert descriptors.shape == (2, 96)
+    np.testing.assert_allclose(descriptors[0, 48:], descriptors[1, 48:])
+    assert _cosine(descriptors[0, :48], descriptors[1, :48]) < 0.9

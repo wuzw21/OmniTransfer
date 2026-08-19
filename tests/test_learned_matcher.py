@@ -7,6 +7,7 @@ from omnitransfer.learned_matcher import (
     DIRECT_PAIR_EVIDENCE_NAMES,
     DIRECT_TEXT_EVIDENCE_ENCODER,
     LEGACY_GLOBAL_POOL_VISUAL_ENCODER,
+    MULTISCALE_HASH_VISUAL_ENCODER,
     OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE,
     RELATION_FEATURE_DIM,
     SPATIAL_CNN_VISUAL_ENCODER,
@@ -324,6 +325,67 @@ def test_visual_encoder_migration_preserves_new_visual_parameters() -> None:
     for name, value in target_state.items():
         expected = -0.75 if name.startswith("visual_encoder.") else 0.25
         assert torch.all(value == expected), name
+
+
+def test_multiscale_hash_encoder_exposes_trainable_visual_descriptors() -> None:
+    torch = pytest.importorskip("torch", exc_type=ImportError)
+    config = MatcherConfig(
+        hidden_dim=32,
+        relation_hidden_dim=16,
+        association_dim=24,
+        num_heads=4,
+        association_layers=2,
+        dropout=0.0,
+        visual_encoder=MULTISCALE_HASH_VISUAL_ENCODER,
+        visual_canvas_size=0,
+    )
+    source = _graph("source")
+    target = _graph("target")
+    model = build_geometric_v9_matcher(config)
+    inputs = matcher_inputs(source, target, config=config)
+
+    assert inputs[7].shape[1] == 6
+    output = model(*inputs)
+    assert output["source_visual_descriptors"].shape == (
+        len(source.nodes),
+        config.hidden_dim,
+    )
+    assert output["source_visual_descriptors"].requires_grad
+
+
+def test_multiscale_hash_migration_preserves_tight_hash_and_zeros_context() -> None:
+    torch = pytest.importorskip("torch", exc_type=ImportError)
+    base_config = MatcherConfig(
+        hidden_dim=32,
+        relation_hidden_dim=16,
+        association_dim=24,
+        num_heads=4,
+        association_layers=2,
+        dropout=0.0,
+    )
+    source = build_geometric_v9_matcher(base_config)
+    target = build_geometric_v9_matcher(
+        replace(
+            base_config,
+            visual_encoder=MULTISCALE_HASH_VISUAL_ENCODER,
+            visual_canvas_size=0,
+        )
+    )
+    for parameter in source.parameters():
+        parameter.data.fill_(0.25)
+    for parameter in target.parameters():
+        parameter.data.fill_(-0.75)
+
+    transferred = initialize_nonvisual_from_model(target, source)
+    target_state = target.state_dict()
+
+    assert "visual_to_hidden.weight" in transferred
+    assert "missing_visual" in transferred
+    assert torch.all(target_state["visual_to_hidden.weight"][:, :48] == 0.25)
+    assert torch.all(target_state["visual_to_hidden.weight"][:, 48:] == 0.0)
+    assert torch.all(target_state["missing_visual"][:48] == 0.25)
+    assert torch.all(target_state["missing_visual"][48:] == 0.0)
+    assert torch.all(target_state["xml_to_hidden.weight"] == 0.25)
 
 
 def test_torch_decoder_uses_sharper_previous_association_layer() -> None:

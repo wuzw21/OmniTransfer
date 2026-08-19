@@ -8,6 +8,7 @@ import pytest
 from omnitransfer.learned_matcher import (
     GeometricMatcher,
     MatcherConfig,
+    MULTISCALE_HASH_VISUAL_ENCODER,
     build_geometric_v9_matcher,
     matcher_inputs,
     save_matcher_checkpoint,
@@ -108,6 +109,58 @@ def test_v9_numpy_matches_pytorch_candidate_ranking(tmp_path: Path) -> None:
     assert [node_id for node_id, _ in numpy_match.scores] == [
         node_id for node_id, _ in pytorch_match.scores
     ]
+    np.testing.assert_allclose(
+        [score for _, score in numpy_match.scores],
+        [score for _, score in pytorch_match.scores],
+        rtol=2e-4,
+        atol=2e-4,
+    )
+
+
+def test_multiscale_hash_numpy_matches_pytorch(tmp_path: Path) -> None:
+    torch.manual_seed(23)
+    config = MatcherConfig(
+        hidden_dim=32,
+        relation_hidden_dim=16,
+        association_dim=24,
+        num_heads=4,
+        association_layers=2,
+        dropout=0.0,
+        visual_encoder=MULTISCALE_HASH_VISUAL_ENCODER,
+        visual_canvas_size=0,
+    )
+    model = build_geometric_v9_matcher(config).eval()
+    torch_checkpoint = tmp_path / "multiscale.pt"
+    numpy_checkpoint = tmp_path / "multiscale.npz"
+    save_matcher_checkpoint(torch_checkpoint, model, config=config)
+    save_numpy_unified_association_checkpoint(
+        numpy_checkpoint,
+        model.state_dict(),
+        config=config,
+    )
+    source = graph_from_record({"xml": SOURCE_XML}, graph_id="source")
+    target = graph_from_record({"xml": TARGET_XML}, graph_id="target")
+    source_node = next(node for node in source.nodes if node.content_desc == "搜索")
+    candidates = tuple(node.node_id for node in target.nodes)
+
+    pytorch_match = GeometricMatcher.from_checkpoint(torch_checkpoint).predict(
+        source,
+        target,
+        source_node_id=source_node.node_id,
+        candidate_node_ids=candidates,
+    )
+    numpy_match = NumpyGeometricAlignmentMatcher.from_checkpoint(
+        numpy_checkpoint
+    ).predict(
+        source,
+        target,
+        source_node_id=source_node.node_id,
+        candidate_node_ids=candidates,
+    )
+
+    assert numpy_match.target_node is not None
+    assert pytorch_match.target_node is not None
+    assert numpy_match.target_node.node_id == pytorch_match.target_node.node_id
     np.testing.assert_allclose(
         [score for _, score in numpy_match.scores],
         [score for _, score in pytorch_match.scores],

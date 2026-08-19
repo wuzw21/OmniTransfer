@@ -25,7 +25,7 @@ The repository currently has 18 mapping-affecting rule surfaces:
 | `self_supervised.py` | relation-preserving augmentations, candidate/NULL training policy, losses | training objective |
 | `mapping_training.py` | correspondence extraction and assignment label policy | dataset/training contract |
 | `mapping_dataset.py` | schema, split, leakage, and label validation | dataset contract |
-| `runtime.py` | actionable candidate gate, confidence/margin, fallback contract | runtime safety policy |
+| `runtime.py` | bounded all-node candidate set, confidence/margin, fallback contract | runtime safety policy |
 | `mapping_baselines.py` | exact identity baselines | diagnostic baseline only |
 | `utg_mapping_candidates.py` | legacy weighted candidate proposal | legacy diagnostic path; not runtime mapping |
 | `icon_hard_set.py` | hard-case selection and difficulty reasons | sampling/diagnostics only |

@@ -151,6 +151,25 @@ def deterministic_icon_descriptor_numpy(patches: Any) -> Any:
     return descriptor
 
 
+def multiscale_hash_descriptor_numpy(patches: Any) -> Any:
+    """Encode a native-resolution node crop and its context ring separately."""
+
+    import numpy as np
+
+    rgb = np.asarray(patches, dtype=np.float32)
+    if rgb.ndim != 4 or rgb.shape[1] != 6:
+        raise ValueError(
+            "multiscale visual patches must have shape [nodes, 6, height, width]"
+        )
+    return np.concatenate(
+        (
+            deterministic_icon_descriptor_numpy(rgb[:, :3]),
+            deterministic_icon_descriptor_numpy(rgb[:, 3:]),
+        ),
+        axis=1,
+    ).astype(np.float32, copy=False)
+
+
 def deterministic_icon_descriptor_torch(patches: Any, *, torch: Any) -> Any:
     """Torch equivalent of :func:`deterministic_icon_descriptor_numpy`."""
 
@@ -272,6 +291,22 @@ def deterministic_icon_descriptor_torch(patches: Any, *, torch: Any) -> Any:
     if descriptor.shape[1] != 48:
         raise AssertionError(f"unexpected visual descriptor width: {descriptor.shape[1]}")
     return descriptor
+
+
+def multiscale_hash_descriptor_torch(patches: Any, *, torch: Any) -> Any:
+    """Torch equivalent of :func:`multiscale_hash_descriptor_numpy`."""
+
+    if patches.ndim != 4 or patches.shape[1] != 6:
+        raise ValueError(
+            "multiscale visual patches must have shape [nodes, 6, height, width]"
+        )
+    return torch.cat(
+        (
+            deterministic_icon_descriptor_torch(patches[:, :3], torch=torch),
+            deterministic_icon_descriptor_torch(patches[:, 3:], torch=torch),
+        ),
+        dim=1,
+    )
 
 
 @lru_cache(maxsize=16)

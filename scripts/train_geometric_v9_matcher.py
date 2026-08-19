@@ -20,6 +20,7 @@ from omnitransfer.learned_matcher import (
     ALL_NODE_CANDIDATE_POLICY,
     DETERMINISTIC_ICON_VISUAL_ENCODER,
     LEGACY_GLOBAL_POOL_VISUAL_ENCODER,
+    MULTISCALE_HASH_VISUAL_ENCODER,
     NODE_DESCRIPTOR_DIM,
     OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE,
     SPATIAL_CNN_VISUAL_ENCODER,
@@ -102,10 +103,18 @@ def _parser() -> argparse.ArgumentParser:
             DETERMINISTIC_ICON_VISUAL_ENCODER,
             LEGACY_GLOBAL_POOL_VISUAL_ENCODER,
             SPATIAL_CNN_VISUAL_ENCODER,
+            MULTISCALE_HASH_VISUAL_ENCODER,
         ),
         default=None,
         help="Replace only geometric-v9's visual encoder; pretrained runs migrate all nonvisual weights.",
     )
+    parser.add_argument(
+        "--visual-canvas-size",
+        type=int,
+        default=None,
+        help="0 keeps screenshot pixels at native resolution before node crops.",
+    )
+    parser.add_argument("--visual-context-scale", type=float, default=3.0)
     parser.add_argument("--progress-interval", type=int, default=1000)
     parser.add_argument(
         "--visual-dropout-probability",
@@ -144,6 +153,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--descriptor-learning-rate-scale must be in (0, 1]")
     if args.visual_descriptor_temperature <= 0.0:
         raise SystemExit("--visual-descriptor-temperature must be positive")
+    if args.visual_canvas_size is not None and args.visual_canvas_size < 0:
+        raise SystemExit("--visual-canvas-size must be non-negative")
+    if args.visual_context_scale < 1.0:
+        raise SystemExit("--visual-context-scale must be at least 1")
     for name, value in {
         "--visual-dropout-probability": args.visual_dropout_probability,
     }.items():
@@ -172,6 +185,16 @@ def main() -> None:
     torch.manual_seed(args.seed)
 
     if args.pretrained is None:
+        visual_encoder = args.visual_encoder or MatcherConfig.visual_encoder
+        visual_canvas_size = (
+            args.visual_canvas_size
+            if args.visual_canvas_size is not None
+            else (
+                0
+                if visual_encoder == MULTISCALE_HASH_VISUAL_ENCODER
+                else MatcherConfig.visual_canvas_size
+            )
+        )
         config = MatcherConfig(
             hidden_dim=args.hidden_dim,
             num_heads=args.num_heads,
@@ -180,14 +203,29 @@ def main() -> None:
             target_context_nodes=args.target_context_nodes,
             architecture=OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE,
             candidate_policy=ALL_NODE_CANDIDATE_POLICY,
-            visual_encoder=args.visual_encoder or MatcherConfig.visual_encoder,
+            visual_encoder=visual_encoder,
+            visual_canvas_size=visual_canvas_size,
+            visual_context_scale=args.visual_context_scale,
         )
         pretrained_model = None
         pretrained_mode = None
     else:
         pretrained = _load_geometric_checkpoint(args.pretrained, device=args.device)
         if args.visual_encoder and args.visual_encoder != pretrained.config.visual_encoder:
-            config = replace(pretrained.config, visual_encoder=args.visual_encoder)
+            config = replace(
+                pretrained.config,
+                visual_encoder=args.visual_encoder,
+                visual_canvas_size=(
+                    args.visual_canvas_size
+                    if args.visual_canvas_size is not None
+                    else (
+                        0
+                        if args.visual_encoder == MULTISCALE_HASH_VISUAL_ENCODER
+                        else pretrained.config.visual_canvas_size
+                    )
+                ),
+                visual_context_scale=args.visual_context_scale,
+            )
             pretrained_model = build_geometric_v9_matcher(config)
             transferred = initialize_nonvisual_from_model(
                 pretrained_model,
@@ -198,7 +236,15 @@ def main() -> None:
                 f"->{args.visual_encoder}:{len(transferred)}"
             )
         else:
-            config = pretrained.config
+            config = replace(
+                pretrained.config,
+                visual_canvas_size=(
+                    args.visual_canvas_size
+                    if args.visual_canvas_size is not None
+                    else pretrained.config.visual_canvas_size
+                ),
+                visual_context_scale=args.visual_context_scale,
+            )
             pretrained_model = pretrained.model
             pretrained_mode = "exact_geometric_v9_resume"
 

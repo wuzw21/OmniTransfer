@@ -80,6 +80,20 @@ def test_ranking_prefers_actionable_child_with_same_bounds() -> None:
     assert result["candidates"][0]["bbox"] == [104.0, 551.0, 608.0, 691.0]
 
 
+def test_ranking_resolves_point_to_small_non_actionable_canonical_node() -> None:
+    source_xml = """<hierarchy bounds="[0,0][1000,1000]"><node text="Create row" class="android.widget.LinearLayout" clickable="true" bounds="[0,400][1000,600]"><node content-desc="Create icon" class="android.widget.ImageView" clickable="false" bounds="[880,430][940,490]" /></node></hierarchy>"""
+    target_xml = """<hierarchy bounds="[0,0][1000,1000]"><node text="Create row" class="android.widget.LinearLayout" clickable="true" bounds="[0,400][1000,600]"><node content-desc="Create icon" class="android.widget.ImageView" clickable="false" bounds="[850,440][910,500]" /></node></hierarchy>"""
+
+    result = rank_action_candidates(
+        source_xml=source_xml,
+        target_xml=target_xml,
+        source_point=(910, 460),
+    )
+
+    assert result["src_element"]["content_desc"] == "Create icon"
+    assert result["candidates"][0]["content_desc"] == "Create icon"
+
+
 def test_ranking_uses_model_for_equivalent_ui_graph(
     monkeypatch,
 ) -> None:

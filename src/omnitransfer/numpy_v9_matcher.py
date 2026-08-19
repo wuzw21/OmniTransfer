@@ -22,6 +22,7 @@ from omnitransfer.learned_matcher import (
     LearnedMatch,
     LEGACY_GLOBAL_POOL_VISUAL_ENCODER,
     MatcherConfig,
+    MULTISCALE_HASH_VISUAL_ENCODER,
     OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE,
     TEXT_DESCRIPTOR_DIM,
     TYPED_RELATION_NAMES,
@@ -39,7 +40,10 @@ from omnitransfer.ui_graph import (
     multi_anchor_context_graph,
     visual_bbox_fraction,
 )
-from omnitransfer.visual_descriptor import deterministic_icon_descriptor_numpy
+from omnitransfer.visual_descriptor import (
+    deterministic_icon_descriptor_numpy,
+    multiscale_hash_descriptor_numpy,
+)
 
 NUMPY_UNIFIED_ASSOCIATION_SCHEMA = "omnitransfer_numpy_unified_association_v1"
 
@@ -308,11 +312,15 @@ class NumpyGeometricAlignmentMatcher:
             source,
             patch_size=self.config.visual_patch_size,
             canvas_size=self.config.visual_canvas_size,
+            visual_encoder=self.config.visual_encoder,
+            context_scale=self.config.visual_context_scale,
         )
         target_visual, target_visual_mask = _visual_inputs(
             target,
             patch_size=self.config.visual_patch_size,
             canvas_size=self.config.visual_canvas_size,
+            visual_encoder=self.config.visual_encoder,
+            context_scale=self.config.visual_context_scale,
         )
         source_states, source_modalities = self._encode_nodes(
             source_tokens,
@@ -386,6 +394,8 @@ class NumpyGeometricAlignmentMatcher:
             visual = self._linear(visual, "visual_encoder.9")
         elif self.config.visual_encoder == DETERMINISTIC_ICON_VISUAL_ENCODER:
             visual = deterministic_icon_descriptor_numpy(visual)
+        elif self.config.visual_encoder == MULTISCALE_HASH_VISUAL_ENCODER:
+            visual = multiscale_hash_descriptor_numpy(visual)
         else:
             raise ValueError(f"unsupported visual encoder: {self.config.visual_encoder}")
         visual = (
@@ -758,10 +768,13 @@ def _visual_inputs(
     *,
     patch_size: int,
     canvas_size: int = 0,
+    visual_encoder: str = DETERMINISTIC_ICON_VISUAL_ENCODER,
+    context_scale: float = 3.0,
 ) -> tuple[Any, Any]:
     np = _require_numpy()
+    channels = 6 if visual_encoder == MULTISCALE_HASH_VISUAL_ENCODER else 3
     patches = np.zeros(
-        (len(graph.nodes), 3, patch_size, patch_size),
+        (len(graph.nodes), channels, patch_size, patch_size),
         dtype=np.float32,
     )
     mask = np.zeros((len(graph.nodes), 1), dtype=np.float32)
@@ -788,6 +801,7 @@ def _visual_inputs(
         )
         if bbox is None:
             continue
+        context_bbox = _expanded_bbox_fraction(bbox, context_scale)
         if screenshot_signature is not None:
             patch = _cached_screenshot_patch(
                 screenshot_path,
@@ -797,11 +811,47 @@ def _visual_inputs(
                 tuple(float(value) for value in bbox),
                 int(patch_size),
             )
+            context_patch = (
+                _cached_screenshot_patch(
+                    screenshot_path,
+                    int(canvas_size),
+                    screenshot_signature[0],
+                    screenshot_signature[1],
+                    tuple(float(value) for value in context_bbox),
+                    int(patch_size),
+                )
+                if visual_encoder == MULTISCALE_HASH_VISUAL_ENCODER
+                else None
+            )
         else:
             patch = _sample_rgb_bbox(image, bbox=bbox, size=patch_size)
-        patches[index] = patch.transpose(2, 0, 1)
+            context_patch = (
+                _sample_rgb_bbox(image, bbox=context_bbox, size=patch_size)
+                if visual_encoder == MULTISCALE_HASH_VISUAL_ENCODER
+                else None
+            )
+        patches[index, :3] = patch.transpose(2, 0, 1)
+        if context_patch is not None:
+            patches[index, 3:] = context_patch.transpose(2, 0, 1)
         mask[index, 0] = np_float(1.0)
     return patches, mask
+
+
+def _expanded_bbox_fraction(
+    bbox: tuple[float, float, float, float], scale: float
+) -> tuple[float, float, float, float]:
+    left, top, right, bottom = bbox
+    scale = max(1.0, float(scale))
+    center_x = (left + right) * 0.5
+    center_y = (top + bottom) * 0.5
+    half_width = (right - left) * scale * 0.5
+    half_height = (bottom - top) * scale * 0.5
+    return (
+        max(0.0, center_x - half_width),
+        max(0.0, center_y - half_height),
+        min(1.0, center_x + half_width),
+        min(1.0, center_y + half_height),
+    )
 
 
 def _graph_rgb(graph: UIGraph, *, canvas_size: int) -> Any | None:

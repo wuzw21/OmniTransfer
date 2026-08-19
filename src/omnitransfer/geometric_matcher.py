@@ -22,6 +22,7 @@ def build_geometric_matcher(config: Any) -> Any:
         DETERMINISTIC_ICON_VISUAL_ENCODER,
         LEARNED_TOKEN_LOOKUP_ENCODER,
         LEGACY_GLOBAL_POOL_VISUAL_ENCODER,
+        MULTISCALE_HASH_VISUAL_ENCODER,
         OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE,
         SPATIAL_CNN_VISUAL_ENCODER,
         TEXT_DESCRIPTOR_DIM,
@@ -31,9 +32,13 @@ def build_geometric_matcher(config: Any) -> Any:
         XML_NODE_FEATURE_DIM,
         mutual_log_assignment,
         typed_relation_bases,
+        visual_descriptor_dim,
         _require_torch,
     )
-    from omnitransfer.visual_descriptor import deterministic_icon_descriptor_torch
+    from omnitransfer.visual_descriptor import (
+        deterministic_icon_descriptor_torch,
+        multiscale_hash_descriptor_torch,
+    )
 
     cfg = config
     if cfg.architecture != OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE:
@@ -44,7 +49,10 @@ def build_geometric_matcher(config: Any) -> Any:
         raise ValueError("hidden_dim must be divisible by num_heads")
     if cfg.source_context_nodes <= 0 or cfg.target_context_nodes <= 0:
         raise ValueError("context node limits must be positive")
-    if cfg.visual_canvas_size < cfg.visual_patch_size:
+    if (
+        cfg.visual_canvas_size != 0
+        and cfg.visual_canvas_size < cfg.visual_patch_size
+    ):
         raise ValueError("visual_canvas_size must cover one visual patch")
     if cfg.association_layers <= 0:
         raise ValueError("association_layers must be positive")
@@ -54,6 +62,7 @@ def build_geometric_matcher(config: Any) -> Any:
     torch = _require_torch()
     nn = torch.nn
     relation_count = len(TYPED_RELATION_NAMES)
+    visual_dim = visual_descriptor_dim(cfg.visual_encoder)
 
     class LocalGraphLayer(nn.Module):
         """Aggregate one node's typed, nearby UI relatives into its state."""
@@ -222,13 +231,22 @@ def build_geometric_matcher(config: Any) -> Any:
                         )
 
                 self.visual_encoder = DeterministicIconEncoder()
+            elif cfg.visual_encoder == MULTISCALE_HASH_VISUAL_ENCODER:
+
+                class MultiscaleHashEncoder(nn.Module):
+                    def forward(self, patches: Any) -> Any:
+                        return multiscale_hash_descriptor_torch(
+                            patches, torch=torch
+                        )
+
+                self.visual_encoder = MultiscaleHashEncoder()
             else:
                 raise ValueError(f"unsupported visual encoder: {cfg.visual_encoder}")
 
             self.missing_text = nn.Parameter(torch.zeros(TEXT_DESCRIPTOR_DIM))
-            self.missing_visual = nn.Parameter(torch.zeros(VISUAL_DESCRIPTOR_DIM))
+            self.missing_visual = nn.Parameter(torch.zeros(visual_dim))
             self.text_to_hidden = nn.Linear(TEXT_DESCRIPTOR_DIM, cfg.hidden_dim)
-            self.visual_to_hidden = nn.Linear(VISUAL_DESCRIPTOR_DIM, cfg.hidden_dim)
+            self.visual_to_hidden = nn.Linear(visual_dim, cfg.hidden_dim)
             self.xml_to_hidden = nn.Linear(XML_DESCRIPTOR_DIM, cfg.hidden_dim)
             self.modality_type = nn.Parameter(torch.empty(3, cfg.hidden_dim))
             nn.init.normal_(self.modality_type, std=0.02)
@@ -335,10 +353,11 @@ def build_geometric_matcher(config: Any) -> Any:
                 self.missing_text.unsqueeze(0).expand(text_states.shape[0], -1)
             )
             xml_states = self.xml_projection(numeric_features)
+            visual_hidden = self.visual_to_hidden(visual_states)
             modalities = torch.stack(
                 (
                     self.text_to_hidden(text_states),
-                    self.visual_to_hidden(visual_states),
+                    visual_hidden,
                     self.xml_to_hidden(xml_states),
                 ),
                 dim=1,
@@ -359,10 +378,7 @@ def build_geometric_matcher(config: Any) -> Any:
             states = self.input_output_norm(
                 states + self.input_feed_forward(states)
             )
-            raw_modalities = torch.cat(
-                (text_states, visual_states, xml_states), dim=-1
-            )
-            return states, states, raw_modalities
+            return states, states, visual_hidden
 
         def forward(
             self,
@@ -380,13 +396,21 @@ def build_geometric_matcher(config: Any) -> Any:
             detach_unary_for_relation: bool = False,
         ) -> dict[str, Any]:
             del detach_unary_for_relation
-            source_states, source_descriptors, source_modalities = self.encode_nodes(
+            (
+                source_states,
+                source_descriptors,
+                source_visual_descriptors,
+            ) = self.encode_nodes(
                 source_token_ids,
                 source_numeric,
                 source_visual,
                 source_visual_mask,
             )
-            target_states, target_descriptors, target_modalities = self.encode_nodes(
+            (
+                target_states,
+                target_descriptors,
+                target_visual_descriptors,
+            ) = self.encode_nodes(
                 target_token_ids,
                 target_numeric,
                 target_visual,
@@ -450,16 +474,8 @@ def build_geometric_matcher(config: Any) -> Any:
                 "target_relation_bases": target_bases,
                 "source_descriptors": source_descriptors,
                 "target_descriptors": target_descriptors,
-                "source_visual_descriptors": source_modalities[
-                    :,
-                    TEXT_DESCRIPTOR_DIM : TEXT_DESCRIPTOR_DIM
-                    + VISUAL_DESCRIPTOR_DIM,
-                ],
-                "target_visual_descriptors": target_modalities[
-                    :,
-                    TEXT_DESCRIPTOR_DIM : TEXT_DESCRIPTOR_DIM
-                    + VISUAL_DESCRIPTOR_DIM,
-                ],
+                "source_visual_descriptors": source_visual_descriptors,
+                "target_visual_descriptors": target_visual_descriptors,
                 "source_visual_mask": source_visual_mask,
                 "target_visual_mask": target_visual_mask,
                 "source_states": source_states,

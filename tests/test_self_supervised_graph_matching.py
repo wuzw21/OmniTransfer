@@ -158,7 +158,7 @@ def test_geometric_matching_loss_and_training_smoke() -> None:
 
     assert loss.item() >= 0.0
     assert details["supervised_layers"] == 2.0
-    assert details["visual_descriptor_trainable"] == 0.0
+    assert details["visual_descriptor_trainable"] == 1.0
     assert details["visual_descriptor_loss"] == 0.0
     assert details["matchability_loss"] > 0.0
     assert trained.training is False

@@ -58,6 +58,13 @@ parameters and labels.
 
 - XML, text, content description, class, affordance state, screenshot crop,
   hierarchy, and local relative relations enter through `UIGraph`.
+- Candidate membership is independent of `clickable`, `editable`,
+  `scrollable`, and `enabled`. Every bounded canonical node is ranked;
+  actionability remains observation evidence only and never filters identity.
+- The multiscale small-control visual seam preserves a native-resolution tight
+  crop and a separate expanded context crop. The shared deterministic shape /
+  edge / color hash is projected by a trainable visual head; tight appearance
+  and local context are not averaged before matching.
 - Whole-page absolute position is weak evidence. Local context is represented
   by one relation graph whose channels include parent/child, sibling,
   ancestor/descendant, local direction/proximity, and normalized kinship

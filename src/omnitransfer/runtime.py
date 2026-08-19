@@ -140,22 +140,8 @@ def rank_action_candidates(
             action_type=request.action_type,
             top_k=request.top_k,
         )
-    enabled_nodes = tuple(
-        node
-        for node in target.nodes
-        if node.bbox is not None and node.enabled
-    )
-    actionable_nodes = tuple(
-        node
-        for node in enabled_nodes
-        if node.clickable or node.editable or node.scrollable
-    )
-    # Container bounds are useful context features, but they are not valid
-    # replay targets for an action. Keep the all-enabled fallback only for
-    # sparse/non-interactive captures that expose no actionable node at all.
-    candidate_node_ids = tuple(
-        node.node_id for node in (actionable_nodes or enabled_nodes)
-    )
+    bounded_nodes = tuple(node for node in target.nodes if node.bbox is not None)
+    candidate_node_ids = tuple(node.node_id for node in bounded_nodes)
     try:
         matcher = _get_matcher()
         matcher_metadata = _matcher_metadata(matcher)
@@ -342,14 +328,8 @@ def _source_node(
         and node.bbox[0] <= x <= node.bbox[2]
         and node.bbox[1] <= y <= node.bbox[3]
     ]
-    actionable = [
-        node
-        for node in containing
-        if node.enabled and (node.clickable or node.editable or node.scrollable)
-    ]
-    candidates = actionable or containing
     return min(
-        candidates,
+        containing,
         key=lambda node: (
             _area(node.bbox),
             not _has_stable_identity(node),

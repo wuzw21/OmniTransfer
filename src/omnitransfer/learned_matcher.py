@@ -24,6 +24,7 @@ RELATION_FEATURE_DIM = 18
 XML_NODE_FEATURE_DIM = 32
 TEXT_DESCRIPTOR_DIM = 48
 VISUAL_DESCRIPTOR_DIM = 48
+MULTISCALE_VISUAL_DESCRIPTOR_DIM = VISUAL_DESCRIPTOR_DIM * 2
 XML_DESCRIPTOR_DIM = 32
 NODE_DESCRIPTOR_DIM = (
     TEXT_DESCRIPTOR_DIM + VISUAL_DESCRIPTOR_DIM + XML_DESCRIPTOR_DIM
@@ -94,6 +95,7 @@ ALL_NODE_CANDIDATE_POLICY = "all_nodes"
 LEGACY_GLOBAL_POOL_VISUAL_ENCODER = "legacy_global_pool_v1"
 SPATIAL_CNN_VISUAL_ENCODER = "spatial_cnn_v2"
 DETERMINISTIC_ICON_VISUAL_ENCODER = "deterministic_icon_v1"
+MULTISCALE_HASH_VISUAL_ENCODER = "multiscale_hash_v2"
 
 
 @dataclass(frozen=True)
@@ -112,12 +114,21 @@ class MatcherConfig:
     visual_patch_size: int = 32
     visual_canvas_size: int = 384
     visual_encoder: str = DETERMINISTIC_ICON_VISUAL_ENCODER
+    visual_context_scale: float = 3.0
     source_context_nodes: int = 48
     target_context_nodes: int = 64
     architecture: str = OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE
     assignment_head: str = "partial_assignment"
     text_encoder: str = LEARNED_TOKEN_LOOKUP_ENCODER
     candidate_policy: str = ALL_NODE_CANDIDATE_POLICY
+
+
+def visual_descriptor_dim(visual_encoder: str) -> int:
+    return (
+        MULTISCALE_VISUAL_DESCRIPTOR_DIM
+        if visual_encoder == MULTISCALE_HASH_VISUAL_ENCODER
+        else VISUAL_DESCRIPTOR_DIM
+    )
 
 
 @dataclass(frozen=True)
@@ -474,6 +485,8 @@ def matcher_inputs(
         source,
         patch_size=cfg.visual_patch_size,
         canvas_size=cfg.visual_canvas_size,
+        visual_encoder=cfg.visual_encoder,
+        context_scale=cfg.visual_context_scale,
         torch=torch,
         device=device,
     )
@@ -481,6 +494,8 @@ def matcher_inputs(
         target,
         patch_size=cfg.visual_patch_size,
         canvas_size=cfg.visual_canvas_size,
+        visual_encoder=cfg.visual_encoder,
+        context_scale=cfg.visual_context_scale,
         torch=torch,
         device=device,
     )
@@ -727,7 +742,34 @@ def initialize_nonvisual_from_model(
         if target_name.startswith("visual_encoder."):
             continue
         source_value = source_state.get(target_name)
+        if (
+            source_value is not None
+            and target_name == "missing_visual"
+            and target_value.ndim == source_value.ndim == 1
+            and target_value.shape[0] == source_value.shape[0] * 2
+        ):
+            widened = target_value.detach().clone().zero_()
+            widened[: source_value.shape[0]] = source_value.detach()
+            target_state[target_name] = widened
+            transferred.append(target_name)
+            continue
+        if (
+            source_value is not None
+            and target_name == "visual_to_hidden.weight"
+            and target_value.ndim == source_value.ndim == 2
+            and target_value.shape[0] == source_value.shape[0]
+            and target_value.shape[1] == source_value.shape[1] * 2
+        ):
+            widened = target_value.detach().clone().zero_()
+            widened[:, : source_value.shape[1]] = source_value.detach()
+            target_state[target_name] = widened
+            transferred.append(target_name)
+            continue
         if source_value is None or source_value.shape != target_value.shape:
+            if target_name == "missing_visual" or target_name.startswith(
+                "visual_to_hidden."
+            ):
+                continue
             raise ValueError(
                 f"visual encoder migration cannot initialize {target_name}"
             )
@@ -756,12 +798,15 @@ def _visual_inputs(
     *,
     patch_size: int,
     canvas_size: int,
+    visual_encoder: str = DETERMINISTIC_ICON_VISUAL_ENCODER,
+    context_scale: float = 3.0,
     torch: Any,
     device: str | Any,
 ) -> tuple[Any, Any]:
     screenshot_path = str(graph.metadata.get("screenshot_path") or "")
+    channels = 6 if visual_encoder == MULTISCALE_HASH_VISUAL_ENCODER else 3
     empty = torch.zeros(
-        (len(graph.nodes), 3, patch_size, patch_size),
+        (len(graph.nodes), channels, patch_size, patch_size),
         dtype=torch.float32,
         device=device,
     )
@@ -775,10 +820,12 @@ def _visual_inputs(
     image = torch.as_tensor(image_array, dtype=torch.uint8, device=device)
     image = image.permute(2, 0, 1).unsqueeze(0).to(dtype=torch.float32).div_(255.0)
     normalized_boxes: list[tuple[float, float, float, float]] = []
+    normalized_context_boxes: list[tuple[float, float, float, float]] = []
     available: list[float] = []
     for node in graph.nodes:
         if bool(node.metadata.get("visual_disabled")):
             normalized_boxes.append((-1.0, -1.0, -1.0, -1.0))
+            normalized_context_boxes.append((-1.0, -1.0, -1.0, -1.0))
             available.append(0.0)
             continue
         bbox = visual_bbox_fraction(
@@ -789,6 +836,7 @@ def _visual_inputs(
         )
         if bbox is None:
             normalized_boxes.append((-1.0, -1.0, -1.0, -1.0))
+            normalized_context_boxes.append((-1.0, -1.0, -1.0, -1.0))
             available.append(0.0)
             continue
         normalized_boxes.append(
@@ -799,12 +847,57 @@ def _visual_inputs(
                 2.0 * bbox[3] - 1.0,
             )
         )
+        context_bbox = _expanded_bbox_fraction(bbox, context_scale)
+        normalized_context_boxes.append(
+            (
+                2.0 * context_bbox[0] - 1.0,
+                2.0 * context_bbox[1] - 1.0,
+                2.0 * context_bbox[2] - 1.0,
+                2.0 * context_bbox[3] - 1.0,
+            )
+        )
         available.append(1.0)
     boxes = torch.as_tensor(
         normalized_boxes,
         dtype=torch.float32,
         device=device,
     )
+    patches = _sample_visual_boxes(
+        image,
+        boxes,
+        patch_size=patch_size,
+        torch=torch,
+        device=device,
+    )
+    if visual_encoder == MULTISCALE_HASH_VISUAL_ENCODER:
+        context_boxes = torch.as_tensor(
+            normalized_context_boxes,
+            dtype=torch.float32,
+            device=device,
+        )
+        context_patches = _sample_visual_boxes(
+            image,
+            context_boxes,
+            patch_size=patch_size,
+            torch=torch,
+            device=device,
+        )
+        patches = torch.cat((patches, context_patches), dim=1)
+    patches = _apply_visual_transform(patches, graph=graph, torch=torch, device=device)
+    return (
+        patches,
+        torch.tensor(available, dtype=torch.float32, device=device).unsqueeze(1),
+    )
+
+
+def _sample_visual_boxes(
+    image: Any,
+    boxes: Any,
+    *,
+    patch_size: int,
+    torch: Any,
+    device: str | Any,
+) -> Any:
     offsets = torch.linspace(0.0, 1.0, patch_size, device=device)
     grid_x = (
         boxes[:, 0, None, None]
@@ -817,17 +910,29 @@ def _visual_inputs(
     grid_x = grid_x.expand(-1, patch_size, -1)
     grid_y = grid_y.expand(-1, -1, patch_size)
     grid = torch.stack((grid_x, grid_y), dim=-1)
-    patches = torch.nn.functional.grid_sample(
-        image.expand(len(graph.nodes), -1, -1, -1),
+    return torch.nn.functional.grid_sample(
+        image.expand(len(boxes), -1, -1, -1),
         grid,
         mode="bilinear",
         padding_mode="zeros",
         align_corners=True,
     )
-    patches = _apply_visual_transform(patches, graph=graph, torch=torch, device=device)
+
+
+def _expanded_bbox_fraction(
+    bbox: tuple[float, float, float, float], scale: float
+) -> tuple[float, float, float, float]:
+    left, top, right, bottom = bbox
+    scale = max(1.0, float(scale))
+    center_x = (left + right) * 0.5
+    center_y = (top + bottom) * 0.5
+    half_width = (right - left) * scale * 0.5
+    half_height = (bottom - top) * scale * 0.5
     return (
-        patches,
-        torch.tensor(available, dtype=torch.float32, device=device).unsqueeze(1),
+        max(0.0, center_x - half_width),
+        max(0.0, center_y - half_height),
+        min(1.0, center_x + half_width),
+        min(1.0, center_y + half_height),
     )
 
 
@@ -866,10 +971,12 @@ def _apply_visual_transform(
         dtype=patches.dtype,
         device=device,
     ).view(1, 3, 1, 1)
+    if patches.shape[1] != 3:
+        gains = gains.repeat(1, patches.shape[1] // 3, 1, 1)
     return (((patches - 0.5) * contrast + 0.5 + brightness) * gains).clamp_(0.0, 1.0)
 
 
-@lru_cache(maxsize=512)
+@lru_cache(maxsize=32)
 def _load_rgb_array(
     screenshot_path: str,
     canvas_size: int,
