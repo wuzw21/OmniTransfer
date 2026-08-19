@@ -98,5 +98,5 @@ def test_page_embedding_similarity_is_cosine() -> None:
 def test_default_checkpoint_is_the_frozen_runtime_model() -> None:
     assert page_embedding.DEFAULT_PAGE_EMBEDDING_CHECKPOINT.is_file()
     assert page_embedding.DEFAULT_PAGE_EMBEDDING_CHECKPOINT_SHA256 == (
-        "0494224f76c410f17d47b4aaaeacf99e2060c1174da628884c287a6922882ada"
+        "c262f03c32c4b88d2933323fe2b33007281224ef1a8aae1418a9844d354de232"
     )

@@ -33,7 +33,7 @@ def test_runtime_ignores_checkpoint_override_and_loads_frozen_artifacts(
 def test_unified_checkpoint_is_the_reviewed_export() -> None:
     assert runtime._DEFAULT_MATCHER_CHECKPOINT.exists()
     assert runtime._DEFAULT_MATCHER_SHA256 == (
-        "0494224f76c410f17d47b4aaaeacf99e2060c1174da628884c287a6922882ada"
+        "c262f03c32c4b88d2933323fe2b33007281224ef1a8aae1418a9844d354de232"
     )
 
 
@@ -90,7 +90,7 @@ def test_learned_result_records_frozen_release_and_unambiguous_scores(
     assert result["matcher_release"] == "omnitransfer-unified-association-v1-mobile"
     assert result["matcher_backend"] == "numpy-unified-association-v1"
     assert result["matcher_checkpoint_sha256"] == (
-        "0494224f76c410f17d47b4aaaeacf99e2060c1174da628884c287a6922882ada"
+        "c262f03c32c4b88d2933323fe2b33007281224ef1a8aae1418a9844d354de232"
     )
     assert result["matcher_feature_schema"] == (
         "omnitransfer-unified-association-v1"
