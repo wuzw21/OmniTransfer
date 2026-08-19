@@ -86,7 +86,7 @@ def test_ui_correspondence_review_copies_images_and_embeds_matches(
                 "graph_id": "source-page",
                 "width": 100,
                 "height": 200,
-                "nodes": [{"node_id": "s1", "origin_id": "origin-1", "text": "Line\u2028Break", "bbox": [1, 2, 30, 40]}],
+                "nodes": [{"node_id": "s1", "origin_id": "origin-1", "text": "Line\u2028Break", "bbox": [1, 2, 30, 40], "metadata": {"visual_bbox": [3, 4, 90, 100]}}],
             },
             "xml": "<hierarchy bounds=\"[0,0][100,200]\" />",
         },
@@ -151,8 +151,11 @@ def test_ui_correspondence_review_copies_images_and_embeds_matches(
     assert "stagePoint" in html
     assert "migrateLegacyLiveState" in html
     assert "toVisualPoint" in html
+    assert "point?.coordinate_space === 'screenshot_pixels'" in html
+    assert "canonicalOursNode" in html
     assert "screenshot_pixels" in html
     assert "实时计算的 Target 点" in html
+    assert "静态文件模式不能实时映射" in html
     assert "test.index.v1" in html
     payload = json.loads((tmp_path / "review" / "review.html.payload.json").read_text(encoding="utf-8"))
     assert payload["pairs"][0]["source"]["xml"].startswith("<hierarchy")
@@ -161,6 +164,12 @@ def test_ui_correspondence_review_copies_images_and_embeds_matches(
     assert payload["pairs"][0]["source"]["height"] == 200
     assert payload["pairs"][0]["source"]["display_width"] == 300
     assert payload["pairs"][0]["source"]["display_height"] == 600
+    assert payload["pairs"][0]["source"]["candidates"][0]["visual_bbox"] == [
+        3.0,
+        4.0,
+        90.0,
+        100.0,
+    ]
     assert "实时计算中" in html
     assert "node.node_id === task.source?.node?.node_id" in html
     assert "我们的方案 ≠ selector" in html

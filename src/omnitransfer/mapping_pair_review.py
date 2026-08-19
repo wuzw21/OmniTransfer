@@ -621,6 +621,8 @@ def _review_side(
 
 def _review_node(node: dict[str, Any]) -> dict[str, Any]:
     bbox = node.get("bbox")
+    metadata = node.get("metadata") or {}
+    visual_bbox = node.get("visual_bbox") or metadata.get("visual_bbox")
     return {
         "node_id": str(node["node_id"]),
         "origin_id": str(node.get("origin_id") or ""),
@@ -629,7 +631,7 @@ def _review_node(node: dict[str, Any]) -> dict[str, Any]:
         "resource_id": str(node.get("resource_id") or ""),
         "class_name": str(node.get("class_name") or ""),
         "bbox": [float(value) for value in bbox] if bbox else None,
-        "visual_bbox": [float(value) for value in node.get("visual_bbox", [])] if node.get("visual_bbox") else None,
+        "visual_bbox": [float(value) for value in visual_bbox] if visual_bbox else None,
         "clickable": bool(node.get("clickable")),
         "editable": bool(node.get("editable")),
     }

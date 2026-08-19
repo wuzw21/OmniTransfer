@@ -68,6 +68,7 @@ textarea { width: 100%; min-height: 92px; margin-top: 9px; padding: 8px; resize:
 .muted { color: #8998b0; }
 .timing-summary { color: #91a2bb; font-size: 12px; white-space: nowrap; }
 .live-mapping-status { color: #63e6be; font-size: 12px; white-space: nowrap; }
+.static-mode-warning { flex: 1 0 100%; padding: 7px 10px; border: 1px solid #7a3c43; border-radius: 7px; background: #32171c; color: #ffb4ab; font-size: 12px; }
 .cluster-group { min-width: 0; padding: 10px; border: 1px solid #273146; border-radius: 10px; background: #0f151f; }
 .cluster-group > h3 { margin: 0 0 8px; font-size: 14px; }
 .cluster-members { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(210px, 100%), 1fr)); gap: 8px; }
@@ -125,6 +126,7 @@ textarea { width: 100%; min-height: 92px; margin-top: 9px; padding: 8px; resize:
   <button id="clearPoints">清空人工点</button>
   <span class="timing-summary" id="timingSummary"></span>
   <span class="live-mapping-status" id="liveMappingStatus"></span>
+  <span class="static-mode-warning" id="staticModeWarning" hidden></span>
   <span class="spacer"></span>
   <button id="export">导出审核 JSONL</button>
 </header>
@@ -151,6 +153,12 @@ async function loadPayload() {
 }
 const payload = await loadPayload();
 const summary = payload.summary || {};
+const staticFileMode = location.protocol === 'file:';
+if (staticFileMode) {
+  const warning = document.getElementById('staticModeWarning');
+  warning.hidden = false;
+  warning.textContent = '静态文件模式不能实时映射。请使用构建器 --serve 输出的 http://127.0.0.1 地址。';
+}
 let queue = payload.pairs || [];
 const pagePairReview = summary.review_ui?.protocol === 'page_pair_prior';
 const multiMappingReview = summary.review_ui?.protocol === 'mapping_pair_correspondence' && summary.review_ui?.multi_mapping === true;
@@ -183,7 +191,8 @@ if (unifiedManualMode && multiMappingReview) {
       const task = baseQueue.find(row => row.pair_id === item.pair_id);
       const mapping = task?.mappings?.find(row => row.source_label === item.source_label);
       if (!task || !mapping) return null;
-      const oursNode = item.ours_node || task.target?.candidates?.find(node => node.node_id === item.ours_node_id) || null;
+      const canonicalOursNode = task.target?.candidates?.find(node => node.node_id === item.ours_node_id) || null;
+      const oursNode = canonicalOursNode ? {...(item.ours_node || {}), ...canonicalOursNode} : (item.ours_node || null);
       return {
         ...task,
         task_id: `unified-error:${index + 1}:${item.pair_id}:${item.source_label}`,
@@ -473,7 +482,9 @@ function remainingPanel(task, side) {
   const liveSuffix = mappingReview.live_ours_status === 'pending' ? ' · 实时计算中' : mappingReview.live_ours_status === 'scored' ? ' · 实时' : ['failed','no_candidates'].includes(mappingReview.live_ours_status) ? ' · 实时计算失败' : '';
   const title = side === 'source' ? 'Source · 左' : `Target · 右 · ${task.review_meta?.review_group === 'manual_browser_annotation' ? '当前标注锚点' : '我们的方案'}${liveSuffix}`;
   const sourcePoint = mappingReview.source_point || (mappingReview.live_ours_status ? nodeCenterPoint(node) : null);
-  const targetPoint = mappingReview.live_ours_point || (liveMode ? nodeCenterPoint(oursNode) : null);
+  const targetPoint = mappingReview.live_ours_point
+    ? toVisualPoint(mappingReview.live_ours_point, oursNode)
+    : (liveMode ? nodeCenterPoint(oursNode) : null);
   const targetOverlays = side === 'target'
     // Keep both the reference point (G) and our mapped point (M/R) visible,
     // even when they resolve to the same node.  The review contract is to
@@ -540,6 +551,7 @@ function nodeCenterPoint(node) {
   return bbox ? {x:(bbox[0]+bbox[2])/2, y:(bbox[1]+bbox[3])/2, coordinate_space:node?.visual_bbox ? 'screenshot_pixels' : 'page_pixels', node_id:node?.node_id || null} : null;
 }
 function toVisualPoint(point, node) {
+  if (point?.coordinate_space === 'screenshot_pixels') return point;
   const graph = node?.bbox, visual = node?.visual_bbox;
   if (!point || !graph || !visual) return point;
   const graphWidth = Math.max(1e-9, graph[2] - graph[0]), graphHeight = Math.max(1e-9, graph[3] - graph[1]);
@@ -633,6 +645,11 @@ function liveRequestBody(task, snappedNode, sourcePoint) {
   };
 }
 async function runLiveIcon(task, snappedNode, sourcePoint, requestId) {
+  if (staticFileMode) {
+    setAnnotation(task, {live_ours_status:'failed',live_ours_error:'静态文件模式不能实时映射'});
+    updateLiveMappingStatus(task, annotation(task));
+    return;
+  }
   setAnnotation(task, {
     live_ours_node_id:null,
     live_ours_status:'pending',
@@ -676,6 +693,10 @@ async function runLiveIcon(task, snappedNode, sourcePoint, requestId) {
 function updateLiveMappingStatus(task, review) {
   const status = byId('liveMappingStatus');
   if (!status) return;
+  if (staticFileMode) {
+    status.textContent = '实时映射：不可用 · 请使用 HTTP 服务地址';
+    return;
+  }
   if (remainingManualMode && multiMappingReview) {
     const mapping = taskMappings(task)[0], mappingReview = mapping ? mappingAnnotation(task, mapping) : {};
     const node = mappingReview.live_ours_node_id || mapping?.ours_target_node?.node_id;
@@ -851,6 +872,11 @@ function stagePoint(event, stage, page) {
   };
 }
 async function runUnifiedLiveMapping(baseTask, task, mapping, snappedNode, sourcePoint, requestId) {
+  if (staticFileMode) {
+    setMappingAnnotation(baseTask, mapping, {live_ours_status:'failed',live_ours_error:'静态文件模式不能实时映射'});
+    updateLiveMappingStatus(task, annotation(task));
+    return;
+  }
   setMappingAnnotation(baseTask, mapping, {
     source_node_id:snappedNode?.node_id || null,
     source_point:sourcePoint,
@@ -1065,6 +1091,11 @@ function render() {
       byId('saved').textContent = mapping ? `${mapping.label} · ${mappingReview.verdict || '未审核'} · Source=${mappingReview.source_node_id || mapping.source_node?.node_id || '待选择'} · 人工点 ${points.length} · 点击左侧 Source，再点击右侧 Target` : '当前页面对没有映射';
       const sourceWrap = document.querySelector('.image-stage[data-side="source"]');
       const runLiveOurs = async (snappedNode, sourcePoint, requestId) => {
+        if (staticFileMode) {
+          setMappingAnnotation(baseTask, mapping, {live_ours_status:'failed',live_ours_error:'静态文件模式不能实时映射'});
+          updateLiveMappingStatus(task, annotation(task));
+          return;
+        }
         setMappingAnnotation(baseTask, mapping, {
           source_node_id:snappedNode?.node_id || null,
           source_point:sourcePoint,
