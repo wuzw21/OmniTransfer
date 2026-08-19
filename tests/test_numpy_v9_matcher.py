@@ -5,21 +5,22 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from omnitransfer.learned_matcher import GeometricMatcher
+from omnitransfer.learned_matcher import (
+    GeometricMatcher,
+    MatcherConfig,
+    build_geometric_v9_matcher,
+    matcher_inputs,
+    save_matcher_checkpoint,
+)
 from omnitransfer.numpy_v9_matcher import (
     NumpyGeometricAlignmentMatcher,
-    save_numpy_geometric_v9_checkpoint,
+    save_numpy_unified_association_checkpoint,
 )
 from omnitransfer.ui_graph import graph_from_record
 
 torch = pytest.importorskip("torch", exc_type=ImportError)
 
 
-CHECKPOINT = (
-    Path(__file__).resolve().parents[1]
-    / "src/omnitransfer/checkpoints/omnitransfer_direct_text_alignment_v9_20260805/"
-    "v9_direct_text_alignment_seed29.pt"
-)
 SOURCE_XML = """
 <hierarchy bounds="[0,0][120,240]">
   <node class="android.view.ViewGroup" bounds="[0,0][120,240]">
@@ -47,13 +48,23 @@ TARGET_XML = SOURCE_XML.replace(
 )
 
 
-def _export(path: Path) -> None:
-    payload = torch.load(CHECKPOINT, map_location="cpu", weights_only=False)
-    matcher = GeometricMatcher.from_checkpoint(CHECKPOINT)
-    save_numpy_geometric_v9_checkpoint(
+def _export(path) -> None:
+    torch.manual_seed(17)
+    config = MatcherConfig(
+        hidden_dim=32,
+        relation_hidden_dim=16,
+        association_dim=24,
+        num_heads=4,
+        association_layers=2,
+        dropout=0.0,
+    )
+    model = build_geometric_v9_matcher(config).eval()
+    torch_checkpoint = path.with_suffix(".pt")
+    save_matcher_checkpoint(torch_checkpoint, model, config=config)
+    save_numpy_unified_association_checkpoint(
         path,
-        payload["state_dict"],
-        config=matcher.config,
+        model.state_dict(),
+        config=config,
     )
 
 
@@ -66,7 +77,8 @@ def test_v9_numpy_export_is_deterministic_and_pickle_free(tmp_path: Path) -> Non
     assert first.read_bytes() == second.read_bytes()
     with np.load(first, allow_pickle=False) as checkpoint:
         assert "__schema_version__" in checkpoint.files
-        assert "local_alignment_score.3.weight" in checkpoint.files
+        assert "association_layers.0.local.message_projection.weight" in checkpoint.files
+        assert "page_attention.1.weight" in checkpoint.files
 
 
 def test_v9_numpy_matches_pytorch_candidate_ranking(tmp_path: Path) -> None:
@@ -77,7 +89,7 @@ def test_v9_numpy_matches_pytorch_candidate_ranking(tmp_path: Path) -> None:
     source_node = next(node for node in source.nodes if node.content_desc == "搜索")
     candidates = tuple(node.node_id for node in target.nodes if node.clickable)
 
-    pytorch_match = GeometricMatcher.from_checkpoint(CHECKPOINT).predict(
+    pytorch_match = GeometricMatcher.from_checkpoint(exported.with_suffix(".pt")).predict(
         source,
         target,
         source_node_id=source_node.node_id,
@@ -102,3 +114,66 @@ def test_v9_numpy_matches_pytorch_candidate_ranking(tmp_path: Path) -> None:
         rtol=2e-4,
         atol=2e-4,
     )
+
+
+def test_v9_numpy_predict_many_reuses_page_pair_forward(tmp_path: Path, monkeypatch) -> None:
+    exported = tmp_path / "v9.npz"
+    _export(exported)
+    source = graph_from_record({"xml": SOURCE_XML}, graph_id="source")
+    target = graph_from_record({"xml": TARGET_XML}, graph_id="target")
+    source_nodes = [node for node in source.nodes if node.clickable]
+    candidates = tuple(node.node_id for node in target.nodes if node.clickable)
+    matcher = NumpyGeometricAlignmentMatcher.from_checkpoint(exported)
+    original_forward = matcher._forward
+    calls = 0
+
+    def counted_forward(source_graph, target_graph):
+        nonlocal calls
+        calls += 1
+        return original_forward(source_graph, target_graph)
+
+    monkeypatch.setattr(matcher, "_forward", counted_forward)
+    predictions = matcher.predict_many(
+        source,
+        target,
+        source_node_ids=[node.node_id for node in source_nodes],
+        candidate_node_ids=candidates,
+    )
+
+    assert calls == 1
+    assert set(predictions) == {node.node_id for node in source_nodes}
+    for node in source_nodes:
+        single = matcher.predict(
+            source,
+            target,
+            source_node_id=node.node_id,
+            candidate_node_ids=candidates,
+        )
+        batched = predictions[node.node_id]
+        batched_id = batched.target_node.node_id if batched.target_node else None
+        single_id = single.target_node.node_id if single.target_node else None
+        assert batched_id == single_id
+        np.testing.assert_allclose(
+            [score for _, score in batched.scores],
+            [score for _, score in single.scores],
+            rtol=2e-4,
+            atol=2e-4,
+        )
+
+
+def test_v9_numpy_page_embedding_matches_contextual_torch_readout(tmp_path: Path) -> None:
+    exported = tmp_path / "v9.npz"
+    _export(exported)
+    graph = graph_from_record({"xml": SOURCE_XML}, graph_id="page")
+    torch_matcher = GeometricMatcher.from_checkpoint(exported.with_suffix(".pt"))
+    numpy_matcher = NumpyGeometricAlignmentMatcher.from_checkpoint(exported)
+
+    with torch.inference_mode():
+        expected = torch_matcher.model(
+            *matcher_inputs(graph, graph, config=torch_matcher.config)
+        )["source_config_embedding"].numpy()
+    actual = numpy_matcher.page_embedding(graph)
+
+    assert actual.shape == (torch_matcher.config.hidden_dim,)
+    assert np.linalg.norm(actual) == pytest.approx(1.0, abs=1e-5)
+    np.testing.assert_allclose(actual, expected, rtol=2e-4, atol=2e-4)

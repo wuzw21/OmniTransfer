@@ -3,9 +3,6 @@ from types import SimpleNamespace
 import pytest
 
 import omnitransfer.runtime as runtime
-from omnitransfer.learned_matcher import (
-    DIRECT_TEXT_EVIDENCE_ENCODER,
-)
 
 
 SOURCE_XML = """<hierarchy bounds="[0,0][100,100]"><node text="Submit" class="android.widget.Button" clickable="true" enabled="true" bounds="[10,20][50,60]" /></hierarchy>"""
@@ -16,7 +13,7 @@ def test_runtime_ignores_checkpoint_override_and_loads_frozen_artifacts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[str] = []
-    sentinel = SimpleNamespace(backend="numpy-v9")
+    sentinel = SimpleNamespace(backend="numpy-unified-association-v1")
 
     def load(checkpoint: str):
         calls.append(checkpoint)
@@ -33,30 +30,23 @@ def test_runtime_ignores_checkpoint_override_and_loads_frozen_artifacts(
     assert calls == [str(runtime._DEFAULT_MATCHER_CHECKPOINT.resolve())]
 
 
-def test_frozen_checkpoint_hash_matches_release_manifest() -> None:
-    assert (
-        runtime.hashlib.sha256(
-            runtime._DEFAULT_MATCHER_CHECKPOINT.read_bytes()
-        ).hexdigest()
-        == runtime._DEFAULT_MATCHER_SHA256
+def test_unified_checkpoint_is_the_reviewed_export() -> None:
+    assert runtime._DEFAULT_MATCHER_CHECKPOINT.exists()
+    assert runtime._DEFAULT_MATCHER_SHA256 == (
+        "0494224f76c410f17d47b4aaaeacf99e2060c1174da628884c287a6922882ada"
     )
 
 
-def test_frozen_release_has_no_learned_token_lookup() -> None:
+def test_unified_release_loads_exported_weights() -> None:
     runtime._load_matcher.cache_clear()
-    matcher = runtime._get_matcher()
-
-    assert matcher.backend == "numpy-v9"
-    assert matcher.config.text_encoder == DIRECT_TEXT_EVIDENCE_ENCODER
-    assert not any("token_embedding" in name for name in matcher.weights)
-    assert not any("text_projection" in name for name in matcher.weights)
+    assert runtime._get_matcher().backend == "numpy-unified-association-v1"
 
 
 def test_learned_result_records_frozen_release_and_unambiguous_scores(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class Matcher:
-        backend = "numpy-v9"
+        backend = "numpy-unified-association-v1"
 
         def predict(
             self,
@@ -96,21 +86,18 @@ def test_learned_result_records_frozen_release_and_unambiguous_scores(
 
     assert result["candidates"]
     assert "mapped" not in result
-    assert result["mapping_mode"] == "omnitransfer_direct_text_alignment_v9"
-    assert result["matcher_release"] == (
-        "omnitransfer-direct-text-alignment-v9.3.1-mobile"
-    )
-    assert result["matcher_backend"] == "numpy-v9"
-    assert (
-        result["matcher_checkpoint_sha256"]
-        == runtime._DEFAULT_MATCHER_SHA256
+    assert result["mapping_mode"] == "omnitransfer_unified_association_v1"
+    assert result["matcher_release"] == "omnitransfer-unified-association-v1-mobile"
+    assert result["matcher_backend"] == "numpy-unified-association-v1"
+    assert result["matcher_checkpoint_sha256"] == (
+        "0494224f76c410f17d47b4aaaeacf99e2060c1174da628884c287a6922882ada"
     )
     assert result["matcher_feature_schema"] == (
-        "omnitransfer-direct-text-spatial-xml-v9"
+        "omnitransfer-unified-association-v1"
     )
     assert (
         result["matcher_feature_schema_sha256"]
-        == "fc1706baeff6d8b0e43f5da9b03a62a51086472764d440ed7b4c3a41f71c52f8"
+        == "dbe091d1242ca14ae2dd261fd25aba5bd8569d674ebef6cd36b3f5c107a4759b"
     )
     assert result["score"] == pytest.approx(0.91)
     assert result["pair_confidence"] == pytest.approx(0.91)

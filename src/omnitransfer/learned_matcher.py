@@ -11,7 +11,14 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from omnitransfer.ui_graph import BBox, UIGraph, UINode
+from omnitransfer.ui_graph import (
+    BBox,
+    UIGraph,
+    UINode,
+    local_context_graph,
+    multi_anchor_context_graph,
+    visual_bbox_fraction,
+)
 
 RELATION_FEATURE_DIM = 18
 XML_NODE_FEATURE_DIM = 32
@@ -45,7 +52,6 @@ DIRECT_PAIR_EVIDENCE_NAMES = (
     "enabled_both",
     "enabled_mismatch",
 )
-DIRECT_SEMANTIC_EVIDENCE_NAMES = DIRECT_PAIR_EVIDENCE_NAMES[:4]
 TYPED_RELATION_NAMES = (
     "identity",
     "parent",
@@ -61,6 +67,7 @@ TYPED_RELATION_NAMES = (
     "neighbor_above",
     "neighbor_below",
     "near",
+    "kinship_proximity",
     "control_to_context",
     "context_to_control",
 )
@@ -81,12 +88,12 @@ ALIGNMENT_RELATION_FEATURE_INDICES = (
     16,
     17,
 )
-SPATIAL_XML_ALIGNMENT_TOP_K = 5
-SPATIAL_XML_ALIGNMENT_MAX_LOG_GAP = 5.0
-SPATIAL_XML_ALIGNMENT_DUPLICATE_MAX_LOG_GAP = 2.0
 LEARNED_TOKEN_LOOKUP_ENCODER = "learned_token_lookup"
 DIRECT_TEXT_EVIDENCE_ENCODER = "direct_text_evidence"
 ALL_NODE_CANDIDATE_POLICY = "all_nodes"
+LEGACY_GLOBAL_POOL_VISUAL_ENCODER = "legacy_global_pool_v1"
+SPATIAL_CNN_VISUAL_ENCODER = "spatial_cnn_v2"
+DETERMINISTIC_ICON_VISUAL_ENCODER = "deterministic_icon_v1"
 
 
 @dataclass(frozen=True)
@@ -101,10 +108,10 @@ class MatcherConfig:
     association_dim: int = 64
     association_layers: int = 2
     num_heads: int = 4
-    num_layers: int = 4
     dropout: float = 0.05
     visual_patch_size: int = 32
     visual_canvas_size: int = 384
+    visual_encoder: str = DETERMINISTIC_ICON_VISUAL_ENCODER
     source_context_nodes: int = 48
     target_context_nodes: int = 64
     architecture: str = OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE
@@ -303,6 +310,9 @@ def typed_relation_bases(relations: Any, numeric_features: Any) -> Any:
     local = relations[..., 17].clamp(0.0, 1.0) * non_identity
     same_row = relations[..., 6].clamp(0.0, 1.0) * local
     same_column = relations[..., 7].clamp(0.0, 1.0) * local
+    kinship_proximity = (
+        (1.0 - relations[..., 16].clamp(0.0, 1.0)) * local
+    )
     delta_x = relations[..., 9]
     delta_y = relations[..., 10]
     actionable = (
@@ -336,6 +346,7 @@ def typed_relation_bases(relations: Any, numeric_features: Any) -> Any:
             delta_y.lt(0.0).to(relations.dtype) * same_column,
             delta_y.gt(0.0).to(relations.dtype) * same_column,
             local,
+            kinship_proximity,
             control_to_context,
             context_to_control,
         ),
@@ -346,401 +357,6 @@ def typed_relation_bases(relations: Any, numeric_features: Any) -> Any:
         normalizer > 0.0,
         bases / normalizer.clamp_min(torch.finfo(bases.dtype).eps),
         bases,
-    )
-
-
-def semantic_anchor_relation_vote(
-    direct_pair_evidence: Any,
-    source_bases: Any,
-    target_bases: Any,
-    relation_compatibility: Any,
-    *,
-    minimum_semantic_score: float = 1.0,
-    minimum_margin: float = 0.5,
-) -> Any:
-    """Vote for node pairs using bidirectionally unique semantic anchors."""
-
-    torch = _require_torch()
-    if direct_pair_evidence.ndim != 3:
-        raise ValueError("direct pair evidence must be three-dimensional")
-    source_count, target_count, feature_count = direct_pair_evidence.shape
-    relation_count = len(TYPED_RELATION_NAMES)
-    if feature_count < len(DIRECT_SEMANTIC_EVIDENCE_NAMES):
-        raise ValueError("direct pair evidence is missing semantic features")
-    if source_bases.shape != (relation_count, source_count, source_count):
-        raise ValueError("source relation bases do not align with pair evidence")
-    if target_bases.shape != (relation_count, target_count, target_count):
-        raise ValueError("target relation bases do not align with pair evidence")
-    if relation_compatibility.shape != (relation_count, relation_count):
-        raise ValueError("relation compatibility has an unexpected shape")
-    if source_count == 0 or target_count == 0:
-        return direct_pair_evidence.new_zeros((source_count, target_count))
-
-    semantic_scores = direct_pair_evidence[
-        ..., : len(DIRECT_SEMANTIC_EVIDENCE_NAMES)
-    ].sum(dim=-1)
-    source_best_scores, source_best_targets = semantic_scores.max(dim=1)
-    target_best_scores, target_best_sources = semantic_scores.max(dim=0)
-    source_margins = source_best_scores
-    target_margins = target_best_scores
-    if target_count > 1:
-        source_top_two = torch.topk(semantic_scores, 2, dim=1).values
-        source_margins = source_top_two[:, 0] - source_top_two[:, 1]
-    if source_count > 1:
-        target_top_two = torch.topk(semantic_scores, 2, dim=0).values
-        target_margins = target_top_two[0] - target_top_two[1]
-    source_indices = torch.arange(source_count, device=semantic_scores.device)
-    mutual = target_best_sources[source_best_targets].eq(source_indices)
-    retained = (
-        mutual
-        & source_best_scores.ge(float(minimum_semantic_score))
-        & source_margins.ge(float(minimum_margin))
-        & target_margins[source_best_targets].ge(float(minimum_margin))
-    )
-    source_anchors = source_indices[retained]
-    if source_anchors.numel() == 0:
-        return semantic_scores.new_zeros((source_count, target_count))
-    target_anchors = source_best_targets[source_anchors]
-
-    source_binary = source_bases.gt(0).to(source_bases.dtype)
-    target_binary = target_bases.gt(0).to(target_bases.dtype)
-    source_outgoing = source_binary[:, :, source_anchors]
-    target_outgoing = target_binary[:, :, target_anchors]
-    source_incoming = source_binary[:, source_anchors, :].permute(0, 2, 1)
-    target_incoming = target_binary[:, target_anchors, :].permute(0, 2, 1)
-    vote = torch.einsum(
-        "ria,rq,qja->ij",
-        source_outgoing,
-        relation_compatibility,
-        target_outgoing,
-    )
-    vote = vote + torch.einsum(
-        "ria,rq,qja->ij",
-        source_incoming,
-        relation_compatibility,
-        target_incoming,
-    )
-    support = torch.einsum(
-        "ria,qja->ija",
-        source_outgoing,
-        target_outgoing,
-    ).gt(0).sum(dim=-1)
-    support = support.to(vote.dtype) + torch.einsum(
-        "ria,qja->ija",
-        source_incoming,
-        target_incoming,
-    ).gt(0).sum(dim=-1).to(vote.dtype)
-    return vote / support.clamp_min(1.0)
-
-
-def relational_consensus_features(
-    log_assignment: Any,
-    source_bases: Any,
-    target_bases: Any,
-) -> Any:
-    """Return typed relation agreement around the frozen v8 assignment.
-
-    The feature is permutation equivariant and uses only within-page typed
-    relations.  Each candidate pair receives one channel for every source and
-    target relation-type combination.  The frozen v8 assignment supplies soft
-    anchors, while identity edges are removed so a candidate cannot vote for
-    itself.
-    """
-
-    torch = _require_torch()
-    relation_count = len(TYPED_RELATION_NAMES)
-    if log_assignment.ndim != 2:
-        raise ValueError("log assignment must be two-dimensional")
-    source_count, target_count = log_assignment.shape
-    if source_bases.shape != (relation_count, source_count, source_count):
-        raise ValueError("source relation bases do not align with assignment")
-    if target_bases.shape != (relation_count, target_count, target_count):
-        raise ValueError("target relation bases do not align with assignment")
-    if source_count == 0 or target_count == 0:
-        return log_assignment.new_zeros(
-            (source_count, target_count, relation_count * relation_count)
-        )
-
-    anchor_weights = log_assignment.exp().detach()
-    source_relations = source_bases.clone()
-    target_relations = target_bases.clone()
-    source_relations[0] = 0.0
-    target_relations[0] = 0.0
-    outgoing = torch.einsum(
-        "ria,ab,qjb->ijrq",
-        source_relations,
-        anchor_weights,
-        target_relations,
-    )
-    incoming = torch.einsum(
-        "rai,ab,qbj->ijrq",
-        source_relations,
-        anchor_weights,
-        target_relations,
-    )
-    return (outgoing + incoming).flatten(start_dim=2)
-
-
-def relative_geometry_consensus_features(
-    log_assignment: Any,
-    source_relations: Any,
-    target_relations: Any,
-) -> Any:
-    """Return continuous within-page relation agreement around soft anchors.
-
-    The feature compares only relative edges inside each page.  It excludes
-    identity and relative node-size channels, so global translation, display
-    size, and page order are not model inputs.  Source/target exchange simply
-    transposes the candidate matrix, preserving matcher symmetry.
-    """
-
-    torch = _require_torch()
-    if log_assignment.ndim != 2:
-        raise ValueError("log assignment must be two-dimensional")
-    source_count, target_count = log_assignment.shape
-    expected_source = (source_count, source_count, RELATION_FEATURE_DIM)
-    expected_target = (target_count, target_count, RELATION_FEATURE_DIM)
-    if source_relations.shape != expected_source:
-        raise ValueError("source relations do not align with assignment")
-    if target_relations.shape != expected_target:
-        raise ValueError("target relations do not align with assignment")
-    feature_count = len(ALIGNMENT_RELATION_FEATURE_INDICES)
-    if source_count == 0 or target_count == 0:
-        return log_assignment.new_zeros(
-            (source_count, target_count, feature_count)
-        )
-
-    feature_indices = torch.tensor(
-        ALIGNMENT_RELATION_FEATURE_INDICES,
-        dtype=torch.long,
-        device=log_assignment.device,
-    )
-    source = source_relations.index_select(-1, feature_indices).clone()
-    target = target_relations.index_select(-1, feature_indices).clone()
-    source_indices = torch.arange(source_count, device=log_assignment.device)
-    target_indices = torch.arange(target_count, device=log_assignment.device)
-    source[source_indices, source_indices] = 0.0
-    target[target_indices, target_indices] = 0.0
-    anchor_weights = log_assignment.exp().detach()
-    outgoing = torch.einsum(
-        "iak,ab,jbk->ijk",
-        source,
-        anchor_weights,
-        target,
-    )
-    incoming = torch.einsum(
-        "aik,ab,bjk->ijk",
-        source,
-        anchor_weights,
-        target,
-    )
-    return outgoing + incoming
-
-
-def spatial_xml_alignment_choice(
-    scores: Iterable[float],
-    *,
-    source_node: UINode,
-    target_nodes: tuple[UINode, ...],
-    source_graph: UIGraph,
-    target_graph: UIGraph,
-    top_k: int = SPATIAL_XML_ALIGNMENT_TOP_K,
-    max_log_gap: float = SPATIAL_XML_ALIGNMENT_MAX_LOG_GAP,
-    duplicate_max_log_gap: float = SPATIAL_XML_ALIGNMENT_DUPLICATE_MAX_LOG_GAP,
-) -> int | None:
-    """Return a conservative spatial/XML override for one model ranking.
-
-    The rule compares candidates in two scale-free coordinate systems: the
-    whole page and the largest branching XML ancestor.  It overrides the
-    model only when both systems select the same candidate within the model's
-    low-confidence top-k set.  Text and application identity are deliberately
-    absent, so repeated labels and blank controls remain distinguishable.
-    """
-
-    score_values = tuple(float(value) for value in scores)
-    if len(score_values) != len(target_nodes):
-        raise ValueError("scores and target nodes must have equal length")
-    if (
-        len(score_values) < 2
-        or top_k < 2
-        or max_log_gap < 0.0
-        or duplicate_max_log_gap < 0.0
-    ):
-        return None
-    ranked_positions = sorted(
-        range(len(score_values)),
-        key=lambda position: (
-            -score_values[position],
-            target_nodes[position].node_id,
-        ),
-    )[:top_k]
-    model_position = ranked_positions[0]
-    source_page = _normalized_node_center(source_node, source_graph)
-    source_xml = _dominant_xml_container_coordinates(source_node, source_graph)
-    if source_page is None or source_xml is None:
-        return None
-    source_local, source_ordinal = source_xml
-
-    page_positions: dict[int, tuple[float, float]] = {}
-    local_positions: dict[int, tuple[float, float]] = {}
-    ordinal_positions: dict[int, float] = {}
-    for position in ranked_positions:
-        target_node = target_nodes[position]
-        page = _normalized_node_center(target_node, target_graph)
-        target_xml = _dominant_xml_container_coordinates(
-            target_node,
-            target_graph,
-        )
-        if page is None or target_xml is None:
-            return None
-        local, ordinal = target_xml
-        page_positions[position] = page
-        local_positions[position] = local
-        if ordinal is not None:
-            ordinal_positions[position] = ordinal
-
-    def nearest(
-        source_position: tuple[float, float],
-        candidate_positions: dict[int, tuple[float, float]],
-    ) -> int:
-        return min(
-            ranked_positions,
-            key=lambda position: (
-                math.dist(source_position, candidate_positions[position]),
-                -score_values[position],
-                target_nodes[position].node_id,
-            ),
-        )
-
-    page_choice = nearest(source_page, page_positions)
-    local_choice = nearest(source_local, local_positions)
-    ordinal_choice = None
-    if source_ordinal is not None and len(ordinal_positions) == len(ranked_positions):
-        ordinal_choice = min(
-            ranked_positions,
-            key=lambda position: (
-                abs(source_ordinal - ordinal_positions[position]),
-                -score_values[position],
-                target_nodes[position].node_id,
-            ),
-        )
-    xml_agrees = page_choice == local_choice or page_choice == ordinal_choice
-    if page_choice == model_position or not xml_agrees:
-        return None
-    allowed_gap = max_log_gap
-    if _observable_role_signature(
-        target_nodes[model_position]
-    ) == _observable_role_signature(target_nodes[page_choice]):
-        allowed_gap = min(allowed_gap, duplicate_max_log_gap)
-    if score_values[model_position] - score_values[page_choice] > allowed_gap:
-        return None
-    return page_choice
-
-
-def spatial_xml_alignment_rerank_logits(
-    logits: Any,
-    *,
-    source_node: UINode,
-    target_nodes: tuple[UINode, ...],
-    source_graph: UIGraph,
-    target_graph: UIGraph,
-) -> tuple[Any, bool]:
-    """Swap the model winner with a dual-coordinate alignment consensus."""
-
-    if getattr(logits, "ndim", None) != 1:
-        raise ValueError("spatial/XML alignment expects one-dimensional logits")
-    detached_scores = tuple(float(value.detach().cpu()) for value in logits)
-    choice = spatial_xml_alignment_choice(
-        detached_scores,
-        source_node=source_node,
-        target_nodes=target_nodes,
-        source_graph=source_graph,
-        target_graph=target_graph,
-    )
-    if choice is None:
-        return logits, False
-    model_position = min(
-        range(len(detached_scores)),
-        key=lambda position: (
-            -detached_scores[position],
-            target_nodes[position].node_id,
-        ),
-    )
-    reranked = logits.clone()
-    model_score = reranked[model_position].clone()
-    reranked[model_position] = reranked[choice]
-    reranked[choice] = model_score
-    return reranked, True
-
-
-def local_semantic_context_score(
-    direct_pair_evidence: Any,
-    source_bases: Any,
-    target_bases: Any,
-    source_numeric: Any,
-    target_numeric: Any,
-) -> Any:
-    """Score controls through semantic evidence on their XML neighborhoods."""
-
-    torch = _require_torch()
-    if direct_pair_evidence.ndim != 3:
-        raise ValueError("direct pair evidence must be three-dimensional")
-    source_count, target_count, feature_count = direct_pair_evidence.shape
-    relation_count = len(TYPED_RELATION_NAMES)
-    if feature_count < len(DIRECT_SEMANTIC_EVIDENCE_NAMES):
-        raise ValueError("direct pair evidence is missing semantic features")
-    if source_bases.shape != (relation_count, source_count, source_count):
-        raise ValueError("source relation bases do not align with pair evidence")
-    if target_bases.shape != (relation_count, target_count, target_count):
-        raise ValueError("target relation bases do not align with pair evidence")
-    if source_numeric.shape[0] != source_count:
-        raise ValueError("source numeric features do not align with pair evidence")
-    if target_numeric.shape[0] != target_count:
-        raise ValueError("target numeric features do not align with pair evidence")
-    if source_numeric.shape[1] < 4 or target_numeric.shape[1] < 4:
-        raise ValueError("numeric features must expose action and enabled state")
-    if source_count == 0 or target_count == 0:
-        return direct_pair_evidence.new_zeros((source_count, target_count))
-
-    semantic_scores = direct_pair_evidence[
-        ..., : len(DIRECT_SEMANTIC_EVIDENCE_NAMES)
-    ].sum(dim=-1)
-    hierarchy_indices = tuple(
-        TYPED_RELATION_NAMES.index(name)
-        for name in ("parent", "child", "sibling", "ancestor", "descendant")
-    )
-    source_actionable = (
-        source_numeric[:, :3].sum(dim=1).gt(0.0)
-        & source_numeric[:, 3].gt(0.0)
-    )
-    target_actionable = (
-        target_numeric[:, :3].sum(dim=1).gt(0.0)
-        & target_numeric[:, 3].gt(0.0)
-    )
-    source_links = source_bases[list(hierarchy_indices)].gt(0).any(dim=0)
-    target_links = target_bases[list(hierarchy_indices)].gt(0).any(dim=0)
-    source_links = (source_links | source_links.T) & (~source_actionable)[None, :]
-    target_links = (target_links | target_links.T) & (~target_actionable)[None, :]
-
-    source_to_target_context = torch.where(
-        target_links[None, :, :],
-        semantic_scores[:, None, :],
-        torch.zeros_like(semantic_scores)[:, None, :],
-    ).amax(dim=2)
-    source_context_to_target = torch.where(
-        source_links[:, :, None],
-        semantic_scores[None, :, :],
-        torch.zeros_like(semantic_scores)[None, :, :],
-    ).amax(dim=1)
-    source_context_best = source_context_to_target
-    context_to_context = torch.where(
-        target_links[None, :, :],
-        source_context_best[:, None, :],
-        torch.zeros_like(source_context_best)[:, None, :],
-    ).amax(dim=2)
-    return torch.maximum(
-        torch.maximum(source_to_target_context, source_context_to_target),
-        context_to_context,
     )
 
 
@@ -814,11 +430,14 @@ def matcher_inputs(
         dtype=torch.float32,
         device=device,
     )
-    pair_relations = torch.as_tensor(
-        cross_relation_features(
-            source,
-            target,
-            feature_schema_id=feature_schema_id,
+    # The contextual matcher compares final node states as one dense matrix.
+    # Keep this compatibility input shape for exporters, but do not rebuild the
+    # retired Python-level candidate-pair evidence table on every mapping.
+    pair_relations = torch.zeros(
+        (
+            len(source.nodes),
+            len(target.nodes),
+            len(DIRECT_PAIR_EVIDENCE_NAMES),
         ),
         dtype=torch.float32,
         device=device,
@@ -877,7 +496,10 @@ class GeometricMatcher:
     ) -> GeometricMatcher:
         torch = _require_torch()
         payload = torch.load(Path(path), map_location=device)
-        config = MatcherConfig(**dict(payload["matcher_config"]))
+        config_payload = dict(payload["matcher_config"])
+        if "visual_encoder" not in config_payload:
+            config_payload["visual_encoder"] = LEGACY_GLOBAL_POOL_VISUAL_ENCODER
+        config = MatcherConfig(**config_payload)
         if config.architecture != OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE:
             raise ValueError("only geometric-v9 checkpoints are supported")
         model = build_geometric_v9_matcher(config)
@@ -901,27 +523,42 @@ class GeometricMatcher:
         )
         if source_node is None:
             return LearnedMatch(None, 0.0, 0.0, "source_node_missing", ())
+        source_context = local_context_graph(
+            source,
+            anchor_node_id=source_node_id,
+            max_nodes=self.config.source_context_nodes,
+        )
         source_index = next(
             (
                 index
-                for index, node in enumerate(source.nodes)
+                for index, node in enumerate(source_context.nodes)
                 if node.node_id == source_node_id
             ),
             None,
         )
         if source_index is None:
             raise AssertionError("source context dropped its anchor node")
-        allowed = set(candidate_node_ids or (node.node_id for node in target.nodes))
+        target_node_ids = {node.node_id for node in target.nodes}
+        allowed = set(
+            candidate_node_ids or (node.node_id for node in target.nodes)
+        ) & target_node_ids
+        if not allowed:
+            return LearnedMatch(None, 0.0, 0.0, "target_candidates_missing", ())
+        target_context = multi_anchor_context_graph(
+            target,
+            anchor_node_ids=allowed,
+            max_nodes=max(self.config.target_context_nodes, len(allowed)),
+        )
         candidate_indices = [
             index
-            for index, node in enumerate(target.nodes)
+            for index, node in enumerate(target_context.nodes)
             if node.node_id in allowed
         ]
         if not candidate_indices:
             return LearnedMatch(None, 0.0, 0.0, "target_candidates_missing", ())
         inputs = matcher_inputs(
-            source,
-            target,
+            source_context,
+            target_context,
             config=self.config,
             device=self.device,
             feature_schema_id=GEOMETRIC_FEATURE_SCHEMA_ID,
@@ -930,24 +567,14 @@ class GeometricMatcher:
             output = self.model(*inputs)
             selected_logits = output["logits_ab"][source_index][candidate_indices]
             selected_affinity = output["affinity"][source_index][candidate_indices]
-            if (
-                self.config.architecture
-                == OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE
-            ):
-                selected_logits, _ = spatial_xml_alignment_rerank_logits(
-                    selected_logits,
-                    source_node=source.nodes[source_index],
-                    target_nodes=tuple(
-                        target.nodes[index] for index in candidate_indices
-                    ),
-                    source_graph=source,
-                    target_graph=target,
-                )
             rank_probabilities = torch.softmax(selected_logits, dim=0)
             match_probabilities = torch.sigmoid(selected_affinity)
         ranked = sorted(
             (
-                (target.nodes[index].node_id, float(rank_probabilities[position]))
+                (
+                    target_context.nodes[index].node_id,
+                    float(rank_probabilities[position]),
+                )
                 for position, index in enumerate(candidate_indices)
             ),
             key=lambda item: (-item[1], item[0]),
@@ -956,7 +583,7 @@ class GeometricMatcher:
         best_position = next(
             position
             for position, index in enumerate(candidate_indices)
-            if target.nodes[index].node_id == best_id
+            if target_context.nodes[index].node_id == best_id
         )
         match_probability = float(match_probabilities[best_position])
         second_probability = max(
@@ -1049,6 +676,29 @@ def initialize_direct_text_from_lookup(
     return tuple(transferred)
 
 
+def initialize_nonvisual_from_model(
+    target_model: Any,
+    source_model: Any,
+) -> tuple[str, ...]:
+    """Migrate geometric-v9 while replacing only its visual encoder."""
+
+    source_state = source_model.state_dict()
+    target_state = target_model.state_dict()
+    transferred: list[str] = []
+    for target_name, target_value in target_state.items():
+        if target_name.startswith("visual_encoder."):
+            continue
+        source_value = source_state.get(target_name)
+        if source_value is None or source_value.shape != target_value.shape:
+            raise ValueError(
+                f"visual encoder migration cannot initialize {target_name}"
+            )
+        target_state[target_name] = source_value.detach().clone()
+        transferred.append(target_name)
+    target_model.load_state_dict(target_state)
+    return tuple(transferred)
+
+
 def prepare_visual_asset(
     screenshot_path: str | Path,
     *,
@@ -1059,7 +709,7 @@ def prepare_visual_asset(
     path = Path(screenshot_path)
     if not path.is_file():
         raise FileNotFoundError(f"screenshot is missing: {path}")
-    array = _load_rgb_array(str(path.resolve()), canvas_size)
+    array, _ = _load_rgb_array(str(path.resolve()), canvas_size)
     return tuple(int(value) for value in array.shape)
 
 
@@ -1083,13 +733,9 @@ def _visual_inputs(
     path = Path(screenshot_path)
     if not path.is_file():
         return empty, mask
-    image_array = _load_rgb_array(str(path.resolve()), canvas_size)
+    image_array, original_size = _load_rgb_array(str(path.resolve()), canvas_size)
     image = torch.as_tensor(image_array, dtype=torch.uint8, device=device)
     image = image.permute(2, 0, 1).unsqueeze(0).to(dtype=torch.float32).div_(255.0)
-    graph_width = float(graph.width or image_array.shape[1])
-    graph_height = float(graph.height or image_array.shape[0])
-    screenshot_width = float(image_array.shape[1])
-    screenshot_height = float(image_array.shape[0])
     normalized_boxes: list[tuple[float, float, float, float]] = []
     available: list[float] = []
     for node in graph.nodes:
@@ -1097,26 +743,22 @@ def _visual_inputs(
             normalized_boxes.append((-1.0, -1.0, -1.0, -1.0))
             available.append(0.0)
             continue
-        visual_bbox = _visual_bbox(node)
-        if visual_bbox is None or graph_width <= 0.0 or graph_height <= 0.0:
+        bbox = visual_bbox_fraction(
+            graph,
+            node,
+            image_width=original_size[0],
+            image_height=original_size[1],
+        )
+        if bbox is None:
             normalized_boxes.append((-1.0, -1.0, -1.0, -1.0))
             available.append(0.0)
             continue
-        coordinate_space = str(
-            node.metadata.get("visual_bbox_coordinate_space") or ""
-        )
-        bbox_width = (
-            screenshot_width if coordinate_space == "page_pixels" else graph_width
-        )
-        bbox_height = (
-            screenshot_height if coordinate_space == "page_pixels" else graph_height
-        )
         normalized_boxes.append(
             (
-                _clip(2.0 * visual_bbox[0] / bbox_width - 1.0, -1.0, 1.0),
-                _clip(2.0 * visual_bbox[1] / bbox_height - 1.0, -1.0, 1.0),
-                _clip(2.0 * visual_bbox[2] / bbox_width - 1.0, -1.0, 1.0),
-                _clip(2.0 * visual_bbox[3] / bbox_height - 1.0, -1.0, 1.0),
+                2.0 * bbox[0] - 1.0,
+                2.0 * bbox[1] - 1.0,
+                2.0 * bbox[2] - 1.0,
+                2.0 * bbox[3] - 1.0,
             )
         )
         available.append(1.0)
@@ -1190,7 +832,10 @@ def _apply_visual_transform(
 
 
 @lru_cache(maxsize=512)
-def _load_rgb_array(screenshot_path: str, canvas_size: int) -> Any:
+def _load_rgb_array(
+    screenshot_path: str,
+    canvas_size: int,
+) -> tuple[Any, tuple[int, int]]:
     try:
         import numpy as np
         from PIL import Image
@@ -1201,6 +846,7 @@ def _load_rgb_array(screenshot_path: str, canvas_size: int) -> Any:
 
     with Image.open(screenshot_path) as image:
         image = image.convert("RGB")
+        original_size = (image.width, image.height)
         if canvas_size > 0 and max(image.size) > canvas_size:
             scale = canvas_size / max(image.size)
             image = image.resize(
@@ -1210,7 +856,7 @@ def _load_rgb_array(screenshot_path: str, canvas_size: int) -> Any:
                 ),
                 resample=Image.Resampling.BILINEAR,
             )
-        return np.array(image, dtype=np.uint8, copy=True)
+        return np.array(image, dtype=np.uint8, copy=True), original_size
 
 
 
@@ -1671,60 +1317,6 @@ def _normalized_bbox(bbox: BBox | None, graph: UIGraph) -> BBox | None:
     )
 
 
-def _normalized_node_center(
-    node: UINode,
-    graph: UIGraph,
-) -> tuple[float, float] | None:
-    bbox = _normalized_bbox(node.bbox, graph)
-    if bbox is None:
-        return None
-    return _center(bbox)
-
-
-def _dominant_xml_container_coordinates(
-    node: UINode,
-    graph: UIGraph,
-) -> tuple[tuple[float, float], float | None] | None:
-    """Return container-local geometry and direct-branch order."""
-
-    node_center = _normalized_node_center(node, graph)
-    if node_center is None:
-        return None
-    nodes_by_id = {candidate.node_id: candidate for candidate in graph.nodes}
-    current = node
-    visited = {node.node_id}
-    best_position: tuple[float, float] | None = None
-    best_ordinal: float | None = None
-    best_child_count = 1
-    while current.parent_id and current.parent_id not in visited:
-        branch_id = current.node_id
-        visited.add(current.parent_id)
-        parent = nodes_by_id.get(current.parent_id)
-        if parent is None:
-            break
-        parent_bbox = _normalized_bbox(parent.bbox, graph)
-        child_count = len(parent.child_ids)
-        if parent_bbox is not None and child_count >= 2:
-            left, top, right, bottom = parent_bbox
-            width = right - left
-            height = bottom - top
-            if width > 0.0 and height > 0.0 and child_count > best_child_count:
-                best_position = (
-                    (node_center[0] - left) / width,
-                    (node_center[1] - top) / height,
-                )
-                best_ordinal = (
-                    parent.child_ids.index(branch_id) / (child_count - 1)
-                    if branch_id in parent.child_ids
-                    else None
-                )
-                best_child_count = child_count
-        current = parent
-    if best_position is None:
-        return None
-    return best_position, best_ordinal
-
-
 def _center(bbox: BBox | None) -> tuple[float, float]:
     if bbox is None:
         return 0.0, 0.0
@@ -1795,6 +1387,11 @@ def _ancestor_path(node_id: str, graph: UIGraph) -> list[str]:
 
 def _normalize_text(value: str) -> str:
     value = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(value or ""))
+    # Android accessibility labels often append the control role (for
+    # example ``Notifications, Tab``).  The role is not part of the
+    # cross-platform semantic label and must not turn an exact label into a
+    # weak containment-only match.
+    value = re.sub(r"\s*,\s*tab\s*$", "", value, flags=re.IGNORECASE)
     return " ".join(
         re.findall(r"[^\W_]+", value.lower(), flags=re.UNICODE)
     )
@@ -1808,18 +1405,6 @@ def _semantic_fields(node: UINode) -> tuple[str, ...]:
             _normalize_text(node.content_desc),
         )
         if value
-    )
-
-
-def _observable_role_signature(node: UINode) -> tuple[Any, ...]:
-    """Describe when two target instances expose the same observable role."""
-
-    return (
-        _semantic_fields(node),
-        _normalize_text(node.class_name),
-        bool(node.clickable),
-        bool(node.editable),
-        bool(node.scrollable),
     )
 
 

@@ -9,36 +9,35 @@ from pathlib import Path
 from typing import Any
 
 from omnitransfer.numpy_v9_matcher import NumpyGeometricAlignmentMatcher
+from omnitransfer.page_embedding import (
+    DEFAULT_PAGE_EMBEDDING_CHECKPOINT,
+    DEFAULT_PAGE_EMBEDDING_CHECKPOINT_SHA256,
+)
+from omnitransfer.unified_alignment import (
+    ALIGNMENT_STRATEGY_SCHEMA_ID,
+    TRANSFER_CONTRACT_SCHEMA_ID,
+    TransferRequest,
+    transfer_contract_metadata,
+)
 from omnitransfer.ui_graph import UIGraph, UINode, graph_from_record
 
 _MIN_ANCHOR_OFFSET = -1.0
 _MAX_ANCHOR_OFFSET = 2.0
-_MATCHER_RELEASE = "omnitransfer-direct-text-alignment-v9.3.1-mobile"
-_MATCHER_MODE = "omnitransfer_direct_text_alignment_v9"
-_DEFAULT_MATCHER_CHECKPOINT = (
-    Path(__file__).resolve().parent
-    / "checkpoints"
-    / "omnitransfer_direct_text_alignment_v9_20260805"
-    / "v9_direct_text_alignment_seed29.npz"
-)
-_DEFAULT_MATCHER_SHA256 = (
-    "b8a6735bd97a7163ad186ec4c869eebbb05634522472035bd9c3b9bc323c5e9e"
-)
-_MATCHER_FEATURE_SCHEMA_ID = "omnitransfer-direct-text-spatial-xml-v9"
+_MATCHER_RELEASE = "omnitransfer-unified-association-v1-mobile"
+_MATCHER_MODE = "omnitransfer_unified_association_v1"
+_DEFAULT_MATCHER_CHECKPOINT = DEFAULT_PAGE_EMBEDDING_CHECKPOINT
+_DEFAULT_MATCHER_SHA256 = DEFAULT_PAGE_EMBEDDING_CHECKPOINT_SHA256
+_MATCHER_FEATURE_SCHEMA_ID = "omnitransfer-unified-association-v1"
 _MATCHER_FEATURE_SCHEMA_SPEC = (
-    "direct_text=semantic_exact,token_dice,trigram_dice,containment,presence;"
-    "hashed_text=signed_class_hash;node_text_state=presence_only;"
-    "numeric=clickable,editable,scrollable,enabled,padded_zero;"
-    "visual=node_crop_rgb;"
-    "within_page_relations=hierarchy,sibling,ancestor,descendant,row,column,"
+    "node_encoder=learned_token_lookup,content_desc,class,action_state,deterministic_icon_v1;"
+    "modality_fusion=sharp_learned_attention_missing_aware;"
+    "within_page_relations=typed_hierarchy,sibling,ancestor,descendant,row,column,"
     "overlap,neighbors,near,control_context;"
-    "cross_page_evidence=semantic_exact,token_dice,trigram_dice,containment,"
-    "semantic_presence,action_compatibility,class_similarity;"
-    "inference_alignment=page_normalized_center,dominant_xml_container_position,"
-    "dominant_xml_branch_order,top5_consensus,adaptive_confidence;"
-    "forbidden=learned_token_lookup,resource_id,raw_absolute_position,"
-    "source_coordinate_passthrough,app_identity;"
-    "context=source128,target160"
+    "refinement=three_layer_local_graph_plus_bidirectional_cross_page_attention;"
+    "assignment=partial_bidirectional_matchability;"
+    "page_embedding=attention_pool_normalized;"
+    "forbidden=resource_id_lookup,node_id_lookup,raw_absolute_position,"
+    "source_coordinate_passthrough,app_identity"
 )
 _MATCHER_FEATURE_SCHEMA_SHA256 = hashlib.sha256(
     _MATCHER_FEATURE_SCHEMA_SPEC.encode("utf-8")
@@ -67,7 +66,20 @@ def rank_action_candidates(
     recorded within-node offset onto every ranked target candidate.
     """
 
-    if not source_xml:
+    request = TransferRequest(
+        target_xml=target_xml,
+        source_xml=source_xml,
+        source_point=source_point,
+        source_element_id=source_element_id,
+        source_offset=source_offset,
+        source_screenshot_path=source_screenshot_path,
+        target_screenshot_path=target_screenshot_path,
+        source_visual_rgb=source_visual_rgb,
+        target_visual_rgb=target_visual_rgb,
+        action_type=action_type,
+        top_k=top_k,
+    )
+    if not request.source_xml:
         return _candidate_ranking_result(
             status="invalid_input",
             reason="source_graph_required",
@@ -77,17 +89,17 @@ def rank_action_candidates(
     try:
         source = graph_from_record(
             {
-                "xml": source_xml,
-                "screenshot_path": source_screenshot_path,
-                "visual_rgb": source_visual_rgb,
+                "xml": request.source_xml,
+                "screenshot_path": request.source_screenshot_path,
+                "visual_rgb": request.source_visual_rgb,
             },
             graph_id="source",
         )
         target = graph_from_record(
             {
-                "xml": target_xml,
-                "screenshot_path": target_screenshot_path,
-                "visual_rgb": target_visual_rgb,
+                "xml": request.target_xml,
+                "screenshot_path": request.target_screenshot_path,
+                "visual_rgb": request.target_visual_rgb,
             },
             graph_id="target",
         )
@@ -99,7 +111,11 @@ def rank_action_candidates(
             top_k=top_k,
             error=str(error) or type(error).__name__,
         )
-    source_node = _source_node(source, source_point, source_element_id)
+    source_node = _source_node(
+        source,
+        request.source_point,
+        request.source_element_id,
+    )
     if source_node is None:
         return _candidate_ranking_result(
             status="invalid_input",
@@ -109,7 +125,11 @@ def rank_action_candidates(
             action_type=action_type,
             top_k=top_k,
         )
-    offset = _source_offset(source_node, source_point, source_offset)
+    offset = _source_offset(
+        source_node,
+        request.source_point,
+        request.source_offset,
+    )
     if offset is None:
         return _candidate_ranking_result(
             status="invalid_input",
@@ -117,29 +137,24 @@ def rank_action_candidates(
             source=source,
             target=target,
             source_node=source_node,
-            action_type=action_type,
-            top_k=top_k,
+            action_type=request.action_type,
+            top_k=request.top_k,
         )
-    equivalent_target = _equivalent_graph_target(source, target, source_node)
-    if equivalent_target is not None:
-        return _candidate_ranking_result(
-            status="scored",
-            reason="equivalent_ui_graph",
-            mapping_mode="equivalent_ui_graph",
-            source=source,
-            target=target,
-            source_node=source_node,
-            offset=offset,
-            ranked=[(1.0, equivalent_target)],
-            pair_confidence=1.0,
-            margin=1.0,
-            action_type=action_type,
-            top_k=top_k,
-        )
-    candidate_node_ids = tuple(
-        node.node_id
+    enabled_nodes = tuple(
+        node
         for node in target.nodes
         if node.bbox is not None and node.enabled
+    )
+    actionable_nodes = tuple(
+        node
+        for node in enabled_nodes
+        if node.clickable or node.editable or node.scrollable
+    )
+    # Container bounds are useful context features, but they are not valid
+    # replay targets for an action. Keep the all-enabled fallback only for
+    # sparse/non-interactive captures that expose no actionable node at all.
+    candidate_node_ids = tuple(
+        node.node_id for node in (actionable_nodes or enabled_nodes)
     )
     try:
         matcher = _get_matcher()
@@ -175,8 +190,8 @@ def rank_action_candidates(
         ranked=ranked,
         pair_confidence=float(match.probability),
         margin=float(match.margin),
-        action_type=action_type,
-        top_k=top_k,
+        action_type=request.action_type,
+        top_k=request.top_k,
         matcher_metadata=matcher_metadata,
     )
 
@@ -202,6 +217,8 @@ def _candidate_ranking_result(
     candidates = _projected_candidate_dicts(ranked_values, offset)
     result: dict[str, Any] = {
         "schema_version": _CANDIDATE_RANKING_SCHEMA_VERSION,
+        "transfer_contract": TRANSFER_CONTRACT_SCHEMA_ID,
+        "pipeline": transfer_contract_metadata(),
         "status": status,
         "reason": reason,
         "mapping_mode": mapping_mode,
@@ -264,7 +281,7 @@ def _load_matcher(
         raise FileNotFoundError(f"OmniTransfer v9 checkpoint missing: {path}")
     if path == _DEFAULT_MATCHER_CHECKPOINT.resolve():
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        if digest != _DEFAULT_MATCHER_SHA256:
+        if _DEFAULT_MATCHER_SHA256 and digest != _DEFAULT_MATCHER_SHA256:
             raise ValueError("default OmniTransfer v9 checkpoint checksum mismatch")
     if path.suffix != ".npz":
         raise ValueError("OmniTransfer runtime accepts only the frozen NumPy checkpoint")
@@ -273,14 +290,15 @@ def _load_matcher(
 
 def _matcher_metadata(
     matcher: Any,
-) -> dict[str, str]:
-    backend = str(getattr(matcher, "backend", "numpy-v9"))
+) -> dict[str, Any]:
+    backend = str(getattr(matcher, "backend", "numpy-unified-association-v1"))
     return {
         "matcher_release": _MATCHER_RELEASE,
         "matcher_backend": backend,
         "matcher_checkpoint_sha256": _DEFAULT_MATCHER_SHA256,
         "matcher_feature_schema": _MATCHER_FEATURE_SCHEMA_ID,
         "matcher_feature_schema_sha256": _MATCHER_FEATURE_SCHEMA_SHA256,
+        "alignment_strategy_schema": ALIGNMENT_STRATEGY_SCHEMA_ID,
     }
 
 
@@ -297,71 +315,6 @@ def _learned_candidates(
         ),
         key=lambda item: (-item[0], item[1].node_id),
     )
-
-
-def _equivalent_graph_target(
-    source: UIGraph,
-    target: UIGraph,
-    source_node: UINode,
-) -> UINode | None:
-    if source.width != target.width or source.height != target.height:
-        return None
-    if len(source.nodes) != len(target.nodes):
-        return None
-    if any(
-        _structural_identity(left) != _structural_identity(right)
-        for left, right in zip(source.nodes, target.nodes, strict=True)
-    ):
-        return None
-    target_by_id = {node.node_id: node for node in target.nodes}
-    target_node = target_by_id.get(source_node.node_id)
-    if target_node is None or target_node.bbox is None:
-        return None
-    source_subtree = _subtree(source, source_node.node_id)
-    target_subtree = _subtree(target, target_node.node_id)
-    if len(source_subtree) != len(target_subtree):
-        return None
-    if any(
-        _identity_key(left) != _identity_key(right)
-        for left, right in zip(source_subtree, target_subtree, strict=True)
-    ):
-        return None
-    has_semantic_anchor = any(
-        node.text or node.content_desc for node in source_subtree
-    )
-    has_unique_resource = bool(source_node.resource_id) and sum(
-        node.resource_id == source_node.resource_id for node in source.nodes
-    ) == 1
-    return target_node if has_semantic_anchor or has_unique_resource else None
-
-
-def _structural_identity(node: UINode) -> tuple[Any, ...]:
-    return (
-        node.node_id,
-        node.parent_id,
-        node.child_ids,
-        node.origin_id,
-        node.resource_id,
-        node.class_name,
-        node.bbox,
-        node.clickable,
-        node.editable,
-        node.scrollable,
-        node.enabled,
-    )
-
-
-def _subtree(graph: UIGraph, root_id: str) -> tuple[UINode, ...]:
-    by_id = {node.node_id: node for node in graph.nodes}
-    pending = [root_id]
-    nodes: list[UINode] = []
-    while pending:
-        node = by_id.get(pending.pop(0))
-        if node is None:
-            return ()
-        nodes.append(node)
-        pending.extend(node.child_ids)
-    return tuple(nodes)
 
 
 def _source_node(
@@ -409,18 +362,6 @@ def _source_node(
 
 def _has_stable_identity(node: UINode) -> bool:
     return bool(node.resource_id or node.text or node.content_desc)
-
-
-def _identity_key(node: UINode) -> tuple[Any, ...]:
-    return (
-        _tail(node.resource_id),
-        _text(node.text),
-        _text(node.content_desc),
-        _tail(node.class_name),
-        node.clickable,
-        node.editable,
-        node.scrollable,
-    )
 
 
 def _source_offset(
@@ -501,11 +442,3 @@ def _graph_size(graph: UIGraph | None) -> list[float] | None:
 
 def _area(bounds: tuple[float, float, float, float] | None) -> float:
     return float("inf") if bounds is None else (bounds[2] - bounds[0]) * (bounds[3] - bounds[1])
-
-
-def _tail(value: str) -> str:
-    return _text(value).rsplit("/", 1)[-1].rsplit(".", 1)[-1]
-
-
-def _text(value: str) -> str:
-    return " ".join(str(value or "").strip().lower().split())

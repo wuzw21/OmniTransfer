@@ -48,6 +48,78 @@ class UIGraph:
         return {node.origin_id: node for node in self.nodes}
 
 
+def visual_bbox_fraction(
+    graph: UIGraph,
+    node: UINode,
+    *,
+    image_width: float,
+    image_height: float,
+) -> BBox | None:
+    """Resolve one node crop into normalized screenshot coordinates."""
+
+    declared_visual_bbox = node.metadata.get("visual_bbox")
+    if declared_visual_bbox is not None:
+        bbox = _finite_bbox(declared_visual_bbox)
+        if bbox is None:
+            return None
+        coordinate_space = str(
+            node.metadata.get("visual_bbox_coordinate_space") or ""
+        )
+        if coordinate_space in {"page_pixels", "screenshot_pixels", "visual_pixels"}:
+            display_size = graph.metadata.get("visual_display_size")
+            if isinstance(display_size, (list, tuple)) and len(display_size) == 2:
+                try:
+                    bbox_width = float(display_size[0])
+                    bbox_height = float(display_size[1])
+                except (TypeError, ValueError):
+                    return None
+            else:
+                bbox_width = float(image_width)
+                bbox_height = float(image_height)
+        else:
+            bbox_width = float(graph.width or image_width)
+            bbox_height = float(graph.height or image_height)
+    else:
+        bbox = _finite_bbox(node.bbox)
+        if bbox is None:
+            return None
+        bbox_width = float(graph.width or image_width)
+        bbox_height = float(graph.height or image_height)
+
+    if bbox_width <= 0.0 or bbox_height <= 0.0:
+        return None
+    left, top, right, bottom = bbox
+    tolerance = 1e-6
+    if (
+        left < -tolerance
+        or top < -tolerance
+        or right > bbox_width + tolerance
+        or bottom > bbox_height + tolerance
+    ):
+        return None
+    return (
+        min(max(left / bbox_width, 0.0), 1.0),
+        min(max(top / bbox_height, 0.0), 1.0),
+        min(max(right / bbox_width, 0.0), 1.0),
+        min(max(bottom / bbox_height, 0.0), 1.0),
+    )
+
+
+def _finite_bbox(value: Any) -> BBox | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+    try:
+        bbox = tuple(float(coordinate) for coordinate in value)
+    except (TypeError, ValueError):
+        return None
+    left, top, right, bottom = bbox
+    if not all(math.isfinite(coordinate) for coordinate in bbox):
+        return None
+    if right <= left or bottom <= top:
+        return None
+    return left, top, right, bottom
+
+
 def graph_from_record(record: dict[str, Any], *, graph_id: str | None = None) -> UIGraph:
     """Parse one MobileViews/RICO-like record into a canonical UI graph.
 
@@ -109,6 +181,14 @@ def _with_record_metadata(graph: UIGraph, record: dict[str, Any]) -> UIGraph:
     screenshot_path = record.get("screenshot_path")
     if isinstance(screenshot_path, str) and screenshot_path.strip():
         metadata["screenshot_path"] = screenshot_path.strip()
+    display_width = _optional_float(
+        record.get("display_width") or record.get("screenshot_width")
+    )
+    display_height = _optional_float(
+        record.get("display_height") or record.get("screenshot_height")
+    )
+    if display_width is not None and display_height is not None:
+        metadata["visual_display_size"] = (display_width, display_height)
     visual_rgb = record.get("visual_rgb")
     if isinstance(visual_rgb, dict):
         metadata["visual_rgb"] = dict(visual_rgb)
@@ -465,6 +545,10 @@ def _node_from_payload(
     child_ids: tuple[str, ...],
     depth: int,
 ) -> UINode:
+    class_name = _text_from_payload(
+        payload,
+        ("class", "class_name", "className", "viewClass", "type"),
+    )
     return UINode(
         node_id=node_id,
         origin_id=str(
@@ -489,15 +573,9 @@ def _node_from_payload(
             payload,
             ("resource-id", "resource_id", "resourceId", "view_id", "viewId"),
         ),
-        class_name=_text_from_payload(
-            payload,
-            ("class", "class_name", "className", "viewClass", "type"),
-        ),
+        class_name=class_name,
         bbox=_bounds_from_payload(payload),
-        clickable=_bool_from_payload(
-            payload,
-            ("clickable", "is_clickable", "isClickable"),
-        ),
+        clickable=_clickable_from_payload(payload, class_name),
         editable=_bool_from_payload(
             payload,
             ("editable", "is_editable", "isEditable", "input"),
@@ -595,6 +673,37 @@ def _text_from_payload(payload: dict[str, Any], keys: tuple[str, ...]) -> str:
 
 def _bool_from_payload(payload: dict[str, Any], keys: tuple[str, ...]) -> bool:
     return _truthy(_first_present(payload, keys))
+
+
+def _clickable_from_payload(payload: dict[str, Any], class_name: str) -> bool:
+    """Read clickability, inferring it for UI formats with typed controls.
+
+    XCTest XML commonly identifies buttons with ``type``/``class`` but does
+    not emit Android's explicit ``clickable`` attribute. Treating those
+    controls as non-clickable creates a false cross-platform state mismatch.
+    Explicit values still win, including an explicit ``false``.
+    """
+
+    keys = ("clickable", "is_clickable", "isClickable")
+    if any(key in payload for key in keys):
+        return _bool_from_payload(payload, keys)
+    normalized = re.sub(r"[^a-z0-9]", "", str(class_name).lower())
+    return normalized.endswith(
+        (
+            "button",
+            "checkbox",
+            "link",
+            "menuitem",
+            "radiobutton",
+            "searchfield",
+            "securetextfield",
+            "slider",
+            "spinner",
+            "stepper",
+            "switch",
+            "textfield",
+        )
+    )
 
 
 def _first_present(payload: dict[str, Any], keys: tuple[str, ...]) -> Any:

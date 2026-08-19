@@ -67,6 +67,7 @@ textarea { width: 100%; min-height: 92px; margin-top: 9px; padding: 8px; resize:
 .legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; margin-right: 5px; border-radius: 50%; background: var(--color); }
 .muted { color: #8998b0; }
 .timing-summary { color: #91a2bb; font-size: 12px; white-space: nowrap; }
+.live-mapping-status { color: #63e6be; font-size: 12px; white-space: nowrap; }
 .cluster-group { min-width: 0; padding: 10px; border: 1px solid #273146; border-radius: 10px; background: #0f151f; }
 .cluster-group > h3 { margin: 0 0 8px; font-size: 14px; }
 .cluster-members { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(210px, 100%), 1fr)); gap: 8px; }
@@ -123,6 +124,7 @@ textarea { width: 100%; min-height: 92px; margin-top: 9px; padding: 8px; resize:
   <button id="clearSource">重置 Source</button>
   <button id="clearPoints">清空人工点</button>
   <span class="timing-summary" id="timingSummary"></span>
+  <span class="live-mapping-status" id="liveMappingStatus"></span>
   <span class="spacer"></span>
   <button id="export">导出审核 JSONL</button>
 </header>
@@ -136,15 +138,67 @@ textarea { width: 100%; min-height: 92px; margin-top: 9px; padding: 8px; resize:
   </div>
 </main>
 <script type="module">
-const payload = __OMNITRANSFER_REVIEW_PAYLOAD__;
+async function loadPayload() {
+  try {
+    return await (async () => (__OMNITRANSFER_REVIEW_PAYLOAD__))();
+  } catch (embeddedError) {
+    try {
+      return await fetch('./review.html.payload.json').then(response => response.json());
+    } catch (sidecarError) {
+      return {summary:{schema_version:'omnitransfer.review_template.v1',review_ui:{protocol:'empty'}},pairs:[]};
+    }
+  }
+}
+const payload = await loadPayload();
 const summary = payload.summary || {};
-const queue = payload.pairs || [];
+let queue = payload.pairs || [];
 const pagePairReview = summary.review_ui?.protocol === 'page_pair_prior';
 const multiMappingReview = summary.review_ui?.protocol === 'mapping_pair_correspondence' && summary.review_ui?.multi_mapping === true;
+const queryParams = new URLSearchParams(location.search);
+const unifiedManualMode = queryParams.get('unified_manual') === '1';
+const remainingManualQuery = queryParams.get('remaining_manual');
+const remainingManualMode = unifiedManualMode || remainingManualQuery === '1' || (remainingManualQuery !== '0' && multiMappingReview && summary.review_ui?.live_mapping !== false);
+const iconVisualReview = summary.review_ui?.protocol === 'icon_visual_review';
 const utgPageMerge = summary.review_ui?.protocol === 'utg_page_merge';
 const utgClusterReview = summary.review_ui?.protocol === 'utg_cluster_review';
 const minimalMappingReview = summary.review_ui?.minimal === true;
 const fixedSourceReview = summary.review_ui?.fixed_source === true;
+if (unifiedManualMode && multiMappingReview) {
+  try {
+    const manualIndex = payload.unified_manual_index || await fetch('./review.html.unified_manual.index.json').then(response => response.json());
+    const baseQueue = queue.slice();
+    summary.schema_version = 'omnitransfer.unified_error_review.v1';
+    summary.review_ui = {
+      ...(summary.review_ui || {}),
+      protocol: 'mapping_pair_correspondence',
+      multi_mapping: true,
+      template_ids: ['correct_correspondence', 'wrong_correspondence', 'ambiguous_or_absent'],
+      template_overrides: {
+        correct_correspondence: '接受 / 可点击',
+        wrong_correspondence: '错误 / 不可点击',
+        ambiguous_or_absent: '仍需核对',
+      },
+    };
+    queue = (manualIndex.rows || []).map((item, index) => {
+      const task = baseQueue.find(row => row.pair_id === item.pair_id);
+      const mapping = task?.mappings?.find(row => row.source_label === item.source_label);
+      if (!task || !mapping) return null;
+      const oursNode = item.ours_node || task.target?.candidates?.find(node => node.node_id === item.ours_node_id) || null;
+      return {
+        ...task,
+        task_id: `unified-error:${index + 1}:${item.pair_id}:${item.source_label}`,
+        review_meta: item,
+        method_tags: [{id: item.review_group || 'unified_error', label: item.reason_label || item.review_group || '统一错误审阅', count: 1}],
+        mappings: [{...mapping, mapping_id: `unified-error:${index + 1}`, ours_target_node: oursNode}],
+        verdict_ids: ['correct_correspondence', 'wrong_correspondence', 'ambiguous_or_absent'],
+      };
+    }).filter(Boolean);
+  } catch (error) {
+    summary.schema_version = 'omnitransfer.unified_error_review.missing_index';
+    queue = [];
+    document.body.dataset.reviewLoadError = String(error?.message || error);
+  }
+}
 document.body.classList.toggle('cluster-protocol', utgClusterReview);
 document.body.classList.toggle('minimal-mapping-review', minimalMappingReview);
 const idleThresholdMs = Number(summary.review_ui?.idle_threshold_ms || 10000);
@@ -161,6 +215,20 @@ let selectedMappingId = null;
 let methodOverlayMode = 'ours';
 const mappingPalette = ['#63e6be','#ffd166','#55c2ff','#ff70c7','#ff7b72','#b197fc','#8ce99a','#ffa94d','#74c0fc','#f783ac','#a9e34b','#e599f7'];
 const byId = value => document.getElementById(value);
+const methodOptions = new Map();
+queue.flatMap(task => task.method_tags || []).forEach(tag => {
+  const id = typeof tag === 'string' ? tag : tag?.id;
+  const label = typeof tag === 'string' ? tag : (tag?.label || tag?.id);
+  if (id) methodOptions.set(id,label);
+});
+const existingMethodOptions = new Set([...byId('methodFilter').options].map(option => option.value));
+methodOptions.forEach((label,id) => {
+  if (existingMethodOptions.has(id)) return;
+  const option = document.createElement('option');
+  option.value = id;
+  option.textContent = `只看 ${label}`;
+  byId('methodFilter').append(option);
+});
 byId('stageFilter').hidden = !utgClusterReview;
 byId('methodFilter').hidden = !queue.some(task => (task.method_tags || []).length);
 const hasMethodComparison = queue.some(task => task.method_comparison);
@@ -176,6 +244,38 @@ function save() { localStorage.setItem(storageKey, JSON.stringify(annotations));
 function saveExclusions() { localStorage.setItem(exclusionStorageKey, JSON.stringify(excludedPages)); }
 function annotation(task) { return annotations[task.task_id] || {}; }
 function setAnnotation(task, patch) { annotations[task.task_id] = {...annotation(task), ...patch, updated_at: new Date().toISOString()}; save(); render(); }
+function migrateLegacyLiveState() {
+  let changed = false;
+  Object.values(annotations).forEach(review => {
+    const clear = value => {
+      if (value?.live_ours_error !== 'http_501') return;
+      delete value.live_ours_error;
+      delete value.live_ours_status;
+      delete value.live_ours_node_id;
+      delete value.live_ours_request_id;
+      changed = true;
+    };
+    clear(review);
+    const clearStaleCoordinates = value => {
+      if (!value?.source_point || value.mapping_coordinate_contract === 'graph_visual_v3_manual_click') return;
+      delete value.source_node_id;
+      delete value.source_point;
+      delete value.live_ours_node_id;
+      delete value.live_ours_status;
+      delete value.live_ours_request_id;
+      delete value.live_ours_probability;
+      delete value.live_ours_margin;
+      delete value.live_ours_point;
+      delete value.live_ours_error;
+      delete value.live_ours_release;
+      value.mapping_coordinate_contract = 'graph_visual_v3_manual_click';
+      changed = true;
+    };
+    clearStaleCoordinates(review);
+    Object.values(review?.mappings || {}).forEach(value => { clear(value); clearStaleCoordinates(value); });
+  });
+  if (changed) save();
+}
 function pageKey(page) { return page?.page_key || `${page?.device_role || page?.device_serial || 'device'}:${page?.page_id || 'page'}`; }
 function isExcluded(page) { return Boolean(excludedPages[pageKey(page)]); }
 function visibleMembers(cluster) { return (cluster?.members || []).filter(page => !isExcluded(page)); }
@@ -316,6 +416,7 @@ function methodComparisonDiagnostics(task) {
   const anchors = (comparison.anchors || []).map((anchor, index) => `${index+1}. ${anchor.category} · ours rank=${anchor.ours_rank ?? '—'} · selector rank=${anchor.selector_rank ?? '—'}`).join('<br>');
   return `<div class="diagnostic"><strong>方法差异 · ours vs selector</strong><br>${comparison.anchor_count} 个对应动作点 · ${esc(counts)}<br>对应关系：源N → 我N（我们的方案）或 选N（selector）；同一个 N 表示同一个对应动作点。<br>当前显示：${methodOverlayMode === 'selector' ? 'selector（按 2 切换）' : '我们的方案（按 1 切换）'}<details class="pairwise-details"><summary>查看各对应动作点</summary><span class="muted">${esc(anchors)}</span></details></div>`;
 }
+function imageSrc(page) { return page?.screenshot_path || page?.image_url || ''; }
 function setMappingAnnotation(task, mapping, patch) {
   const review = annotation(task), mappings = {...(review.mappings || {})};
   mappings[mapping.mapping_id] = {...(mappings[mapping.mapping_id] || {}), ...patch, updated_at:new Date().toISOString()};
@@ -324,11 +425,13 @@ function setMappingAnnotation(task, mapping, patch) {
 function multiOverlay(node, side, mapping, index, page) {
   const bbox = nodeBbox(node);
   if (!bbox || !page.width || !page.height) return '';
+  const coordinateWidth = node?.visual_bbox ? (page.display_width || page.width) : page.width;
+  const coordinateHeight = node?.visual_bbox ? (page.display_height || page.height) : page.height;
   const [x1,y1,x2,y2] = bbox;
-  const left = Math.max(0, Math.min(100, x1/page.width*100));
-  const top = Math.max(0, Math.min(100, y1/page.height*100));
-  const width = Math.max(.25, Math.min(100-left, (x2-x1)/page.width*100));
-  const height = Math.max(.25, Math.min(100-top, (y2-y1)/page.height*100));
+  const left = Math.max(0, Math.min(100, x1/coordinateWidth*100));
+  const top = Math.max(0, Math.min(100, y1/coordinateHeight*100));
+  const width = Math.max(.25, Math.min(100-left, (x2-x1)/coordinateWidth*100));
+  const height = Math.max(.25, Math.min(100-top, (y2-y1)/coordinateHeight*100));
   const labelText = side === 'source' ? (mapping.source_label || `S${index+1}`) : (mapping.target_label || `M${index+1}`);
   return `<div class="overlay multi-overlay" style="--color:${esc(mappingColor(mapping,index))};left:${left}%;top:${top}%;width:${width}%;height:${height}%"><span class="tag" title="${esc(`${labelText} · ${label(node)}`)}">${esc(labelText)} · ${esc(label(node).slice(0,28))}</span><i class="point">${esc(labelText)}</i></div>`;
 }
@@ -348,7 +451,48 @@ function multiPanel(task, side) {
     }
   });
   if (byId('showCandidates').checked && side === 'target') overlays = (page.candidates || []).map(node => overlay(node, 'candidate', page)).concat(overlays);
-  return `<h3>${side === 'source' ? 'Source' : 'Target'} · ${esc(page.page_id)} · ${page.width}×${page.height}</h3><div class="image-wrap"><div class="image-stage" data-side="${side}"><img src="${esc(page.screenshot_path)}" alt="${esc(page.page_id)}">${overlays.join('')}${methodPointOverlays(task, side, page)}</div></div>`;
+  return `<h3>${side === 'source' ? 'Source' : 'Target'} · ${esc(page.page_id)} · ${page.width}×${page.height}</h3><div class="image-wrap"><div class="image-stage" data-side="${side}"><img src="${esc(imageSrc(page))}" alt="${esc(page.page_id)}">${overlays.join('')}${methodPointOverlays(task, side, page)}</div></div>`;
+}
+function remainingPanel(task, side) {
+  const page = task[side], mapping = taskMappings(task)[0], mappingReview = mapping ? mappingAnnotation(task, mapping) : {};
+  const selectedSource = mappingReview.source_node_id ? (page.candidates || []).find(node => node.node_id === mappingReview.source_node_id) : null;
+  const liveOurs = mappingReview.live_ours_node_id ? (page.candidates || []).find(node => node.node_id === mappingReview.live_ours_node_id) : null;
+  const liveMode = Boolean(mappingReview.live_ours_status);
+  const oursNode = liveMode ? liveOurs : mapping?.ours_target_node;
+  const referenceNode = mapping?.target_nodes?.[0] || null;
+  // After a manual Source click, the point itself is authoritative.  If it
+  // did not snap to an iOS XML node, do not keep drawing the old mapping's
+  // source node as if it were the clicked icon.
+  const sourcePointHitsSelectedNode = selectedSource && mappingReview.source_point
+    ? (() => { const bbox = interactionBbox(selectedSource), point = mappingReview.source_point; return Boolean(bbox && point && bbox[0] <= point.x && point.x <= bbox[2] && bbox[1] <= point.y && point.y <= bbox[3]); })()
+    : Boolean(selectedSource);
+  const node = side === 'source'
+    ? (sourcePointHitsSelectedNode ? selectedSource : (mappingReview.source_point ? null : mapping?.source_node))
+    : oursNode;
+  const role = side === 'source' ? 'source' : (task.review_meta?.review_group === 'manual_browser_annotation' ? 'selector' : 'matcher');
+  const liveSuffix = mappingReview.live_ours_status === 'pending' ? ' · 实时计算中' : mappingReview.live_ours_status === 'scored' ? ' · 实时' : ['failed','no_candidates'].includes(mappingReview.live_ours_status) ? ' · 实时计算失败' : '';
+  const title = side === 'source' ? 'Source · 左' : `Target · 右 · ${task.review_meta?.review_group === 'manual_browser_annotation' ? '当前标注锚点' : '我们的方案'}${liveSuffix}`;
+  const sourcePoint = mappingReview.source_point || (mappingReview.live_ours_status ? nodeCenterPoint(node) : null);
+  const targetPoint = mappingReview.live_ours_point || (liveMode ? nodeCenterPoint(oursNode) : null);
+  const targetOverlays = side === 'target'
+    // Keep both the reference point (G) and our mapped point (M/R) visible,
+    // even when they resolve to the same node.  The review contract is to
+    // compare what was annotated with what the mapper produced.
+    ? `${overlay(referenceNode, 'gold', page)}${overlay(oursNode, role, page)}${mappedPoint(targetPoint, page, 'P', '实时计算的 Target 点')}`
+    : `${overlay(node, 'source', page)}${mappingReview.source_point ? '' : overlay(node, 'matcher', page)}${mappedPoint(sourcePoint, page, 'P', '我们的 Source 点')}`;
+  return `<h3>${title} · ${esc(page.page_id)} · ${page.width}×${page.height}</h3><div class="image-wrap"><div class="image-stage" data-side="${side}"><img src="${esc(imageSrc(page))}" alt="${esc(page.page_id)}">${targetOverlays}</div></div>`;
+}
+function unifiedReviewDiagnostics(task) {
+  const meta = task.review_meta || {};
+  if (!meta.review_group) return '';
+  const flags = meta.node_flags || {};
+  const flagText = [
+    `class: ${flags.ours_class || '—'} → ${flags.reference_class || '—'}`,
+    `clickable: ${flags.ours_clickable ?? '—'} → ${flags.reference_clickable ?? '—'}`,
+    `same_parent: ${flags.same_parent ?? '—'}`,
+  ].join(' · ');
+  const join = meta.join_status ? `<br>join=${esc(meta.join_status)}${meta.annotation_mapping_id ? ` · annotation=${esc(meta.annotation_mapping_id)}` : ''}${meta.current_mapping_id ? ` · current=${esc(meta.current_mapping_id)}` : ''}` : '';
+  return `<div class="diagnostic"><strong>统一错例审阅 · ${esc(meta.review_group)}</strong><span class="tag-chip">${esc(meta.review_status || '未标记')}</span><span class="tag-chip">${esc(meta.reference_status || 'unknown')}</span><br>${esc(meta.reason_label || meta.reason_code || '—')}<br><span class="muted">${esc(flagText)}</span>${meta.note ? `<br>${esc(meta.note)}` : ''}${join}</div>`;
 }
 function multiDiagnostics(task) {
   const rows = taskMappings(task).map((mapping, index) => {
@@ -381,41 +525,195 @@ function activeTask(task, review) {
     source: {...task.source, node: query.source_node || task.source?.node},
     gold_proposal: Object.hasOwn(query, 'gold_proposal') ? query.gold_proposal : task.gold_proposal,
     gold_proposals: Object.hasOwn(query, 'gold_proposals') ? query.gold_proposals : task.gold_proposals,
-    matcher_prediction: query.matcher_prediction || task.matcher_prediction,
+    matcher_prediction: review.live_ours_status ? livePrediction(task, review) : (query.matcher_prediction || task.matcher_prediction),
     selector_prediction: query.selector_prediction || task.selector_prediction,
   };
 }
 function clamp01(value) { return Math.max(0, Math.min(1, value)); }
+// Visual overlays use screenshot-space bounds when available. Interactions and
+// live matcher requests use graph/XML-space bounds, which may differ on iOS or
+// on Android captures with a navigation-bar crop.
 function nodeBbox(node) { return node?.visual_bbox || node?.bbox || null; }
+function interactionBbox(node) { return node?.bbox || node?.visual_bbox || null; }
+function nodeCenterPoint(node) {
+  const bbox = node?.visual_bbox || interactionBbox(node);
+  return bbox ? {x:(bbox[0]+bbox[2])/2, y:(bbox[1]+bbox[3])/2, coordinate_space:node?.visual_bbox ? 'screenshot_pixels' : 'page_pixels', node_id:node?.node_id || null} : null;
+}
+function toVisualPoint(point, node) {
+  const graph = node?.bbox, visual = node?.visual_bbox;
+  if (!point || !graph || !visual) return point;
+  const graphWidth = Math.max(1e-9, graph[2] - graph[0]), graphHeight = Math.max(1e-9, graph[3] - graph[1]);
+  const offsetX = clamp01((Number(point.x) - graph[0]) / graphWidth);
+  const offsetY = clamp01((Number(point.y) - graph[1]) / graphHeight);
+  return {
+    ...point,
+    x:visual[0] + offsetX * (visual[2] - visual[0]),
+    y:visual[1] + offsetY * (visual[3] - visual[1]),
+    coordinate_space:'screenshot_pixels',
+  };
+}
+function mappedPoint(point, page, marker, title) {
+  const position = pointPercent(point, page);
+  if (!position) return '';
+  return `<i class="matcher-point mapped-point" title="${esc(`${title} · node=${point?.node_id || '未吸附'}`)}" style="left:${position.x}%;top:${position.y}%">${esc(marker)}</i>`;
+}
 function matcherMappedPoint(task, review) {
   const explicitPoint = task.matcher_prediction?.point;
-  if (explicitPoint) return explicitPoint;
+  if (explicitPoint) return toVisualPoint(explicitPoint, task.matcher_prediction?.node);
   const sourcePoint = review.source_query_point || task.source?.point;
   const sourceNode = task.source?.node;
   const targetNode = task.matcher_prediction?.node;
-  const sourceBbox = nodeBbox(sourceNode), targetBbox = nodeBbox(targetNode);
+  const sourceBbox = interactionBbox(sourceNode), targetBbox = interactionBbox(targetNode);
   if (!sourcePoint || !sourceBbox || !targetBbox) return null;
   const sourceWidth = Math.max(1e-9, sourceBbox[2] - sourceBbox[0]);
   const sourceHeight = Math.max(1e-9, sourceBbox[3] - sourceBbox[1]);
   const offsetX = clamp01((sourcePoint.x - sourceBbox[0]) / sourceWidth);
   const offsetY = clamp01((sourcePoint.y - sourceBbox[1]) / sourceHeight);
-  return {
+  return toVisualPoint({
     x: targetBbox[0] + offsetX * (targetBbox[2] - targetBbox[0]),
     y: targetBbox[1] + offsetY * (targetBbox[3] - targetBbox[1]),
     coordinate_space: 'page_pixels',
     node_id: targetNode.node_id,
     offset_x: offsetX,
     offset_y: offsetY,
+  }, targetNode);
+}
+function livePrediction(task, review) {
+  if (review.live_ours_status !== 'scored' || !review.live_ours_node_id) return null;
+  const node = (task.target?.candidates || []).find(candidate => candidate.node_id === review.live_ours_node_id);
+  if (!node) return null;
+  return {
+    node,
+    top1_node:node,
+    accepted:true,
+    reason:'live_rank_action_candidates',
+    probability:review.live_ours_probability,
+    margin:review.live_ours_margin || 0,
+    point:review.live_ours_point || null,
   };
+}
+function resolveTargetNode(page, candidate) {
+  const ids = [candidate?.node_id, candidate?.candidate_id, candidate?.resource_id].filter(value => value !== null && value !== undefined).map(String);
+  return (page?.candidates || []).find(node => [node.node_id, node.origin_id, node.resource_id].filter(Boolean).map(String).some(id => ids.includes(id))) || null;
+}
+function liveProjectedPoint(result, candidate, targetNode, page) {
+  const runtimeWidth = Number(result?.target_size?.width);
+  const runtimeHeight = Number(result?.target_size?.height);
+  const runtimeX = Number(candidate?.new_x);
+  const runtimeY = Number(candidate?.new_y);
+  if ([runtimeWidth,runtimeHeight,runtimeX,runtimeY].every(Number.isFinite) && runtimeWidth > 0 && runtimeHeight > 0) {
+    return toVisualPoint({
+      x:runtimeX/runtimeWidth*Number(page.width),
+      y:runtimeY/runtimeHeight*Number(page.height),
+      coordinate_space:'page_pixels',
+      node_id:targetNode?.node_id || candidate?.candidate_id || null,
+    }, targetNode);
+  }
+  const bbox = interactionBbox(targetNode);
+  return bbox ? toVisualPoint({
+    x:(bbox[0]+bbox[2])/2,
+    y:(bbox[1]+bbox[3])/2,
+    coordinate_space:'page_pixels',
+    node_id:targetNode?.node_id || null,
+  }, targetNode) : null;
+}
+function liveRequestBody(task, snappedNode, sourcePoint) {
+  return {
+    source_page_id:task.source.page_id,
+    target_page_id:task.target.page_id,
+    source_node_id:snappedNode?.node_id || null,
+    source_element_id:snappedNode?.node_id || null,
+    source_point:runtimeSourcePoint(sourcePoint, task.source),
+    source_offset:sourceOffset(sourcePoint, snappedNode),
+    source_size:{width:task.source.width,height:task.source.height},
+    source_xml:task.source.xml || task.source.xml_text || null,
+    target_xml:task.target.xml || task.target.xml_text || null,
+    source_screenshot_path:task.source.screenshot_path || task.source.image_url || null,
+    target_screenshot_path:task.target.screenshot_path || task.target.image_url || null,
+  };
+}
+async function runLiveIcon(task, snappedNode, sourcePoint, requestId) {
+  setAnnotation(task, {
+    live_ours_node_id:null,
+    live_ours_status:'pending',
+    live_ours_request_id:requestId,
+    live_ours_probability:null,
+    live_ours_margin:null,
+    live_ours_point:null,
+    live_ours_error:null,
+    live_ours_release:null,
+  });
+  try {
+    const response = await fetch(summary.review_ui?.live_mapping_endpoint || '/api/rank_action_candidates', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(liveRequestBody(task, snappedNode, sourcePoint)),
+    });
+    const responseText = await response.text();
+    let result;
+    try { result = JSON.parse(responseText); } catch { throw new Error(`http_${response.status}`); }
+    const current = annotation(task);
+    if (current.live_ours_request_id !== requestId) return;
+    const top = result.status === 'scored' ? (result.candidates || result.top_candidates || [])[0] : null;
+    const targetNode = resolveTargetNode(task.target, top);
+    const topId = targetNode?.node_id || top?.node_id || top?.candidate_id || null;
+    const status = topId ? 'scored' : (result.status === 'no_candidates' ? 'no_candidates' : 'failed');
+    setAnnotation(task, {
+      live_ours_node_id:topId,
+      live_ours_status:status,
+      live_ours_probability:top?.score ?? result.rank_probability ?? result.pair_confidence ?? null,
+      live_ours_margin:result.margin ?? null,
+      live_ours_point:liveProjectedPoint(result, top, targetNode, task.target),
+      live_ours_error:status === 'scored' ? null : (result.error || result.reason || `http_${response.status}`),
+      live_ours_release:result.matcher_release || null,
+    });
+    if (status === 'scored') requestAnimationFrame(revealMatcherPoint);
+  } catch (error) {
+    const current = annotation(task);
+    if (current.live_ours_request_id === requestId) setAnnotation(task, {live_ours_node_id:null,live_ours_status:'failed',live_ours_error:String(error?.message || error)});
+  }
+}
+function updateLiveMappingStatus(task, review) {
+  const status = byId('liveMappingStatus');
+  if (!status) return;
+  if (remainingManualMode && multiMappingReview) {
+    const mapping = taskMappings(task)[0], mappingReview = mapping ? mappingAnnotation(task, mapping) : {};
+    const node = mappingReview.live_ours_node_id || mapping?.ours_target_node?.node_id;
+    status.textContent = mappingReview.live_ours_status === 'pending'
+      ? '实时映射：计算中…'
+      : mappingReview.live_ours_status === 'scored'
+        ? `实时映射 P · ${node || '候选'} · p=${Number(mappingReview.live_ours_probability || 0).toFixed(3)}`
+        : ['failed','no_candidates'].includes(mappingReview.live_ours_status)
+          ? `实时映射：失败 · ${mappingReview.live_ours_error || mappingReview.live_ours_status}`
+          : '实时映射：请点击 Source';
+    return;
+  }
+  if (!iconVisualReview) { status.textContent = ''; return; }
+  if (review.live_ours_status === 'pending') { status.textContent = '实时映射：计算中…'; return; }
+  if (['failed','no_candidates'].includes(review.live_ours_status)) { status.textContent = `实时映射：失败 · ${review.live_ours_error || review.live_ours_status}`; return; }
+  const prediction = task.matcher_prediction, point = matcherMappedPoint(task, review);
+  if (point && prediction?.node) {
+    status.textContent = `实时映射 P · ${label(prediction.node)} · p=${Number(prediction.probability || 0).toFixed(3)}`;
+  } else if (review.source_query_point) {
+    status.textContent = '实时映射：当前 Source 没有自动候选';
+  } else {
+    status.textContent = '实时映射：请点击 Source';
+  }
+}
+function revealMatcherPoint() {
+  const point = document.querySelector('.matcher-point');
+  if (point) point.scrollIntoView({block:'center', inline:'center', behavior:'auto'});
 }
 function overlay(node, role, page) {
   const bbox = nodeBbox(node);
   if (!bbox || !page.width || !page.height) return '';
+  const coordinateWidth = node?.visual_bbox ? (page.display_width || page.width) : page.width;
+  const coordinateHeight = node?.visual_bbox ? (page.display_height || page.height) : page.height;
   const [x1,y1,x2,y2] = bbox;
-  const left = Math.max(0, Math.min(100, x1/page.width*100));
-  const top = Math.max(0, Math.min(100, y1/page.height*100));
-  const width = Math.max(.25, Math.min(100-left, (x2-x1)/page.width*100));
-  const height = Math.max(.25, Math.min(100-top, (y2-y1)/page.height*100));
+  const left = Math.max(0, Math.min(100, x1/coordinateWidth*100));
+  const top = Math.max(0, Math.min(100, y1/coordinateHeight*100));
+  const width = Math.max(.25, Math.min(100-left, (x2-x1)/coordinateWidth*100));
+  const height = Math.max(.25, Math.min(100-top, (y2-y1)/coordinateHeight*100));
   const names = {source:'S',gold:'G',matcher:'M',selector:'R'};
   return `<div class="overlay ${role}" style="left:${left}%;top:${top}%;width:${width}%;height:${height}%"><span class="tag" title="${esc(`${label(node)} · ${node?.node_id || 'NULL'}`)}">${names[role]} · ${esc(overlayLabel(node))}</span><i class="point">${names[role]}</i></div>`;
 }
@@ -425,10 +723,29 @@ function pointPercent(point, page) {
   let x = Number(point.x), y = Number(point.y);
   if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
   if (space === 'page_pixels') { if (!page.width || !page.height) return null; x = x/page.width*100; y = y/page.height*100; }
+  else if (space === 'screenshot_pixels') { const width = page.display_width || page.width, height = page.display_height || page.height; if (!width || !height) return null; x = x/width*100; y = y/height*100; }
   else if (space === 'relative_0_1000') { x = x/10; y = y/10; }
   else if (space === 'normalized_0_1') { x = x*100; y = y*100; }
   else if (space !== 'percent_0_100') return null;
   return {x:Math.max(0,Math.min(100,x)),y:Math.max(0,Math.min(100,y))};
+}
+function xmlUsesRelativeCoordinates(xml) {
+  return /coordinate-space=["']xml-relative-0-1|coordinate_space["']?\s*[:=]\s*["']xml_relative_0_1/.test(String(xml || ''));
+}
+function runtimeSourcePoint(point, page) {
+  if (!point) return null;
+  if (!xmlUsesRelativeCoordinates(page?.xml)) return {x:point.x,y:point.y};
+  return {x:point.x/Number(page.width),y:point.y/Number(page.height)};
+}
+function sourceOffset(point, node) {
+  const bbox = interactionBbox(node);
+  if (!point || !bbox) return null;
+  const width = Number(bbox[2])-Number(bbox[0]), height = Number(bbox[3])-Number(bbox[1]);
+  if (!(width > 0) || !(height > 0)) return {x:0.5,y:0.5};
+  return {
+    x:Math.max(0,Math.min(1,(Number(point.x)-Number(bbox[0]))/width)),
+    y:Math.max(0,Math.min(1,(Number(point.y)-Number(bbox[1]))/height)),
+  };
 }
 function payloadPoint(point, role, page) {
   const position = pointPercent(point, page);
@@ -451,7 +768,7 @@ function panel(task, side, review) {
   const page = task[side];
   if (utgPageMerge) {
     const names = {source:'Source · 1080×2400',small:'Small · 720×1280',fold:'Fold · 2208×1840'};
-    return `<h3>${names[side]} · ${esc(page.device_serial)} · ${esc(page.page_id)} · nodes=${page.node_count}</h3><div class="image-wrap"><div class="image-stage" data-side="${side}"><img src="${esc(page.screenshot_path)}" alt="${esc(page.page_id)}"></div></div>`;
+    return `<h3>${names[side]} · ${esc(page.device_serial)} · ${esc(page.page_id)} · nodes=${page.node_count}</h3><div class="image-wrap"><div class="image-stage" data-side="${side}"><img src="${esc(imageSrc(page))}" alt="${esc(page.page_id)}"></div></div>`;
   }
   const goldNodes = task.gold_proposals || [task.gold_proposal];
   let overlays = side === 'source' ? overlay(page.node, 'source', page) : [...goldNodes.map(node => overlay(node, 'gold', page)), overlay(task.matcher_prediction?.node, 'matcher', page), overlay(task.selector_prediction?.node, 'selector', page)].join('');
@@ -460,7 +777,7 @@ function panel(task, side, review) {
   if (side === 'source') overlays += queryPoint(review.source_query_point, page);
   if (side === 'target') overlays += matcherPoint(matcherMappedPoint(task, review), page);
   const manual = side === 'target' ? manualPoints(review).map((point, pointIndex) => `<i class="manual-point" title="${esc(point.node_id ? `node=${point.node_id}` : '未吸附到节点')}" style="left:${point.screen_x_pct}%;top:${point.screen_y_pct}%">H${pointIndex+1}</i>`).join('') : '';
-  return `<h3>${side === 'source' ? 'Source' : 'Target'} · ${esc(page.page_id)} · ${page.width}×${page.height}</h3><div class="image-wrap"><div class="image-stage" data-side="${side}"><img src="${esc(page.screenshot_path)}" alt="${esc(page.page_id)}">${overlays}${manual}</div></div>`;
+  return `<h3>${side === 'source' ? 'Source' : 'Target'} · ${esc(page.page_id)} · ${page.width}×${page.height}</h3><div class="image-wrap"><div class="image-stage" data-side="${side}"><img src="${esc(imageSrc(page))}" alt="${esc(page.page_id)}">${overlays}${manual}</div></div>`;
 }
 function diagnostic(title, node, extras='') { return `<div class="diagnostic"><strong>${esc(title)}</strong>${esc(label(node))}<br><span class="muted">${esc(node?.node_id || 'NULL')}</span>${node?.view_str ? `<br><span class="muted">view_str=${esc(node.view_str)}</span>` : ''}${node?.origin_id ? `<br><span class="muted">origin=${esc(node.origin_id)}</span>` : ''}${extras}</div>`; }
 function rankText(rows) { return (rows || []).map((row,index) => `${index+1}. ${row.page_id.slice(0,10)} · ${Number(row.score).toFixed(4)} · n=${row.node_count}`).join('<br>'); }
@@ -508,22 +825,131 @@ function clusterDiagnostics(task) {
   }
   return training + (task.clusters || []).map(cluster => `<div class="diagnostic"><strong>${esc(cluster.cluster_id)}</strong>${cluster.auto_merged?'complete-link 自动集群':'单页集群'}<br>v7 min=${Number(cluster.ours_scores?.minimum).toFixed(4)} · mean=${Number(cluster.ours_scores?.mean).toFixed(4)}<details class="pairwise-details"><summary>Cluster 内全部 Pair</summary><span class="muted">${pairwiseText(cluster.ours_pairwise)}</span></details><br>UTG internal=${cluster.transitions?.internal?.length||0} · incoming=${cluster.transitions?.incoming?.length||0} · outgoing=${cluster.transitions?.outgoing?.length||0}</div>`).join('');
 }
+function stagePoint(event, stage, page) {
+  const image = stage.querySelector('img');
+  if (!image || !page?.width || !page?.height) return null;
+  const rect = image.getBoundingClientRect();
+  if (!rect.width || !rect.height) return null;
+  const xPct = Math.max(0, Math.min(100, (event.clientX - rect.left) / rect.width * 100));
+  const yPct = Math.max(0, Math.min(100, (event.clientY - rect.top) / rect.height * 100));
+  const x = xPct / 100 * page.width, y = yPct / 100 * page.height;
+  const containing = (page.candidates || []).filter(node => {
+    const bbox = interactionBbox(node);
+    return bbox && bbox[0] <= x && x <= bbox[2] && bbox[1] <= y && y <= bbox[3];
+  }).sort((left, right) => {
+    const a = interactionBbox(left), b = interactionBbox(right);
+    return ((a[2] - a[0]) * (a[3] - a[1])) - ((b[2] - b[0]) * (b[3] - b[1]));
+  });
+  const snappedNode = containing[0] || null;
+  return {
+    point: {
+      screen_x_pct:xPct, screen_y_pct:yPct, x, y, page_x:x, page_y:y,
+      coordinate_space:'page_pixels', node_id:snappedNode?.node_id || null,
+      node_ids:containing.map(node => node.node_id),
+    },
+    snappedNode,
+  };
+}
+async function runUnifiedLiveMapping(baseTask, task, mapping, snappedNode, sourcePoint, requestId) {
+  setMappingAnnotation(baseTask, mapping, {
+    source_node_id:snappedNode?.node_id || null,
+    source_point:sourcePoint,
+    live_ours_node_id:null,
+    live_ours_status:'pending',
+    live_ours_request_id:requestId,
+    live_ours_probability:null,
+    live_ours_point:null,
+    live_ours_error:null,
+    verdict:null,
+    confirmed_at:null,
+  });
+  try {
+    const response = await fetch(summary.review_ui?.live_mapping_endpoint || '/api/rank_action_candidates', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        source_page_id:task.source.page_id,
+        target_page_id:task.target.page_id,
+        source_node_id:snappedNode?.node_id || null,
+        source_element_id:snappedNode?.node_id || null,
+        source_point:runtimeSourcePoint(sourcePoint, task.source),
+        source_offset:sourceOffset(sourcePoint, snappedNode),
+        source_size:{width:task.source.width,height:task.source.height},
+        source_xml:task.source.xml || task.source.xml_text || null,
+        target_xml:task.target.xml || task.target.xml_text || null,
+        source_screenshot_path:task.source.screenshot_path || task.source.image_url || null,
+        target_screenshot_path:task.target.screenshot_path || task.target.image_url || null,
+      }),
+    });
+    const responseText = await response.text();
+    let result;
+    try { result = JSON.parse(responseText); } catch { throw new Error(`http_${response.status}`); }
+    const current = mappingAnnotation(baseTask, mapping);
+    if (current.live_ours_request_id !== requestId) return;
+    const top = result.status === 'scored' ? (result.candidates || result.top_candidates || [])[0] : null;
+    const targetNode = resolveTargetNode(task.target, top);
+    const topId = targetNode?.node_id || top?.node_id || top?.candidate_id || null;
+    const status = topId ? 'scored' : (result.status === 'no_candidates' ? 'no_candidates' : 'failed');
+    setMappingAnnotation(baseTask, mapping, {
+      live_ours_node_id:topId,
+      live_ours_status:status,
+      live_ours_probability:top?.score ?? result.rank_probability ?? result.pair_confidence ?? null,
+      live_ours_point:liveProjectedPoint(result, top, targetNode, task.target),
+      live_ours_error:status === 'scored' ? null : (result.error || result.reason || `http_${response.status}`),
+      live_ours_release:result.matcher_release || null,
+    });
+    if (status === 'scored') requestAnimationFrame(revealMatcherPoint);
+  } catch (error) {
+    const current = mappingAnnotation(baseTask, mapping);
+    if (current.live_ours_request_id === requestId) {
+      setMappingAnnotation(baseTask, mapping, {live_ours_node_id:null,live_ours_status:'failed',live_ours_error:String(error?.message || error)});
+    }
+  }
+}
+function bindStageFallback() {
+  if (document.body.dataset.stageFallbackBound === '1') return;
+  document.body.dataset.stageFallbackBound = '1';
+  document.addEventListener('click', event => {
+    const stage = event.target.closest?.('.image-stage[data-side]');
+    if (!stage || stage.onclick || !multiMappingReview || !remainingManualMode || !filtered.length) return;
+    const baseTask = filtered[index], review = annotation(baseTask), task = activeTask(baseTask, review);
+    const mapping = taskMappings(task)[0];
+    if (!mapping) return;
+    const selected = stagePoint(event, stage, task[stage.dataset.side]);
+    if (!selected) return;
+    recordActivity(baseTask, stage.dataset.side === 'source' ? 'source_candidate_click' : 'candidate_click');
+    if (stage.dataset.side === 'source') {
+      void runUnifiedLiveMapping(baseTask, task, mapping, selected.snappedNode, selected.point, `${Date.now()}-${Math.random().toString(16).slice(2)}`);
+      return;
+    }
+    const points = manualPoints(mappingAnnotation(baseTask, mapping)).slice();
+    const duplicate = points.findIndex(value => (selected.point.node_id && value.node_id === selected.point.node_id) || Math.hypot(value.screen_x_pct - selected.point.screen_x_pct, value.screen_y_pct - selected.point.screen_y_pct) < 1.5);
+    if (duplicate >= 0) points.splice(duplicate, 1); else points.push(selected.point);
+    setMappingAnnotation(baseTask, mapping, {target_points:points, verdict:null, confirmed_at:null});
+  });
+}
 function render() {
   updateExclusionControls();
   if (!filtered.length) {
     byId('progress').textContent = utgClusterReview ? `已排除 ${Object.keys(excludedPages).length} 页` : '';
-    byId('identity').textContent = '当前筛选无任务';
+    const standaloneTemplate = location.pathname.endsWith('review' + '_annotation_template.html');
+    byId('identity').textContent = standaloneTemplate ? '这是唯一 reviewer 模板源文件，尚未注入审核 payload' : '当前筛选无任务';
     byId('screens').innerHTML = '';
+    byId('legend').innerHTML = standaloneTemplate ? '<span class="muted">请打开构建器生成的 review.html；生成页会注入同一份 payload，并启用 Source → Target 实时映射。</span>' : '';
+    byId('diagnostics').innerHTML = standaloneTemplate ? '<div class="diagnostic"><strong>没有审核数据</strong>模板本身只包含统一 UI 和映射逻辑，不包含具体页面数据。</div>' : '';
     return;
   }
   const baseTask = filtered[index], review = annotation(baseTask), task = activeTask(baseTask, review);
+  updateLiveMappingStatus(task, review);
   showTaskTiming(baseTask);
   renderTimingSummary();
   const exclusionProgress = utgClusterReview ? ` · 已排除 ${Object.keys(excludedPages).length} 页` : '';
   const autoDedupProgress = utgClusterReview && summary.review_ui?.exact_xml_deduplication?.excluded_pages ? ` · exact XML 去重 ${summary.review_ui.exact_xml_deduplication.excluded_pages} 页` : '';
   byId('progress').textContent = `${index+1} / ${filtered.length} · 已审核 ${Object.values(annotations).filter(row => row.verdict).length}${exclusionProgress}${autoDedupProgress}`;
   const methodTags = (task.method_tags || []).map(tag => `<span class="tag-chip">${esc(methodTagText(tag))}${esc(methodTagCount(tag))}</span>`).join('');
-  byId('identity').innerHTML = `<span class="tag-chip">${esc(task.app)}</span><span class="tag-chip">${esc(task.label_status)}</span>${methodTags}${esc(task.task_id)}${review.source_node_id ? ` · source=${esc(review.source_node_id)}` : ''}`;
+  const reviewMeta = task.review_meta || {};
+  const reviewMetaTags = reviewMeta.review_group ? `<span class="tag-chip">${esc(reviewMeta.review_group)}</span><span class="tag-chip">${esc(reviewMeta.review_status || '')}</span>` : '';
+  byId('identity').innerHTML = `<span class="tag-chip">${esc(task.app)}</span><span class="tag-chip">${esc(task.label_status)}</span>${reviewMetaTags}${methodTags}${esc(task.task_id)}${review.source_node_id ? ` · source=${esc(review.source_node_id)}` : ''}`;
   byId('methodOverlayStatus').textContent = task.method_comparison ? `当前落点：${methodOverlayMode === 'selector' ? 'selector' : '我们的方案'}` : '';
   byId('difficulty').innerHTML = `difficulty ${Number(task.difficulty_score).toFixed(3)} · ${(task.difficulty_reasons || []).map(reason => `<span class="tag-chip">${esc(reason)}</span>`).join('')}`;
   if (multiMappingReview) {
@@ -532,11 +958,18 @@ function render() {
     byId('screens').className = 'screens';
     if (!byId('sourcePanel')) byId('screens').innerHTML = '<section class="screen" id="sourcePanel"></section><section class="screen" id="targetPanel"></section><section class="screen" id="foldPanel" hidden></section>';
     byId('foldPanel').hidden = true;
-    byId('sourcePanel').innerHTML = multiPanel(task, 'source');
-    byId('targetPanel').innerHTML = multiPanel(task, 'target');
-    byId('legend').innerHTML = '<span>每一行是一组独立映射：S1→M1、S2→M2；颜色只标识组，不改变模型分数。</span><span>先选择左侧映射行，再点击右侧 Target，可连续标注多组。</span>';
-    byId('diagnostics').innerHTML = methodComparisonDiagnostics(task) + multiDiagnostics(task);
-    document.querySelectorAll('[data-mapping-id]').forEach(button => button.onclick = () => { selectedMappingId = button.dataset.mappingId; render(); });
+    if (remainingManualMode) {
+      byId('sourcePanel').innerHTML = remainingPanel(task, 'source');
+      byId('targetPanel').innerHTML = remainingPanel(task, 'target');
+      byId('legend').innerHTML = '<span>左边：Source。右边：Target。</span><span class="gold">黄框：当前 reference / 原始映射。</span><span class="matcher">蓝框：我们的预测。</span><span>点击 Source 重新计算；点击 Target 可保存真实匹配。</span>';
+      byId('diagnostics').innerHTML = unifiedReviewDiagnostics(task);
+    } else {
+      byId('sourcePanel').innerHTML = multiPanel(task, 'source');
+      byId('targetPanel').innerHTML = multiPanel(task, 'target');
+      byId('legend').innerHTML = '<span>每一行是一组独立映射：S1→M1、S2→M2；颜色只标识组，不改变模型分数。</span><span>先选择左侧映射行，再点击右侧 Target，可连续标注多组。</span>';
+      byId('diagnostics').innerHTML = methodComparisonDiagnostics(task) + multiDiagnostics(task);
+      document.querySelectorAll('[data-mapping-id]').forEach(button => button.onclick = () => { selectedMappingId = button.dataset.mappingId; render(); });
+    }
   } else if (utgClusterReview) {
     byId('screens').className = 'screens cluster-review';
     byId('screens').innerHTML = (task.clusters || []).map(clusterPanel).join('');
@@ -564,7 +997,9 @@ function render() {
     byId('targetPanel').innerHTML = panel(task, 'target', review);
     const proposalLabel = summary.review_ui?.proposal_label || '自动 proposal（非 gold）';
     const predictionLabel = summary.review_ui?.prediction_label || 'OmniTransfer Top-1（提示）';
-    byId('legend').innerHTML = minimalMappingReview
+    byId('legend').innerHTML = iconVisualReview
+      ? '<span>快捷键：S 保存草稿；1 保存并标记正确；2 保存并标记错误。先点击 Source，再查看自动 P；确认真实目标时点击 Target。</span>'
+      : minimalMappingReview
       ? `<span>Q = 固定 Source 点；P = ${esc(predictionLabel)}；P 正确可直接确认，错误时点击 Target 生成 H；不存在时选 NULL。</span>`
       : `<span class="source">Source</span>${task.gold_proposal ? `<span class="gold">${esc(proposalLabel)}</span>` : ''}${task.matcher_prediction?.node ? '<span class="matcher">OmniTransfer Top-1（提示）</span>' : ''}${task.selector_prediction?.node ? '<span class="selector">Identity selector（诊断）</span>' : ''}<span>左侧白点 Q：查询点；右侧蓝点 P：映射点；H：人工 target 点，可标多个</span>`;
     const matcherTop1 = task.matcher_prediction?.top1_node;
@@ -599,8 +1034,12 @@ function render() {
     }
     const currentReview = annotation(task);
     const automaticPoint = matcherMappedPoint(task, currentReview);
-    if (verdict === 'confirm_mapping' && !manualPoints(currentReview).length && !automaticPoint) {
+    if ((verdict === 'confirm_mapping' || (iconVisualReview && verdict === 'correct_correspondence')) && !manualPoints(currentReview).length && !automaticPoint) {
       byId('saved').textContent = '没有自动候选，请先在 Target 图上点击一个或多个对应点';
+      return;
+    }
+    if (iconVisualReview && verdict === 'correct_correspondence' && !manualPoints(currentReview).length) {
+      byId('saved').textContent = '请先点击右侧真实匹配目标，再按 1';
       return;
     }
     const current = annotation(baseTask), timing = timingRecord(baseTask), now = new Date().toISOString();
@@ -622,7 +1061,85 @@ function render() {
     const mapping = taskMappings(task).find(row => row.mapping_id === selectedMappingId) || taskMappings(task)[0];
     const mappingReview = mapping ? mappingAnnotation(baseTask, mapping) : {};
     const points = mapping ? manualPoints(mappingReview) : [];
-    byId('saved').textContent = mapping ? `${mapping.label} · ${mappingReview.verdict || '未审核'} · 人工点 ${points.length} · 选择行后点击 Target` : '当前页面对没有映射';
+    if (remainingManualMode) {
+      byId('saved').textContent = mapping ? `${mapping.label} · ${mappingReview.verdict || '未审核'} · Source=${mappingReview.source_node_id || mapping.source_node?.node_id || '待选择'} · 人工点 ${points.length} · 点击左侧 Source，再点击右侧 Target` : '当前页面对没有映射';
+      const sourceWrap = document.querySelector('.image-stage[data-side="source"]');
+      const runLiveOurs = async (snappedNode, sourcePoint, requestId) => {
+        setMappingAnnotation(baseTask, mapping, {
+          source_node_id:snappedNode?.node_id || null,
+          source_point:sourcePoint,
+          live_ours_node_id:null,
+          live_ours_status:'pending',
+          live_ours_request_id:requestId,
+          live_ours_probability:null,
+          mapping_coordinate_contract:'graph_visual_v3_manual_click',
+          live_ours_point:null,
+          live_ours_error:null,
+          verdict:null,
+          confirmed_at:null,
+        });
+        try {
+          const body = {
+            source_page_id:task.source.page_id,
+            target_page_id:task.target.page_id,
+            source_node_id:snappedNode?.node_id || null,
+            source_element_id:snappedNode?.node_id || null,
+            source_point:runtimeSourcePoint(sourcePoint, task.source),
+            source_offset:sourceOffset(sourcePoint, snappedNode),
+            source_size:{width:task.source.width,height:task.source.height},
+            source_xml:task.source.xml || task.source.xml_text || null,
+            target_xml:task.target.xml || task.target.xml_text || null,
+            source_screenshot_path:task.source.screenshot_path || task.source.image_url || null,
+            target_screenshot_path:task.target.screenshot_path || task.target.image_url || null,
+          };
+          const response = await fetch(summary.review_ui?.live_mapping_endpoint || '/api/rank_action_candidates', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify(body),
+          });
+          const responseText = await response.text();
+          let result;
+          try { result = JSON.parse(responseText); } catch { throw new Error(`http_${response.status}`); }
+          const current = mappingAnnotation(baseTask, mapping);
+          if (current.live_ours_request_id !== requestId) return;
+          const top = result.status === 'scored' ? (result.candidates || result.top_candidates || [])[0] : null;
+          const targetNode = resolveTargetNode(task.target, top);
+          const topId = targetNode?.node_id || top?.node_id || top?.candidate_id || null;
+          const status = topId ? 'scored' : (result.status === 'no_candidates' ? 'no_candidates' : 'failed');
+          setMappingAnnotation(baseTask, mapping, {
+            live_ours_node_id:topId,
+            live_ours_status:status,
+            live_ours_probability:top?.score ?? result.rank_probability ?? result.pair_confidence ?? null,
+            mapping_coordinate_contract:'graph_visual_v3_manual_click',
+            live_ours_point:liveProjectedPoint(result, top, targetNode, task.target),
+            live_ours_error:status === 'scored' ? null : (result.error || result.reason || `http_${response.status}`),
+            live_ours_release:result.matcher_release || null,
+          });
+          if (status === 'scored') requestAnimationFrame(revealMatcherPoint);
+        } catch (error) {
+          const current = mappingAnnotation(baseTask, mapping);
+          if (current.live_ours_request_id === requestId) setMappingAnnotation(baseTask, mapping, {live_ours_node_id:null,live_ours_status:'failed',live_ours_error:String(error?.message || error)});
+        }
+      };
+      if (sourceWrap) sourceWrap.onclick = event => {
+        recordActivity(baseTask, 'source_candidate_click');
+        const rect = sourceWrap.querySelector('img').getBoundingClientRect();
+        const xPct = Math.max(0, Math.min(100, (event.clientX-rect.left)/rect.width*100));
+        const yPct = Math.max(0, Math.min(100, (event.clientY-rect.top)/rect.height*100));
+        const pageX = xPct/100*task.source.width, pageY = yPct/100*task.source.height;
+        const containing = (task.source.candidates || []).filter(node => { const bbox = interactionBbox(node); return bbox && bbox[0] <= pageX && pageX <= bbox[2] && bbox[1] <= pageY && pageY <= bbox[3]; }).sort((a,b) => {
+          const bboxA = interactionBbox(a), bboxB = interactionBbox(b);
+          return ((bboxA[2]-bboxA[0])*(bboxA[3]-bboxA[1])) - ((bboxB[2]-bboxB[0])*(bboxB[3]-bboxB[1]));
+        });
+        const snappedNode = containing[0] || null;
+        const sourcePoint = {screen_x_pct:xPct,screen_y_pct:yPct,x:pageX,y:pageY,page_x:pageX,page_y:pageY,coordinate_space:'page_pixels',node_id:snappedNode?.node_id || null,node_ids:containing.map(node => node.node_id)};
+        void runLiveOurs(snappedNode, sourcePoint, `${Date.now()}-${Math.random().toString(16).slice(2)}`);
+      };
+      // Manual unified review must start from the user's clicked Source
+      // point.  Do not silently run the stale dataset mapping on page load.
+    } else {
+      byId('saved').textContent = mapping ? `${mapping.label} · ${mappingReview.verdict || '未审核'} · 人工点 ${points.length} · 选择行后点击 Target` : '当前页面对没有映射';
+    }
     const targetWrap = document.querySelector('.image-stage[data-side="target"]');
     if (targetWrap && mapping) targetWrap.onclick = event => {
       recordActivity(baseTask, 'candidate_click');
@@ -630,7 +1147,7 @@ function render() {
       const xPct = Math.max(0, Math.min(100, (event.clientX-rect.left)/rect.width*100));
       const yPct = Math.max(0, Math.min(100, (event.clientY-rect.top)/rect.height*100));
       const pageX = xPct/100*task.target.width, pageY = yPct/100*task.target.height;
-      const containing = (task.target.candidates || []).filter(node => { const bbox = nodeBbox(node); return bbox && bbox[0] <= pageX && pageX <= bbox[2] && bbox[1] <= pageY && pageY <= bbox[3]; }).sort((a,b) => { const bboxA = nodeBbox(a), bboxB = nodeBbox(b); return ((bboxA[2]-bboxA[0])*(bboxA[3]-bboxA[1])) - ((bboxB[2]-bboxB[0])*(bboxB[3]-bboxB[1])); });
+      const containing = (task.target.candidates || []).filter(node => { const bbox = interactionBbox(node); return bbox && bbox[0] <= pageX && pageX <= bbox[2] && bbox[1] <= pageY && pageY <= bbox[3]; }).sort((a,b) => { const bboxA = interactionBbox(a), bboxB = interactionBbox(b); return ((bboxA[2]-bboxA[0])*(bboxA[3]-bboxA[1])) - ((bboxB[2]-bboxB[0])*(bboxB[3]-bboxB[1])); });
       const snappedNode = containing[0] || null;
       const point = {screen_x_pct:xPct,screen_y_pct:yPct,x:pageX,y:pageY,page_x:pageX,page_y:pageY,coordinate_space:'page_pixels',node_id:snappedNode?.node_id || null,node_ids:containing.map(node => node.node_id)};
       const points = manualPoints(mappingAnnotation(baseTask, mapping)).slice();
@@ -640,7 +1157,9 @@ function render() {
     };
     return;
   }
-  byId('saved').textContent = (utgPageMerge || utgClusterReview) ? (review.updated_at ? `已保存 ${review.updated_at}` : '请选择 Cluster 裁决；模型分数仅作为审核证据') : (review.updated_at ? `${sourceStatus} · 已保存 ${review.updated_at} · 人工点 ${selectedPoints.length} · Target 吸附 ${targetSnapped}` : `${sourceStatus}；点击 Target 图可补充人工点`);
+  byId('saved').textContent = iconVisualReview
+    ? (review.updated_at ? `${sourceStatus} · ${review.verdict || '草稿'} · 人工目标 ${selectedPoints.length} · 已保存 ${review.updated_at}` : `${sourceStatus}；点击 Target 后按 1/2`)
+    : (utgPageMerge || utgClusterReview) ? (review.updated_at ? `已保存 ${review.updated_at}` : '请选择 Cluster 裁决；模型分数仅作为审核证据') : (review.updated_at ? `${sourceStatus} · 已保存 ${review.updated_at} · 人工点 ${selectedPoints.length} · Target 吸附 ${targetSnapped}` : `${sourceStatus}；点击 Target 图可补充人工点`);
   if (utgPageMerge || utgClusterReview) return;
   const sourceWrap = document.querySelector('.image-stage[data-side="source"]');
   if (!fixedSourceReview) sourceWrap.onclick = event => {
@@ -649,10 +1168,12 @@ function render() {
     const xPct = Math.max(0, Math.min(100, (event.clientX-rect.left)/rect.width*100));
     const yPct = Math.max(0, Math.min(100, (event.clientY-rect.top)/rect.height*100));
     const pageX = xPct/100*task.source.width, pageY = yPct/100*task.source.height;
-    const containing = (task.source.candidates || []).filter(node => { const bbox = nodeBbox(node); return bbox && bbox[0] <= pageX && pageX <= bbox[2] && bbox[1] <= pageY && pageY <= bbox[3]; }).sort((a,b) => { const bboxA = nodeBbox(a), bboxB = nodeBbox(b); return ((bboxA[2]-bboxA[0])*(bboxA[3]-bboxA[1])) - ((bboxB[2]-bboxB[0])*(bboxB[3]-bboxB[1])); });
+    const containing = (task.source.candidates || []).filter(node => { const bbox = interactionBbox(node); return bbox && bbox[0] <= pageX && pageX <= bbox[2] && bbox[1] <= pageY && pageY <= bbox[3]; }).sort((a,b) => { const bboxA = interactionBbox(a), bboxB = interactionBbox(b); return ((bboxA[2]-bboxA[0])*(bboxA[3]-bboxA[1])) - ((bboxB[2]-bboxB[0])*(bboxB[3]-bboxB[1])); });
     const snappedNode = containing.find(node => task.source_queries?.[node.node_id] || (!task.source_queries && node.node_id === task.source?.node?.node_id)) || null;
     const point = {screen_x_pct:xPct,screen_y_pct:yPct,x:pageX,y:pageY,page_x:pageX,page_y:pageY,coordinate_space:'page_pixels',node_id:snappedNode?.node_id || null,node_ids:containing.map(node => node.node_id)};
-    setAnnotation(baseTask, {source_node_id:snappedNode?.node_id || null,source_query_point:point,target_points:[],target_point:null,verdict:null,confirmed_at:null});
+    setAnnotation(baseTask, {source_node_id:snappedNode?.node_id || null,source_query_point:point,target_points:[],target_point:null,verdict:null,confirmed_at:null,live_ours_node_id:null,live_ours_status:null,live_ours_request_id:null,live_ours_probability:null,live_ours_margin:null,live_ours_point:null,live_ours_error:null,live_ours_release:null});
+    if (iconVisualReview) void runLiveIcon(baseTask, snappedNode, point, `${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    revealMatcherPoint();
   };
   const targetWrap = document.querySelector('.image-stage[data-side="target"]');
   targetWrap.onclick = event => {
@@ -661,7 +1182,7 @@ function render() {
     const xPct = Math.max(0, Math.min(100, (event.clientX-rect.left)/rect.width*100));
     const yPct = Math.max(0, Math.min(100, (event.clientY-rect.top)/rect.height*100));
     const pageX = xPct/100*task.target.width, pageY = yPct/100*task.target.height;
-    const containing = (task.target.candidates || []).filter(node => { const bbox = nodeBbox(node); return bbox && bbox[0] <= pageX && pageX <= bbox[2] && bbox[1] <= pageY && pageY <= bbox[3]; }).sort((a,b) => { const bboxA = nodeBbox(a), bboxB = nodeBbox(b); return ((bboxA[2]-bboxA[0])*(bboxA[3]-bboxA[1])) - ((bboxB[2]-bboxB[0])*(bboxB[3]-bboxB[1])); });
+    const containing = (task.target.candidates || []).filter(node => { const bbox = interactionBbox(node); return bbox && bbox[0] <= pageX && pageX <= bbox[2] && bbox[1] <= pageY && pageY <= bbox[3]; }).sort((a,b) => { const bboxA = interactionBbox(a), bboxB = interactionBbox(b); return ((bboxA[2]-bboxA[0])*(bboxA[3]-bboxA[1])) - ((bboxB[2]-bboxB[0])*(bboxB[3]-bboxB[1])); });
     const snappedNode = containing[0] || null;
     const point = {screen_x_pct:xPct,screen_y_pct:yPct,x:pageX,y:pageY,page_x:pageX,page_y:pageY,coordinate_space:'page_pixels',node_id:snappedNode?.node_id || null,node_ids:containing.map(node => node.node_id)};
     const points = manualPoints(annotation(task)).slice();
@@ -707,11 +1228,15 @@ function canonicalNodes(page, extraNodes=[]) {
 function canonicalPage(page, extraNodes=[]) {
   return {page_id:page?.page_id,platform:page?.platform||'android',screenshot_path:page?.screenshot_path||page?.image_url||'',graph:{graph_id:page?.page_id,width:page?.width,height:page?.height,nodes:canonicalNodes(page,extraNodes)}};
 }
+function downloadRows(rows, filename) {
+  const blob = new Blob([rows.map(row => JSON.stringify(row)).join('\n')+'\n'], {type:'application/x-ndjson'});
+  const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = filename; link.click(); URL.revokeObjectURL(link.href);
+}
 byId('previous').onclick = () => move(-1); byId('next').onclick = () => move(1); byId('stageFilter').onchange = () => applyFilter(); byId('filter').onchange = () => applyFilter(); byId('methodFilter').onchange = () => applyFilter(); byId('showCandidates').onchange = render;
 byId('showOurs').onclick = () => { methodOverlayMode = 'ours'; render(); };
 byId('showSelector').onclick = () => { methodOverlayMode = 'selector'; render(); };
 byId('restoreExcluded').onclick = restoreLatestExcluded;
-byId('clearSource').onclick = () => { if (!fixedSourceReview && !multiMappingReview && filtered.length) setAnnotation(filtered[index], {source_node_id:null,source_query_point:null,target_points:[],target_point:null,verdict:null,confirmed_at:null}); };
+byId('clearSource').onclick = () => { if (!fixedSourceReview && !multiMappingReview && filtered.length) setAnnotation(filtered[index], {source_node_id:null,source_query_point:null,target_points:[],target_point:null,verdict:null,confirmed_at:null,live_ours_node_id:null,live_ours_status:null,live_ours_request_id:null,live_ours_probability:null,live_ours_margin:null,live_ours_point:null,live_ours_error:null,live_ours_release:null}); };
 byId('clearPoints').onclick = () => {
   if (!filtered.length) return;
   if (multiMappingReview) {
@@ -723,6 +1248,52 @@ byId('clearPoints').onclick = () => {
 };
 byId('export').onclick = () => {
   if (filtered.length) recordActivity(filtered[index], 'export');
+  if (iconVisualReview) {
+    const ledgerRows = [], goldRows = [];
+    queue.forEach(task => {
+      const review = annotation(task), active = activeTask(task, review);
+      const sourceNode = active.source?.node, targetPoints = manualPoints(review);
+      const targetIds = [...new Set(targetPoints.map(point => point.node_id).filter(Boolean))];
+      const automaticNode = active.matcher_prediction?.node || null;
+      ledgerRows.push({
+        schema_version:'omnitransfer.icon_visual_annotation.v1',
+        task_id:task.task_id,
+        pair_id:task.pair_id,
+        source_page_id:active.source?.page_id,
+        target_page_id:active.target?.page_id,
+        source_node_id:sourceNode?.node_id || review.source_node_id || null,
+        automatic_target_node_id:automaticNode?.node_id || null,
+        automatic_probability:active.matcher_prediction?.probability ?? null,
+        automatic_margin:active.matcher_prediction?.margin ?? null,
+        human_target_node_ids:targetIds,
+        verdict:review.verdict || null,
+        label_status:review.verdict ? 'gold' : 'unreviewed',
+        notes:review.notes || '',
+        updated_at:review.updated_at || null,
+        source:canonicalPage(active.source,[sourceNode]),
+        target:canonicalPage(active.target,[automaticNode,...targetPoints.map(point => (active.target?.candidates||[]).find(node => node.node_id === point.node_id))]),
+      });
+      if (review.verdict === 'correct_correspondence' && sourceNode?.node_id && targetIds.length) {
+        goldRows.push({
+          schema_version:'omnitransfer.ui_correspondence_pair.v1',
+          pair_id:task.task_id,
+          split:'diagnostic',
+          label_status:'gold',
+          source:canonicalPage(active.source,[sourceNode]),
+          target:canonicalPage(active.target,[automaticNode,...targetPoints.map(point => (active.target?.candidates||[]).find(node => node.node_id === point.node_id))]),
+          matches:[{source_node_id:sourceNode.node_id,target_node_ids:targetIds,label:'correspondence',source_point:{x:(sourceNode.bbox[0]+sourceNode.bbox[2])/2,y:(sourceNode.bbox[1]+sourceNode.bbox[3])/2,coordinate_space:'page_pixels',node_id:sourceNode.node_id},target_points:targetPoints}],
+          partition_keys:[`review:icon:${task.app}`,`review:page-pair:${active.source?.page_id}:${active.target?.page_id}`],
+          provenance:{...(task.provenance||{}),annotation:'human_icon_visual_review',automatic_target_node_id:automaticNode?.node_id||null},
+          slices:{app:task.app,review_kind:'icon_visual'},
+          review:{verdict:review.verdict,notes:review.notes||'',confirmed_at:review.confirmed_at||null,updated_at:review.updated_at||null,...exportTiming(task,review)},
+        });
+      }
+    });
+    downloadRows(ledgerRows,'omnitransfer_icon_annotations.jsonl');
+    downloadRows(goldRows,'omnitransfer_icon_gold_pairs.jsonl');
+    byId('saved').textContent = `已导出 ${ledgerRows.length} 条人工记录，其中 ${goldRows.length} 条可直接训练`;
+    return;
+  }
   if (utgClusterReview) {
     const rows = queue.map(task => {
       const review = annotation(task);
@@ -752,7 +1323,7 @@ byId('export').onclick = () => {
         const confirmed = ['confirm_mapping','correct_correspondence'].includes(mappingReview.verdict);
         const isNull = mappingReview.verdict === 'no_correspondence';
         const targetIds = isNull ? [] : (reviewedTargetIds.length ? reviewedTargetIds : (confirmed ? mapping.target_node_ids : []));
-        const sourceBbox = nodeBbox(mapping.source_node);
+        const sourceBbox = interactionBbox(mapping.source_node);
         return {source_node_id:mapping.source_node?.node_id,target_node_ids:targetIds,label:isNull?'no_correspondence':'correspondence',source_point:sourceBbox ? {x:(sourceBbox[0]+sourceBbox[2])/2,y:(sourceBbox[1]+sourceBbox[3])/2,coordinate_space:'page_pixels',node_id:mapping.source_node.node_id} : null,target_points:targetPoints,mapping_id:mapping.mapping_id};
       });
       const isGold = matches.length > 0 && mappings.every(mapping => ['confirm_mapping','correct_correspondence','no_correspondence'].includes(mappingAnnotation(task, mapping).verdict));
@@ -774,7 +1345,7 @@ byId('export').onclick = () => {
   const rows = queue.map(task => {
     const review = annotation(task), active = activeTask(task, review), targetPoints = manualPoints(review);
     const sourceNode = active.source?.node;
-    const sourceBbox = nodeBbox(sourceNode);
+    const sourceBbox = interactionBbox(sourceNode);
     const sourcePoint = review.source_query_point || active.source?.point || (sourceBbox ? {x:(sourceBbox[0]+sourceBbox[2])/2,y:(sourceBbox[1]+sourceBbox[3])/2,coordinate_space:'page_pixels',node_id:sourceNode.node_id} : null);
     const matcherPoint = matcherMappedPoint(active, review);
     const reviewedTargetIds = [...new Set(targetPoints.map(point => point.node_id).filter(Boolean))];
@@ -793,6 +1364,16 @@ byId('export').onclick = () => {
 document.onkeydown = event => {
   const editable = ['INPUT','TEXTAREA','SELECT','BUTTON'].includes(event.target?.tagName) || event.target?.isContentEditable;
   if (filtered.length) recordActivity(filtered[index], 'keydown');
+  if (!editable && iconVisualReview) {
+    const key = event.key.toLowerCase();
+    if (key === 's') { event.preventDefault(); save(); byId('saved').textContent = `草稿已保存 · ${new Date().toLocaleTimeString()}`; return; }
+    if (key === '1' || key === '2') {
+      event.preventDefault();
+      const verdict = key === '1' ? 'correct_correspondence' : 'wrong_correspondence';
+      document.querySelector(`[data-verdict="${verdict}"]`)?.click();
+      return;
+    }
+  }
   if (!editable && event.key === '1' && hasMethodComparison) { methodOverlayMode = 'ours'; render(); return; }
   if (!editable && event.key === '2' && hasMethodComparison) { methodOverlayMode = 'selector'; render(); return; }
   const selectedCard = document.querySelector('.cluster-member.selected-page');
@@ -814,6 +1395,8 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 window.addEventListener('beforeunload', () => closeVisibleInterval());
+migrateLegacyLiveState();
+bindStageFallback();
 applyFilter();
 </script>
 </body>

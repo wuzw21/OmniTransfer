@@ -69,3 +69,37 @@ def test_no_ranked_target_still_returns_structured_failure(monkeypatch) -> None:
     assert "mapped" not in result
     assert "new_x" not in result
     assert "new_y" not in result
+
+
+def test_click_candidates_exclude_non_actionable_container(monkeypatch) -> None:
+    target_xml = """<hierarchy bounds="[0,0][1000,1000]"><node class="android.widget.LinearLayout" enabled="true" bounds="[0,400][1000,600]"><node content-desc="Create" class="android.widget.ImageButton" clickable="true" enabled="true" bounds="[870,430][980,490]" /></node></hierarchy>"""
+    seen: dict[str, tuple[str, ...]] = {}
+
+    class Matcher:
+        backend = "test"
+
+        def predict(self, _source, target, *, candidate_node_ids, **_kwargs):
+            seen["ids"] = tuple(candidate_node_ids)
+            candidates = [
+                node for node in target.nodes if node.node_id in set(candidate_node_ids)
+            ]
+            assert len(candidates) == 1
+            assert candidates[0].content_desc == "Create"
+            return SimpleNamespace(
+                target_node=candidates[0],
+                probability=1.0,
+                margin=1.0,
+                reason="learned_match",
+                scores=((candidates[0].node_id, 1.0),),
+            )
+
+    monkeypatch.setattr(runtime, "_get_matcher", lambda: Matcher())
+
+    result = runtime.rank_action_candidates(
+        source_xml=SOURCE_XML,
+        target_xml=target_xml,
+        source_point=(30.0, 40.0),
+    )
+
+    assert result["status"] == "scored"
+    assert len(seen["ids"]) == 1

@@ -10,6 +10,7 @@ from typing import Any
 
 from omnitransfer.learned_matcher import (
     ALL_NODE_CANDIDATE_POLICY,
+    DETERMINISTIC_ICON_VISUAL_ENCODER,
     OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE,
     XML_NODE_FEATURE_DIM,
     EncodedGraph,
@@ -17,8 +18,8 @@ from omnitransfer.learned_matcher import (
     build_geometric_v9_matcher,
     encode_graph,
     matcher_inputs,
-    spatial_xml_alignment_rerank_logits,
 )
+from omnitransfer.unified_alignment import relation_consistency_loss
 from omnitransfer.ui_graph import BBox, UIGraph, UINode
 
 FEATURE_DIM = XML_NODE_FEATURE_DIM
@@ -255,6 +256,10 @@ def matching_loss(
     matcher_config: MatcherConfig | None = None,
     descriptor_weight: float = 0.20,
     descriptor_temperature: float = 0.10,
+    visual_descriptor_weight: float = 1.0,
+    visual_descriptor_temperature: float = 0.07,
+    strategy_weight: float = 0.10,
+    matchability_weight: float = 0.20,
     return_details: bool = False,
 ) -> Any:
     """Compute the canonical assignment and node-descriptor objective."""
@@ -263,6 +268,14 @@ def matching_loss(
         raise ValueError("descriptor_weight must be non-negative")
     if descriptor_temperature <= 0.0:
         raise ValueError("descriptor_temperature must be positive")
+    if visual_descriptor_weight < 0.0:
+        raise ValueError("visual_descriptor_weight must be non-negative")
+    if visual_descriptor_temperature <= 0.0:
+        raise ValueError("visual_descriptor_temperature must be positive")
+    if strategy_weight < 0.0:
+        raise ValueError("strategy_weight must be non-negative")
+    if matchability_weight < 0.0:
+        raise ValueError("matchability_weight must be non-negative")
     torch = _require_torch()
     config = matcher_config or MatcherConfig()
     inputs = matcher_inputs(
@@ -314,7 +327,48 @@ def matching_loss(
         weight * layer_loss
         for weight, layer_loss in zip(layer_weights, layer_losses, strict=True)
     )
+    source_matchability = tuple(
+        output.get("source_matchability_by_layer") or ()
+    )
+    target_matchability = tuple(
+        output.get("target_matchability_by_layer") or ()
+    )
+    matchability_loss = assignment_loss.new_zeros(())
+    if source_matchability or target_matchability:
+        if not (
+            len(source_matchability)
+            == len(target_matchability)
+            == len(layer_weights)
+        ):
+            raise ValueError("matchability logits must align with model layers")
+        per_layer_matchability = tuple(
+            0.5
+            * (
+                _node_matchability_loss(
+                    source_logits,
+                    pair.targets_a_to_b,
+                    torch=torch,
+                    device=device,
+                )
+                + _node_matchability_loss(
+                    target_logits,
+                    pair.targets_b_to_a,
+                    torch=torch,
+                    device=device,
+                )
+            )
+            for source_logits, target_logits in zip(
+                source_matchability, target_matchability, strict=True
+            )
+        )
+        matchability_loss = sum(
+            weight * layer_loss
+            for weight, layer_loss in zip(
+                layer_weights, per_layer_matchability, strict=True
+            )
+        )
     descriptor_loss = assignment_loss.new_zeros(())
+    visual_descriptor_loss = assignment_loss.new_zeros(())
     source_descriptors = output.get("source_descriptors")
     target_descriptors = output.get("target_descriptors")
     if source_descriptors is not None and target_descriptors is not None:
@@ -345,7 +399,73 @@ def matching_loss(
                 device=device,
             )
         )
-    loss = assignment_loss + float(descriptor_weight) * descriptor_loss
+    source_visual_descriptors = output.get("source_visual_descriptors")
+    target_visual_descriptors = output.get("target_visual_descriptors")
+    source_visual_mask = output.get("source_visual_mask")
+    target_visual_mask = output.get("target_visual_mask")
+    visual_descriptor_trainable = bool(
+        config.visual_encoder != DETERMINISTIC_ICON_VISUAL_ENCODER
+        and (
+            getattr(source_visual_descriptors, "requires_grad", False)
+            or getattr(target_visual_descriptors, "requires_grad", False)
+        )
+    )
+    if (
+        source_visual_descriptors is not None
+        and target_visual_descriptors is not None
+        and source_visual_mask is not None
+        and target_visual_mask is not None
+        and visual_descriptor_trainable
+    ):
+        normalized_source_visual = torch.nn.functional.normalize(
+            source_visual_descriptors,
+            dim=-1,
+        )
+        normalized_target_visual = torch.nn.functional.normalize(
+            target_visual_descriptors,
+            dim=-1,
+        )
+        visual_affinity = (
+            normalized_source_visual @ normalized_target_visual.T
+        ) / float(visual_descriptor_temperature)
+        visual_descriptor_loss = 0.5 * (
+            _masked_partial_assignment_loss(
+                visual_affinity,
+                pair.positive_targets_a_to_b,
+                candidate_indices=candidates_b,
+                source_mask=source_visual_mask,
+                target_mask=target_visual_mask,
+                torch=torch,
+                device=device,
+            )
+            + _masked_partial_assignment_loss(
+                visual_affinity.T,
+                pair.positive_targets_b_to_a,
+                candidate_indices=candidates_a,
+                source_mask=target_visual_mask,
+                target_mask=source_visual_mask,
+                torch=torch,
+                device=device,
+            )
+        )
+    loss = (
+        assignment_loss
+        + float(matchability_weight) * matchability_loss
+        + float(descriptor_weight)
+        * (
+            descriptor_loss
+            + float(visual_descriptor_weight) * visual_descriptor_loss
+        )
+    )
+    strategy_loss = relation_consistency_loss(
+        output["source_relation_bases"],
+        output["target_relation_bases"],
+        model.relation_compatibility,
+        pair.positive_targets_a_to_b,
+        pair.positive_targets_b_to_a,
+        torch=torch,
+    )
+    loss = loss + float(strategy_weight) * strategy_loss
     if not return_details:
         return loss
     final_loss = layer_losses[-1]
@@ -356,12 +476,19 @@ def matching_loss(
     )
     return loss, {
         "assignment_loss": float(assignment_loss.detach().cpu()),
+        "matchability_loss": float(matchability_loss.detach().cpu()),
+        "matchability_weight": float(matchability_weight),
         "descriptor_loss": float(descriptor_loss.detach().cpu()),
+        "visual_descriptor_loss": float(visual_descriptor_loss.detach().cpu()),
         "total_loss": float(loss.detach().cpu()),
         "final_assignment_loss": float(final_loss.detach().cpu()),
         "intermediate_assignment_loss": float(intermediate_loss.detach().cpu()),
         "supervised_layers": float(len(layer_losses)),
         "descriptor_weight": float(descriptor_weight),
+        "visual_descriptor_weight": float(visual_descriptor_weight),
+        "visual_descriptor_trainable": float(visual_descriptor_trainable),
+        "strategy_loss": float(strategy_loss.detach().cpu()),
+        "strategy_weight": float(strategy_weight),
     }
 
 
@@ -481,24 +608,6 @@ def evaluate_correspondence_pairs(
                     if not target_indices:
                         continue
                     selected_logits = logits[row_index, candidate_indices]
-                    spatial_xml_alignment_applied = False
-                    if (
-                        config.architecture
-                        == OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE
-                    ):
-                        (
-                            selected_logits,
-                            spatial_xml_alignment_applied,
-                        ) = spatial_xml_alignment_rerank_logits(
-                            selected_logits,
-                            source_node=source_nodes[row_index],
-                            target_nodes=tuple(
-                                candidate_nodes[index]
-                                for index in candidate_indices
-                            ),
-                            source_graph=source_graph,
-                            target_graph=target_graph,
-                        )
                     ranked_positions = torch.argsort(
                         selected_logits,
                         descending=True,
@@ -562,9 +671,6 @@ def evaluate_correspondence_pairs(
                                     index=ranked[0],
                                 ),
                                 "correct": ranked[0] in target_indices,
-                                "spatial_xml_alignment_applied": (
-                                    spatial_xml_alignment_applied
-                                ),
                                 "gold_rank": gold_rank,
                                 "top_candidates": [
                                     {
@@ -717,17 +823,7 @@ def _evaluation_score_components(
         name: output.get(name)
         for name in (
             "affinity",
-            "unary_affinity",
-            "base_affinity",
-            "association_residual",
-            "direct_evidence_residual",
-            "anchor_vote_residual",
-            "context_vote_residual",
-            "relation_residual",
-            "v9_affinity",
-            "local_alignment_residual",
-            "local_alignment_base_residual",
-            "geometry_alignment_residual",
+            "association_score",
         )
     }
     transformer_residuals = tuple(
@@ -791,6 +887,10 @@ def train_geometric_v9_matcher(
     cross_page_pair_repeats: int = 1,
     descriptor_weight: float = 0.20,
     descriptor_learning_rate_scale: float = 0.25,
+    visual_descriptor_weight: float = 1.0,
+    visual_descriptor_temperature: float = 0.07,
+    strategy_weight: float = 0.10,
+    matchability_weight: float = 0.20,
 ) -> tuple[Any, list[dict[str, float]]]:
     """Train geometric-v9 on canonical cross-page and synthetic pairs."""
 
@@ -804,6 +904,14 @@ def train_geometric_v9_matcher(
         raise ValueError("training requires synthetic or cross-page pairs")
     if descriptor_weight < 0.0:
         raise ValueError("descriptor_weight must be non-negative")
+    if visual_descriptor_weight < 0.0:
+        raise ValueError("visual_descriptor_weight must be non-negative")
+    if visual_descriptor_temperature <= 0.0:
+        raise ValueError("visual_descriptor_temperature must be positive")
+    if strategy_weight < 0.0:
+        raise ValueError("strategy_weight must be non-negative")
+    if matchability_weight < 0.0:
+        raise ValueError("matchability_weight must be non-negative")
     if not 0.0 < descriptor_learning_rate_scale <= 1.0:
         raise ValueError(
             "descriptor_learning_rate_scale must be in (0, 1]"
@@ -828,7 +936,6 @@ def train_geometric_v9_matcher(
         "text_projection",
         "numeric_projection",
         "xml_projection",
-        "visual_encoder",
         "missing_",
         "descriptor_",
     )
@@ -921,6 +1028,10 @@ def train_geometric_v9_matcher(
                 device=device,
                 matcher_config=config,
                 descriptor_weight=descriptor_weight,
+                visual_descriptor_weight=visual_descriptor_weight,
+                visual_descriptor_temperature=visual_descriptor_temperature,
+                strategy_weight=strategy_weight,
+                matchability_weight=matchability_weight,
                 return_details=True,
             )
             loss.backward()
@@ -1026,20 +1137,30 @@ def _select_kept_nodes(
 ) -> list[UINode]:
     if not nodes:
         return []
-    actionable = [node for node in nodes if _is_actionable(node)]
-    context = [
-        node
-        for node in nodes
-        if not _is_actionable(node) and rng.random() >= config.drop_node_prob
-    ]
-    kept = [*actionable, *context]
-    minimum = min(max(1, config.min_nodes, len(actionable)), len(nodes))
+    # Node retention is structural, never actionability-based. Non-clickable
+    # labels, icons and containers are first-class context for correspondence.
+    kept = [node for node in nodes if rng.random() >= config.drop_node_prob]
+    minimum = min(max(1, config.min_nodes), len(nodes))
     if len(kept) < minimum:
         kept_ids = {node.node_id for node in kept}
         missing = [node for node in nodes if node.node_id not in kept_ids]
         rng.shuffle(missing)
         kept.extend(missing[: minimum - len(kept)])
-    return kept
+    node_map = {node.node_id: node for node in nodes}
+    kept_ids = {node.node_id for node in kept}
+    # Retain the immediate parent and adjacent siblings of each sampled node so
+    # augmentation does not erase the local relation that the matcher learns.
+    for node in tuple(kept):
+        parent_id = node.parent_id
+        parent = node_map.get(parent_id) if parent_id else None
+        if parent is None:
+            continue
+        kept_ids.add(parent.node_id)
+        siblings = [value for value in parent.child_ids if value in node_map]
+        if node.node_id in siblings:
+            index = siblings.index(node.node_id)
+            kept_ids.update(siblings[max(0, index - 1) : index + 2])
+    return [node for node in nodes if node.node_id in kept_ids]
 
 
 def _sample_global_transform(
@@ -1265,15 +1386,96 @@ def _partial_assignment_loss(
 
 
 
+def _node_matchability_loss(
+    logits: Any,
+    targets: tuple[int, ...],
+    *,
+    torch: Any,
+    device: str,
+) -> Any:
+    """Train explicit match/NULL confidence while ignoring unknown rows."""
+
+    if logits.ndim != 1 or logits.shape[0] != len(targets):
+        raise ValueError("matchability requires one logit per source node")
+    supervised = [index for index, target in enumerate(targets) if target != -2]
+    if not supervised:
+        return logits.new_zeros(())
+    indices = torch.tensor(supervised, dtype=torch.long, device=device)
+    labels = torch.tensor(
+        [float(targets[index] >= 0) for index in supervised],
+        dtype=logits.dtype,
+        device=device,
+    )
+    return torch.nn.functional.binary_cross_entropy_with_logits(
+        logits[indices], labels
+    )
+
+
+def _masked_partial_assignment_loss(
+    logits: Any,
+    positive_targets: tuple[tuple[int, ...], ...],
+    *,
+    candidate_indices: tuple[int, ...],
+    source_mask: Any,
+    target_mask: Any,
+    torch: Any,
+    device: str,
+) -> Any:
+    """Apply the visual descriptor objective only to nodes with patches."""
+
+    candidate_positions = {
+        index: position for position, index in enumerate(candidate_indices)
+    }
+    source_available = source_mask.reshape(-1).gt(0.0)
+    target_available = target_mask.reshape(-1).gt(0.0)
+    supervised_rows: list[int] = []
+    valid_targets: dict[int, tuple[int, ...]] = {}
+    for source_index, targets in enumerate(positive_targets):
+        if not bool(source_available[source_index].detach().cpu()):
+            continue
+        filtered = tuple(
+            target_index
+            for target_index in targets
+            if target_index in candidate_positions
+            and bool(target_available[target_index].detach().cpu())
+        )
+        if filtered:
+            supervised_rows.append(source_index)
+            valid_targets[source_index] = filtered
+    if not supervised_rows:
+        return logits.new_zeros(())
+    row_indices = torch.tensor(supervised_rows, dtype=torch.long, device=device)
+    column_indices = torch.tensor(candidate_indices, dtype=torch.long, device=device)
+    selected_logits = logits[row_indices][:, column_indices]
+    log_probabilities = torch.log_softmax(selected_logits, dim=1)
+    losses = []
+    for row_position, row_index in enumerate(supervised_rows):
+        positive_positions = torch.tensor(
+            [candidate_positions[target] for target in valid_targets[row_index]],
+            dtype=torch.long,
+            device=device,
+        )
+        losses.append(
+            -torch.logsumexp(
+                log_probabilities[row_position, positive_positions],
+                dim=0,
+            )
+        )
+    return torch.stack(losses).mean()
+
+
 def _mean_loss_details(rows: list[dict[str, float]]) -> dict[str, float]:
     keys = (
         "assignment_loss",
         "descriptor_loss",
+        "visual_descriptor_loss",
         "total_loss",
         "final_assignment_loss",
         "intermediate_assignment_loss",
         "supervised_layers",
         "descriptor_weight",
+        "visual_descriptor_weight",
+        "visual_descriptor_trainable",
     )
     return {
         key: sum(row[key] for row in rows) / max(len(rows), 1)

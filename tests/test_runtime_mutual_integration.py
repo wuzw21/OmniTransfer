@@ -34,7 +34,7 @@ def test_ranking_uses_v9_matcher_for_full_graphs(monkeypatch) -> None:
     assert len(calls) == 1
     assert calls[0][2]["source_node_id"] == "0.0"
     assert result["candidates"]
-    assert result["mapping_mode"] == "omnitransfer_direct_text_alignment_v9"
+    assert result["mapping_mode"] == "omnitransfer_unified_association_v1"
     assert result["candidates"][0]["bbox"] == [40.0, 300.0, 360.0, 400.0]
     assert result["score"] == 0.91
     assert result["margin"] == 0.42
@@ -53,7 +53,7 @@ def test_ranking_reports_failure_when_matcher_is_unavailable(monkeypatch) -> Non
     )
 
     assert result["candidates"] == []
-    assert result["mapping_mode"] == "omnitransfer_direct_text_alignment_v9"
+    assert result["mapping_mode"] == "omnitransfer_unified_association_v1"
     assert result["reason"] == "matcher_unavailable"
     assert "new_x" not in result
     assert "new_y" not in result

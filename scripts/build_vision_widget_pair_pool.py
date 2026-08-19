@@ -10,6 +10,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from omnitransfer.ios_adapter import load_ios_screen
 from omnitransfer.ui_graph import graph_from_record, graph_to_record
 
 
@@ -38,73 +39,32 @@ def _node_payload(node: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _scale_normalized_bboxes(
-    graph: dict[str, Any], *, visual_width: float = 0, visual_height: float = 0
+def _expand_relative_coordinate_spaces(
+    graph_record: dict[str, Any], *, display_width: float, display_height: float
 ) -> None:
-    """Restore model ``bbox`` values to the graph/XML coordinate space.
+    """Materialize normalized XML/screenshot bounds before pool construction."""
 
-    Some iOS dumps expose logical XML dimensions (for example 414x736) while
-    their bounds are expressed in Retina screenshot pixels (for example
-    1242x2208).  Passing those mixed coordinates to the matcher clips the
-    lower part of the source page to one normalized position and destroys the
-    relative-layout evidence.  The graph is the canonical coordinate space;
-    screenshot dimensions are used only to detect and undo an isotropic scale;
-    ``visual_bbox`` remains in screenshot pixels for the review workbench.
-    """
-
-    width = float(graph.get("width") or 0)
-    height = float(graph.get("height") or 0)
-    nodes = graph.get("nodes") or []
-    boxes = [node.get("bbox") for node in nodes if node.get("bbox")]
-    if not boxes or width <= 1 or height <= 1:
-        return
-
-    scale_x = width / visual_width if visual_width > 1 else 1.0
-    scale_y = height / visual_height if visual_height > 1 else 1.0
-    relative_difference = abs(scale_x - scale_y) / max(scale_x, scale_y, 1e-9)
-    screenshot_scaled_xml = relative_difference <= 0.03 and (
-        scale_x <= 0.8 or scale_x >= 1.25
-    )
-
-    def restore_xml_bbox(bbox: list[float] | tuple[float, ...]) -> list[float]:
-        values = [float(value) for value in bbox]
-        maximum = max(values)
-        if maximum <= 1.000001:
-            # Relative XML bounds must be expanded in XML dimensions, never
-            # in screenshot dimensions.
-            return [
-                values[0] * width,
-                values[1] * height,
-                values[2] * width,
-                values[3] * height,
-            ]
-        if screenshot_scaled_xml:
-            return [
-                values[0] * scale_x,
-                values[1] * scale_y,
-                values[2] * scale_x,
-                values[3] * scale_y,
-            ]
-        return values
-
-    def restore_visual_bbox(bbox: list[float] | tuple[float, ...]) -> list[float]:
-        values = [float(value) for value in bbox]
-        if max(values) <= 1.000001 and visual_width > 1 and visual_height > 1:
-            return [
-                values[0] * visual_width,
-                values[1] * visual_height,
-                values[2] * visual_width,
-                values[3] * visual_height,
-            ]
-        return values
-
-    for node in nodes:
+    width = float(graph_record.get("width") or 0.0)
+    height = float(graph_record.get("height") or 0.0)
+    for node in graph_record.get("nodes") or []:
         bbox = node.get("bbox")
-        if bbox:
-            node["bbox"] = restore_xml_bbox(bbox)
-        visual_bbox = node.get("visual_bbox")
-        if visual_bbox:
-            node["visual_bbox"] = restore_visual_bbox(visual_bbox)
+        if bbox and max(float(value) for value in bbox) <= 1.000001:
+            node["bbox"] = [
+                float(bbox[0]) * width,
+                float(bbox[1]) * height,
+                float(bbox[2]) * width,
+                float(bbox[3]) * height,
+            ]
+        metadata = node.get("metadata") or {}
+        visual_bbox = metadata.get("visual_bbox")
+        if visual_bbox and max(float(value) for value in visual_bbox) <= 1.000001:
+            metadata["visual_bbox"] = [
+                float(visual_bbox[0]) * display_width,
+                float(visual_bbox[1]) * display_height,
+                float(visual_bbox[2]) * display_width,
+                float(visual_bbox[3]) * display_height,
+            ]
+        node["metadata"] = metadata
 
 
 def _load_screens(path: Path, root: Path) -> dict[str, dict[str, Any]]:
@@ -115,23 +75,28 @@ def _load_screens(path: Path, root: Path) -> dict[str, dict[str, Any]]:
                 continue
             raw = json.loads(line)
             screen_id = str(raw["screen_id"])
+            if str(raw.get("platform") or "").strip().lower() in {"ios", "iphoneos", "ipad os", "ipados"}:
+                screens[screen_id] = load_ios_screen(raw, root=root)
+                continue
             xml_path = (root / raw["xml_path"]).resolve()
             screenshot_path = (root / raw["screenshot_path"]).resolve()
+            xml = xml_path.read_text(encoding="utf-8")
             graph = graph_from_record(
                 {
-                    "xml": xml_path.read_text(encoding="utf-8"),
+                    "xml": xml,
                     "width": raw.get("original_xml_width"),
                     "height": raw.get("original_xml_height"),
                 },
                 graph_id=screen_id,
             )
             graph_record = graph_to_record(graph)
+            if "relative_0_1" in str(raw.get("coordinate_space") or ""):
+                _expand_relative_coordinate_spaces(
+                    graph_record,
+                    display_width=float(raw.get("screenshot_width") or graph_record["width"]),
+                    display_height=float(raw.get("screenshot_height") or graph_record["height"]),
+                )
             graph_record["nodes"] = [_node_payload(node) for node in graph_record["nodes"]]
-            _scale_normalized_bboxes(
-                graph_record,
-                visual_width=float(raw.get("screenshot_width") or 0),
-                visual_height=float(raw.get("screenshot_height") or 0),
-            )
             screens[screen_id] = {
                 "screen_id": screen_id,
                 "page_id": screen_id,
@@ -139,6 +104,7 @@ def _load_screens(path: Path, root: Path) -> dict[str, dict[str, Any]]:
                 "screenshot_path": str(screenshot_path),
                 "display_width": float(raw.get("screenshot_width") or graph_record["width"]),
                 "display_height": float(raw.get("screenshot_height") or graph_record["height"]),
+                "xml": xml,
                 "graph": graph_record,
             }
     return screens

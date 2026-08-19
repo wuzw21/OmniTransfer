@@ -59,7 +59,7 @@ def test_ranking_uses_matcher_and_projects_source_offset() -> None:
     )
 
     assert result["candidates"]
-    assert result["mapping_mode"] == "omnitransfer_direct_text_alignment_v9"
+    assert result["mapping_mode"] == "omnitransfer_unified_association_v1"
     assert (result["candidates"][0]["new_x"], result["candidates"][0]["new_y"]) == (280.0, 260.0)
     assert result["candidates"][0]["bbox"] == [200.0, 220.0, 360.0, 300.0]
     assert "mapped" not in result
@@ -80,14 +80,12 @@ def test_ranking_prefers_actionable_child_with_same_bounds() -> None:
     assert result["candidates"][0]["bbox"] == [104.0, 551.0, 608.0, 691.0]
 
 
-def test_ranking_maps_equivalent_ui_graph_without_model(
+def test_ranking_uses_model_for_equivalent_ui_graph(
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr(
-        runtime,
-        "_get_matcher",
-        lambda: pytest.fail("equivalent graphs must not invoke the learned matcher"),
-    )
+    calls = []
+    matcher = runtime._get_matcher()
+    monkeypatch.setattr(runtime, "_get_matcher", lambda: calls.append(True) or matcher)
 
     result = rank_action_candidates(
         source_xml=SOURCE_XML,
@@ -96,33 +94,8 @@ def test_ranking_maps_equivalent_ui_graph_without_model(
     )
 
     assert result["candidates"]
-    assert result["mapping_mode"] == "equivalent_ui_graph"
-    assert (result["candidates"][0]["new_x"], result["candidates"][0]["new_y"]) == (60.0, 40.0)
-
-
-def test_ranking_ignores_unrelated_dynamic_text_on_equivalent_graph(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(
-        runtime,
-        "_get_matcher",
-        lambda: pytest.fail("equivalent graphs must not invoke the learned matcher"),
-    )
-    source_xml = SOURCE_XML.replace(
-        "</hierarchy>",
-        '<node resource-id="com.example:id/storage" text="57% used" '
-        'class="android.widget.TextView" bounds="[10,75][110,95]" /></hierarchy>',
-    )
-    target_xml = source_xml.replace('text="57% used"', 'text="53% used"')
-
-    result = rank_action_candidates(
-        source_xml=source_xml,
-        target_xml=target_xml,
-        source_point=(60, 40),
-    )
-
-    assert result["candidates"]
-    assert result["mapping_mode"] == "equivalent_ui_graph"
+    assert calls == [True]
+    assert result["mapping_mode"] == "omnitransfer_unified_association_v1"
     assert (result["candidates"][0]["new_x"], result["candidates"][0]["new_y"]) == (60.0, 40.0)
 
 
@@ -172,7 +145,7 @@ def test_ranking_allows_matcher_to_disambiguate_duplicate_identity(
     )
 
     assert result["candidates"]
-    assert result["mapping_mode"] == "omnitransfer_direct_text_alignment_v9"
+    assert result["mapping_mode"] == "omnitransfer_unified_association_v1"
     assert result["candidates"][0]["bbox"] == [200.0, 220.0, 360.0, 300.0]
     assert sum(
         candidate["resource_id"] == "com.example:id/submit"
@@ -194,7 +167,7 @@ def test_ranking_returns_top_candidate_when_matcher_abstains() -> None:
     )
 
     assert result["candidates"]
-    assert result["mapping_mode"] == "omnitransfer_direct_text_alignment_v9"
+    assert result["mapping_mode"] == "omnitransfer_unified_association_v1"
     assert "selection_policy" not in result
     assert result["reason"] == "learned_low_confidence"
     assert result["candidates"][0]["bbox"] in (

@@ -1,4 +1,5 @@
 import random
+from dataclasses import replace
 
 import pytest
 
@@ -73,7 +74,7 @@ def _config() -> MatcherConfig:
         relation_hidden_dim=16,
         association_dim=24,
         num_heads=4,
-        num_layers=2,
+        association_layers=2,
         dropout=0.0,
     )
 
@@ -107,6 +108,27 @@ def test_augmentation_preserves_origin_identity() -> None:
     }
 
 
+def test_augmentation_node_retention_is_independent_of_clickability() -> None:
+    source, _ = _graphs()
+    changed = UIGraph(
+        graph_id=source.graph_id,
+        width=source.width,
+        height=source.height,
+        nodes=tuple(
+            replace(node, clickable=not node.clickable)
+            for node in source.nodes
+        ),
+    )
+    config = AugmentConfig(drop_node_prob=0.7, distractor_prob=0.0, min_nodes=1)
+
+    original_augmented = augment_graph(source, rng=random.Random(29), config=config)
+    changed_augmented = augment_graph(changed, rng=random.Random(29), config=config)
+
+    assert [node.origin_id for node in original_augmented.nodes] == [
+        node.origin_id for node in changed_augmented.nodes
+    ]
+
+
 def test_geometric_matching_loss_and_training_smoke() -> None:
     pytest.importorskip("torch", exc_type=ImportError)
     source, target = _graphs()
@@ -135,7 +157,10 @@ def test_geometric_matching_loss_and_training_smoke() -> None:
     )
 
     assert loss.item() >= 0.0
-    assert details["supervised_layers"] == 1.0
+    assert details["supervised_layers"] == 2.0
+    assert details["visual_descriptor_trainable"] == 0.0
+    assert details["visual_descriptor_loss"] == 0.0
+    assert details["matchability_loss"] > 0.0
     assert trained.training is False
     assert history[0]["cross_page_pairs"] == 1.0
 

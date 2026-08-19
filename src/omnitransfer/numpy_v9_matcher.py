@@ -1,4 +1,4 @@
-"""NumPy inference for the frozen OmniTransfer geometric-alignment v9 model."""
+"""NumPy inference for the unified OmniTransfer association model."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import math
 from io import BytesIO
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 import zlib
@@ -15,28 +16,39 @@ from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 from omnitransfer.learned_matcher import (
     ALIGNMENT_RELATION_FEATURE_INDICES,
-    DIRECT_SEMANTIC_EVIDENCE_NAMES,
+    DETERMINISTIC_ICON_VISUAL_ENCODER,
+    DIRECT_PAIR_EVIDENCE_NAMES,
     GEOMETRIC_FEATURE_SCHEMA_ID,
     LearnedMatch,
+    LEGACY_GLOBAL_POOL_VISUAL_ENCODER,
     MatcherConfig,
     OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE,
     TEXT_DESCRIPTOR_DIM,
     TYPED_RELATION_NAMES,
     VISUAL_DESCRIPTOR_DIM,
-    cross_relation_features,
     encode_graph,
-    spatial_xml_alignment_choice,
+    SPATIAL_CNN_VISUAL_ENCODER,
 )
-from omnitransfer.ui_graph import UIGraph
+from omnitransfer.unified_alignment import (
+    ALIGNMENT_STRATEGY_SCHEMA_ID,
+    UNIFIED_ASSOCIATION_SCHEMA_ID,
+)
+from omnitransfer.ui_graph import (
+    UIGraph,
+    local_context_graph,
+    multi_anchor_context_graph,
+    visual_bbox_fraction,
+)
+from omnitransfer.visual_descriptor import deterministic_icon_descriptor_numpy
 
-NUMPY_GEOMETRIC_V9_SCHEMA = "omnitransfer_numpy_geometric_alignment_v9_v1"
+NUMPY_UNIFIED_ASSOCIATION_SCHEMA = "omnitransfer_numpy_unified_association_v1"
 
 
 class NumpyGeometricAlignmentMatcher:
-    """Inference-only v9 matcher for the Android Python/NumPy runtime."""
+    """Inference-only unified association matcher for the runtime."""
 
     feature_schema_id = GEOMETRIC_FEATURE_SCHEMA_ID
-    backend = "numpy-v9"
+    backend = "numpy-unified-association-v1"
 
     def __init__(self, weights: Mapping[str, Any], *, config: MatcherConfig) -> None:
         if config.architecture != OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE:
@@ -48,8 +60,10 @@ class NumpyGeometricAlignmentMatcher:
     def from_checkpoint(cls, path: str | Path) -> "NumpyGeometricAlignmentMatcher":
         np = _require_numpy()
         with np.load(Path(path), allow_pickle=False) as checkpoint:
-            if _decode(checkpoint["__schema_version__"]) != NUMPY_GEOMETRIC_V9_SCHEMA:
-                raise ValueError("checkpoint is not an OmniTransfer NumPy v9 matcher")
+            if _decode(checkpoint["__schema_version__"]) != NUMPY_UNIFIED_ASSOCIATION_SCHEMA:
+                raise ValueError(
+                    "checkpoint is not an OmniTransfer unified association matcher"
+                )
             config = MatcherConfig(
                 **json.loads(_decode(checkpoint["__config_json__"]))
             )
@@ -70,53 +84,149 @@ class NumpyGeometricAlignmentMatcher:
         min_probability: float = 0.0,
         min_margin: float = 0.0,
     ) -> LearnedMatch:
-        source_node = next(
-            (node for node in source.nodes if node.node_id == source_node_id),
-            None,
-        )
-        if source_node is None:
+        if not any(node.node_id == source_node_id for node in source.nodes):
             return LearnedMatch(None, 0.0, 0.0, "source_node_missing", ())
-        source_index = next(
-            (
-                index
-                for index, node in enumerate(source.nodes)
-                if node.node_id == source_node_id
-            ),
-            None,
+        source_context = local_context_graph(
+            source,
+            anchor_node_id=source_node_id,
+            max_nodes=self.config.source_context_nodes,
         )
-        if source_index is None:
-            raise AssertionError("source context dropped its anchor node")
+        allowed = set(
+            candidate_node_ids or (node.node_id for node in target.nodes)
+        ) & {node.node_id for node in target.nodes}
+        if not allowed:
+            return LearnedMatch(None, 0.0, 0.0, "target_candidates_missing", ())
+        target_context = multi_anchor_context_graph(
+            target,
+            anchor_node_ids=allowed,
+            max_nodes=max(self.config.target_context_nodes, len(allowed)),
+        )
+        source_index = next(
+            index
+            for index, node in enumerate(source_context.nodes)
+            if node.node_id == source_node_id
+        )
+        candidate_indices = self._candidate_indices(target_context, allowed)
+        if not candidate_indices:
+            return LearnedMatch(None, 0.0, 0.0, "target_candidates_missing", ())
+        return self._predict_from_output(
+            source_context,
+            target_context,
+            source_index=source_index,
+            candidate_indices=candidate_indices,
+            output=self._forward(source_context, target_context),
+            min_probability=min_probability,
+            min_margin=min_margin,
+        )
+
+    def predict_many(
+        self,
+        source: UIGraph,
+        target: UIGraph,
+        *,
+        source_node_ids: Iterable[str],
+        candidate_node_ids: Iterable[str] | None = None,
+        min_probability: float = 0.0,
+        min_margin: float = 0.0,
+    ) -> dict[str, LearnedMatch]:
+        """Predict several source nodes while encoding one page pair once."""
+
+        requested_source_ids = tuple(dict.fromkeys(source_node_ids))
+        valid_source_ids = tuple(
+            node_id
+            for node_id in requested_source_ids
+            if any(node.node_id == node_id for node in source.nodes)
+        )
+        allowed = set(
+            candidate_node_ids or (node.node_id for node in target.nodes)
+        ) & {node.node_id for node in target.nodes}
+        if not allowed:
+            return {
+                source_node_id: LearnedMatch(
+                    None, 0.0, 0.0, "target_candidates_missing", ()
+                )
+                for source_node_id in requested_source_ids
+            }
+        if not valid_source_ids:
+            return {
+                source_node_id: LearnedMatch(
+                    None, 0.0, 0.0, "source_node_missing", ()
+                )
+                for source_node_id in requested_source_ids
+            }
+        source_context = multi_anchor_context_graph(
+            source,
+            anchor_node_ids=valid_source_ids,
+            max_nodes=max(self.config.source_context_nodes, len(valid_source_ids)),
+        )
+        target_context = multi_anchor_context_graph(
+            target,
+            anchor_node_ids=allowed,
+            max_nodes=max(self.config.target_context_nodes, len(allowed)),
+        )
+        source_indices = {
+            node.node_id: index for index, node in enumerate(source_context.nodes)
+        }
+        candidate_indices = self._candidate_indices(target_context, allowed)
+        if not candidate_indices:
+            return {
+                source_node_id: LearnedMatch(
+                    None, 0.0, 0.0, "target_candidates_missing", ()
+                )
+                for source_node_id in requested_source_ids
+            }
+        output = self._forward(source_context, target_context)
+        predictions = {}
+        for source_node_id in requested_source_ids:
+            source_index = source_indices.get(source_node_id)
+            if source_index is None:
+                predictions[source_node_id] = LearnedMatch(
+                    None, 0.0, 0.0, "source_node_missing", ()
+                )
+                continue
+            predictions[source_node_id] = self._predict_from_output(
+                source_context,
+                target_context,
+                source_index=source_index,
+                candidate_indices=candidate_indices,
+                output=output,
+                min_probability=min_probability,
+                min_margin=min_margin,
+            )
+        return predictions
+
+    def page_embedding(self, page: UIGraph) -> Any:
+        """Return the normalized contextual configuration readout for one page."""
+
+        if not page.nodes:
+            raise ValueError("page embedding requires at least one node")
+        return self._forward(page, page)["source_config_embedding"].copy()
+
+    @staticmethod
+    def _candidate_indices(
+        target: UIGraph,
+        candidate_node_ids: Iterable[str] | None,
+    ) -> list[int]:
         allowed = set(candidate_node_ids or (node.node_id for node in target.nodes))
-        candidate_indices = [
+        return [
             index
             for index, node in enumerate(target.nodes)
             if node.node_id in allowed
         ]
-        if not candidate_indices:
-            return LearnedMatch(None, 0.0, 0.0, "target_candidates_missing", ())
 
-        output = self._forward(source, target)
+    def _predict_from_output(
+        self,
+        source: UIGraph,
+        target: UIGraph,
+        *,
+        source_index: int,
+        candidate_indices: list[int],
+        output: dict[str, Any],
+        min_probability: float,
+        min_margin: float,
+    ) -> LearnedMatch:
         selected_logits = output["logits_ab"][source_index][candidate_indices].copy()
         selected_affinity = output["affinity"][source_index][candidate_indices]
-        choice = spatial_xml_alignment_choice(
-            selected_logits,
-            source_node=source.nodes[source_index],
-            target_nodes=tuple(target.nodes[index] for index in candidate_indices),
-            source_graph=source,
-            target_graph=target,
-        )
-        if choice is not None:
-            model_position = min(
-                range(len(selected_logits)),
-                key=lambda position: (
-                    -float(selected_logits[position]),
-                    target.nodes[candidate_indices[position]].node_id,
-                ),
-            )
-            selected_logits[model_position], selected_logits[choice] = (
-                selected_logits[choice],
-                selected_logits[model_position],
-            )
         rank_probabilities = _softmax(selected_logits, axis=0)
         match_probabilities = _sigmoid(selected_affinity)
         ranked = sorted(
@@ -171,11 +281,11 @@ class NumpyGeometricAlignmentMatcher:
             target_encoded.relation_features,
             dtype=np.float32,
         )
-        direct_evidence = np.asarray(
-            cross_relation_features(
-                source,
-                target,
-                feature_schema_id=self.feature_schema_id,
+        direct_evidence = np.zeros(
+            (
+                len(source.nodes),
+                len(target.nodes),
+                len(DIRECT_PAIR_EVIDENCE_NAMES),
             ),
             dtype=np.float32,
         )
@@ -201,139 +311,34 @@ class NumpyGeometricAlignmentMatcher:
             target_visual,
             target_visual_mask,
         )
-        unary_affinity = self._unary(source_states, target_states)
         source_bases = _typed_relation_bases(source_relations, source_numeric)
         target_bases = _typed_relation_bases(target_relations, target_numeric)
-        soft_assignment = np.exp(_mutual_log_assignment(unary_affinity))
-        affinity = unary_affinity
-        for round_index in range(self.config.num_layers):
-            relation_vote = _relation_vote(
-                soft_assignment,
-                source_bases,
-                target_bases,
-                self.weights["relation_compatibility"],
-            )
-            strength = _softplus(self.weights["voting_strengths"][round_index])
-            affinity = unary_affinity + strength * relation_vote
-            soft_assignment = np.exp(_mutual_log_assignment(affinity))
-        base_affinity = affinity
-        semantic_sum = direct_evidence[
-            ..., : len(DIRECT_SEMANTIC_EVIDENCE_NAMES)
-        ].sum(axis=-1, dtype=np.float32)
-        direct_residual = (
-            semantic_sum * self.weights["direct_evidence_head.weight"].reshape(-1)[0]
-        )
-        anchor_weights = np.exp(_mutual_log_assignment(base_affinity + direct_residual))
-        pair_states = self._association_pair_states(
-            source_modalities,
-            target_modalities,
-            (source_tokens != 0).any(axis=1).astype(np.float32),
-            (target_tokens != 0).any(axis=1).astype(np.float32),
-            source_visual_mask[:, 0],
-            target_visual_mask[:, 0],
-            anchor_weights,
-        )
-        compatibility = np_float(0.5) * (
-            self.weights["relation_compatibility"]
-            + self.weights["relation_compatibility"].T
-        )
+        unary_affinity, _, _ = self._affinity(source_states, target_states)
         for layer_index in range(self.config.association_layers):
-            pair_states = self._association_layer(
-                pair_states,
-                anchor_weights,
+            source_states, target_states = self._contextual_layer(
+                source_states,
+                target_states,
                 source_bases,
                 target_bases,
-                compatibility,
                 layer_index,
             )
-        association_residual = self._linear(
-            pair_states,
-            "association_score",
-            bias=False,
-        ).squeeze(-1)
-        anchor_vote = _semantic_anchor_relation_vote(
-            direct_evidence,
-            source_bases,
-            target_bases,
-            compatibility,
+        association_score, source_matchability, target_matchability = self._affinity(
+            source_states, target_states
         )
-        anchor_vote_residual = _softplus(
-            self.weights["anchor_voting_strength"]
-        ) * anchor_vote
-        context_score = _local_semantic_context_score(
-            direct_evidence,
-            source_bases,
-            target_bases,
-            source_numeric,
-            target_numeric,
-        )
-        context_vote_residual = _softplus(
-            self.weights["context_voting_strength"]
-        ) * context_score
-        affinity = (
-            base_affinity
-            + association_residual
-            + direct_residual
-            + anchor_vote_residual
-            + context_vote_residual
-        )
-        assignment = _partial_assignment(
-            affinity,
-            source_numeric,
-            target_numeric,
-            all_nodes=True,
-        )
-        score_components = np.stack(
-            (
-                unary_affinity,
-                base_affinity,
-                association_residual,
-                direct_residual,
-                anchor_vote_residual,
-                context_score,
-                context_vote_residual,
-                affinity,
-            ),
-            axis=-1,
-        )
-        standardized_scores = _standardize(score_components)
-        consensus = _standardize(
-            _relational_consensus_features(assignment, source_bases, target_bases)
-        )
-        geometry = _standardize(
-            _relative_geometry_consensus_features(
-                assignment,
-                source_relations,
-                target_relations,
-            )
-        )
-        local_features = np.concatenate(
-            (
-                direct_evidence,
-                np.tanh(score_components / np_float(5.0)),
-                standardized_scores,
-                consensus,
-                geometry,
-            ),
-            axis=-1,
-        )
-        local_residual = self._layer_norm(local_features, "local_alignment_score.0")
-        local_residual = _gelu(
-            self._linear(local_residual, "local_alignment_score.1")
-        )
-        local_residual = self._linear(
-            local_residual,
-            "local_alignment_score.3",
-            bias=False,
-        ).squeeze(-1)
-        final_affinity = affinity + local_residual
-        final_assignment = _partial_assignment(
-            final_affinity,
-            source_numeric,
-            target_numeric,
-            all_nodes=True,
-        )
-        return {"logits_ab": final_assignment, "affinity": final_affinity}
+        final_assignment = _mutual_log_assignment(association_score)
+        return {
+            "logits_ab": final_assignment,
+            "affinity": association_score,
+            "association_score": association_score,
+            "direct_pair_evidence": direct_evidence,
+            "unary_affinity": unary_affinity,
+            "source_matchability": source_matchability,
+            "target_matchability": target_matchability,
+            "source_config_embedding": self._page_embedding(source_states),
+            "target_config_embedding": self._page_embedding(target_states),
+            "alignment_strategy_schema": ALIGNMENT_STRATEGY_SCHEMA_ID,
+            "association_schema": UNIFIED_ASSOCIATION_SCHEMA_ID,
+        }
 
     def _encode_nodes(
         self,
@@ -344,38 +349,83 @@ class NumpyGeometricAlignmentMatcher:
     ) -> tuple[Any, Any]:
         np = _require_numpy()
         visual = visual_patches
-        for index in (0, 2, 4):
-            visual = _gelu(
-                self._conv2d(visual, f"visual_encoder.{index}", stride=2)
-            )
-        visual = visual.mean(axis=(2, 3), dtype=np.float32)
+        if self.config.visual_encoder == LEGACY_GLOBAL_POOL_VISUAL_ENCODER:
+            for index in (0, 2, 4):
+                visual = _gelu(
+                    self._conv2d(visual, f"visual_encoder.{index}", stride=2)
+                )
+            visual = visual.mean(axis=(2, 3), dtype=np.float32)
+        elif self.config.visual_encoder == SPATIAL_CNN_VISUAL_ENCODER:
+            for index in (0, 2, 4, 6):
+                visual = _gelu(
+                    self._conv2d(visual, f"visual_encoder.{index}", stride=1 if index in (0, 6) else 2)
+                )
+            visual = visual.reshape(visual.shape[0], -1)
+            visual = self._linear(visual, "visual_encoder.9")
+        elif self.config.visual_encoder == DETERMINISTIC_ICON_VISUAL_ENCODER:
+            visual = deterministic_icon_descriptor_numpy(visual)
+        else:
+            raise ValueError(f"unsupported visual encoder: {self.config.visual_encoder}")
         visual = (
             visual_mask * visual
             + (np_float(1.0) - visual_mask) * self.weights["missing_visual"][None]
         )
         text_mask = (token_ids != 0).any(axis=1, keepdims=True).astype(np.float32)
-        present = np.broadcast_to(
-            self.weights["present_text"],
-            (len(token_ids), TEXT_DESCRIPTOR_DIM),
-        )
         missing = np.broadcast_to(
             self.weights["missing_text"],
             (len(token_ids), TEXT_DESCRIPTOR_DIM),
         )
-        text = text_mask * present + (np_float(1.0) - text_mask) * missing
+        if self.config.text_encoder == "learned_token_lookup":
+            token_vectors = self.weights["token_embedding.weight"][token_ids]
+            token_mask = (token_ids != 0).astype(np.float32)[..., None]
+            pooled = (token_vectors * token_mask).sum(axis=1)
+            pooled /= np.maximum(token_mask.sum(axis=1), 1.0)
+            text = self._linear(pooled, "text_projection")
+        elif self.config.text_encoder == "direct_text_evidence":
+            present = np.broadcast_to(
+                self.weights["present_text"],
+                (len(token_ids), TEXT_DESCRIPTOR_DIM),
+            )
+            text = present
+        else:
+            raise ValueError(f"unsupported text encoder: {self.config.text_encoder}")
+        text = text_mask * text + (np_float(1.0) - text_mask) * missing
         xml = self._layer_norm(numeric, "xml_projection.0")
         xml = _gelu(self._linear(xml, "xml_projection.1"))
         xml = self._linear(xml, "xml_projection.3")
         raw = np.concatenate((text, visual, xml), axis=-1)
-        fused = self._layer_norm(raw, "descriptor_fusion.0")
-        fused = _gelu(self._linear(fused, "descriptor_fusion.1"))
-        fused = self._linear(fused, "descriptor_fusion.4")
-        descriptor = self._layer_norm(raw + fused, "descriptor_norm")
-        states = self._linear(descriptor, "descriptor_projection", bias=False)
-        states = self._layer_norm(states, "input_norm")
+        modalities = np.stack(
+            (
+                self._linear(text, "text_to_hidden"),
+                self._linear(visual, "visual_to_hidden"),
+                self._linear(xml, "xml_to_hidden"),
+            ),
+            axis=1,
+        ) + self.weights["modality_type"][None]
+        available = np.concatenate(
+            (text_mask, visual_mask.astype(np.float32), np.ones_like(text_mask)),
+            axis=1,
+        )
+        modality_logits = self._layer_norm(modalities, "modality_score.0")
+        modality_logits = self._linear(
+            modality_logits, "modality_score.1", bias=False
+        ).squeeze(-1)
+        modality_logits = np.where(available > 0.0, modality_logits, np_float(-1e4))
+        modality_weights = _softmax(modality_logits / np_float(0.25), axis=1)
+        fused = (modality_weights[..., None] * modalities).sum(
+            axis=1, dtype=np.float32
+        )
+        states = self._layer_norm(fused, "input_norm")
+        feed_forward = _gelu(
+            self._linear(states, "input_feed_forward.0")
+        )
+        feed_forward = self._linear(feed_forward, "input_feed_forward.3")
+        states = self._layer_norm(
+            states + feed_forward, "input_output_norm"
+        )
         return states, raw
 
-    def _unary(self, source: Any, target: Any) -> Any:
+    def _affinity(self, source: Any, target: Any) -> tuple[Any, Any, Any]:
         np = _require_numpy()
         source_norm = source / np.maximum(
             np.linalg.norm(source, axis=-1, keepdims=True),
@@ -385,110 +435,120 @@ class NumpyGeometricAlignmentMatcher:
             np.linalg.norm(target, axis=-1, keepdims=True),
             np_float(1e-12),
         )
-        cosine = source_norm @ target_norm.T
-        pair = np.concatenate(
-            (
-                np.abs(source[:, None, :] - target[None, :, :]),
-                source[:, None, :] * target[None, :, :],
-            ),
+        source_matchability = self._linear(
+            self._layer_norm(source, "matchability_head.0"),
+            "matchability_head.1",
+        ).squeeze(-1)
+        target_matchability = self._linear(
+            self._layer_norm(target, "matchability_head.0"),
+            "matchability_head.1",
+        ).squeeze(-1)
+        scale = min(100.0, math.exp(float(self.weights["logit_scale"])))
+        affinity = (
+            np_float(scale) * (source_norm @ target_norm.T)
+            + np_float(0.5)
+            * (source_matchability[:, None] + target_matchability[None, :])
+        )
+        return affinity, source_matchability, target_matchability
+
+    def _local_graph_layer(
+        self,
+        states: Any,
+        relation_bases: Any,
+        *,
+        prefix: str,
+    ) -> Any:
+        np = _require_numpy()
+        compatibility = _softmax(
+            np_float(5.0) * self.weights["relation_compatibility"],
             axis=-1,
         )
-        residual = self._layer_norm(pair, "unary_head.residual.0")
-        residual = _gelu(self._linear(residual, "unary_head.residual.1"))
-        residual = self._linear(residual, "unary_head.residual.4").squeeze(-1)
-        scale = min(100.0, math.exp(float(self.weights["unary_head.logit_scale"])))
-        return np_float(scale) * cosine + residual
+        mixed_bases = np.einsum(
+            "rq,qij->rij", compatibility, relation_bases, optimize=True
+        )
+        values = self._linear(states, f"{prefix}.value", bias=False)
+        relation_messages = np.einsum(
+            "rij,jd->rid", mixed_bases, values, optimize=True
+        )
+        messages = relation_messages.transpose(1, 0, 2).reshape(
+            len(states), -1
+        )
+        projected = self._linear(
+            messages, f"{prefix}.message_projection", bias=False
+        )
+        states = self._layer_norm(
+            states + projected, f"{prefix}.message_norm"
+        )
+        feed_forward = _gelu(
+            self._linear(states, f"{prefix}.feed_forward.0")
+        )
+        feed_forward = self._linear(
+            feed_forward, f"{prefix}.feed_forward.3"
+        )
+        return self._layer_norm(
+            states + feed_forward, f"{prefix}.output_norm"
+        )
 
-    def _association_pair_states(
+    def _cross_context(
+        self,
+        query_states: Any,
+        key_states: Any,
+        *,
+        prefix: str,
+    ) -> Any:
+        query = self._linear(query_states, f"{prefix}.query", bias=False)
+        key = self._linear(key_states, f"{prefix}.key", bias=False)
+        scores = (query @ key.T) / np_float(math.sqrt(self.config.hidden_dim))
+        values = self._linear(key_states, f"{prefix}.value", bias=False)
+        return _softmax(scores, axis=-1) @ values
+
+    def _cross_update(self, states: Any, context: Any, *, prefix: str) -> Any:
+        evidence = _require_numpy().concatenate(
+            (states, context, abs(states - context), states * context), axis=-1
+        )
+        update = self._layer_norm(evidence, f"{prefix}.cross_update.0")
+        update = _gelu(self._linear(update, f"{prefix}.cross_update.1"))
+        update = self._linear(update, f"{prefix}.cross_update.4")
+        return self._layer_norm(states + update, f"{prefix}.cross_norm")
+
+    def _contextual_layer(
         self,
         source: Any,
         target: Any,
-        source_text_available: Any,
-        target_text_available: Any,
-        source_visual_available: Any,
-        target_visual_available: Any,
-        anchor_weights: Any,
-    ) -> Any:
-        np = _require_numpy()
-        splits = (TEXT_DESCRIPTOR_DIM, TEXT_DESCRIPTOR_DIM + VISUAL_DESCRIPTOR_DIM)
-        source_text, source_visual, source_xml = np.split(source, splits, axis=-1)
-        target_text, target_visual, target_xml = np.split(target, splits, axis=-1)
-        text, text_both, text_one = _symmetric_pair_features(
-            source_text,
-            target_text,
-            source_text_available,
-            target_text_available,
-        )
-        visual, visual_both, visual_one = _symmetric_pair_features(
-            source_visual,
-            target_visual,
-            source_visual_available,
-            target_visual_available,
-        )
-        xml, _, _ = _symmetric_pair_features(
-            source_xml,
-            target_xml,
-            np.ones_like(source_text_available),
-            np.ones_like(target_text_available),
-        )
-        availability = np.stack(
-            (text_both, text_one, visual_both, visual_one, anchor_weights),
-            axis=-1,
-        )
-        pair = np.concatenate((text, visual, xml, availability), axis=-1)
-        pair = self._layer_norm(pair, "association_pair_encoder.0")
-        pair = _gelu(self._linear(pair, "association_pair_encoder.1"))
-        return self._linear(pair, "association_pair_encoder.4")
-
-    def _association_layer(
-        self,
-        pair_states: Any,
-        anchor_weights: Any,
         source_bases: Any,
         target_bases: Any,
-        compatibility: Any,
         layer_index: int,
-    ) -> Any:
-        np = _require_numpy()
+    ) -> tuple[Any, Any]:
         prefix = f"association_layers.{layer_index}"
-        anchored = pair_states * anchor_weights[..., None]
-        source_messages = np.einsum(
-            "rik,kjd->rijd",
-            source_bases,
-            anchored,
-            optimize=True,
+        source_local = self._local_graph_layer(
+            source, source_bases, prefix=f"{prefix}.local"
         )
-        typed = np.einsum(
-            "rq,rijd->qijd",
-            compatibility,
-            source_messages,
-            optimize=True,
+        target_local = self._local_graph_layer(
+            target, target_bases, prefix=f"{prefix}.local"
         )
-        messages = np.einsum(
-            "qjl,qild->ijd",
-            target_bases,
-            typed,
-            optimize=True,
+        source_context = self._cross_context(
+            source_local, target_local, prefix=prefix
         )
-        projected = self._linear(
-            messages,
-            f"{prefix}.message_projection",
+        target_context = self._cross_context(
+            target_local, source_local, prefix=prefix
+        )
+        return (
+            self._cross_update(source_local, source_context, prefix=prefix),
+            self._cross_update(target_local, target_context, prefix=prefix),
+        )
+
+    def _page_embedding(self, states: Any) -> Any:
+        np = _require_numpy()
+        logits = self._linear(
+            self._layer_norm(states, "page_attention.0"),
+            "page_attention.1",
             bias=False,
+        ).squeeze(-1)
+        embedding = (_softmax(logits, axis=0)[:, None] * states).sum(
+            axis=0, dtype=np.float32
         )
-        pair_states = self._layer_norm(
-            pair_states + projected,
-            f"{prefix}.message_norm",
-        )
-        feed_forward = _gelu(
-            self._linear(pair_states, f"{prefix}.feed_forward.0")
-        )
-        feed_forward = self._linear(
-            feed_forward,
-            f"{prefix}.feed_forward.3",
-        )
-        return self._layer_norm(
-            pair_states + feed_forward,
-            f"{prefix}.output_norm",
+        return embedding / np.maximum(
+            np.linalg.norm(embedding), np_float(1e-12)
         )
 
     def _conv2d(self, values: Any, prefix: str, *, stride: int) -> Any:
@@ -536,7 +596,7 @@ class NumpyGeometricAlignmentMatcher:
         )
 
 
-def save_numpy_geometric_v9_checkpoint(
+def save_numpy_unified_association_checkpoint(
     path: str | Path,
     state_dict: Mapping[str, Any],
     *,
@@ -548,7 +608,7 @@ def save_numpy_geometric_v9_checkpoint(
         raise ValueError("only geometric-alignment v9 can use this exporter")
     np = _require_numpy()
     arrays: dict[str, Any] = {
-        "__schema_version__": _encode(NUMPY_GEOMETRIC_V9_SCHEMA),
+        "__schema_version__": _encode(NUMPY_UNIFIED_ASSOCIATION_SCHEMA),
         "__config_json__": _encode(
             json.dumps(asdict(config), sort_keys=True, separators=(",", ":"))
         ),
@@ -597,6 +657,7 @@ def _typed_relation_bases(relations: Any, numeric: Any) -> Any:
     local = np.clip(relations[..., 17], 0.0, 1.0) * non_identity
     same_row = np.clip(relations[..., 6], 0.0, 1.0) * local
     same_column = np.clip(relations[..., 7], 0.0, 1.0) * local
+    kinship_proximity = (np_float(1.0) - np.clip(relations[..., 16], 0.0, 1.0)) * local
     delta_x = relations[..., 9]
     delta_y = relations[..., 10]
     actionable = (numeric[:, :3].sum(axis=1) > 0.0) & (numeric[:, 3] > 0.0)
@@ -627,6 +688,7 @@ def _typed_relation_bases(relations: Any, numeric: Any) -> Any:
             (delta_y < 0.0).astype(np.float32) * same_column,
             (delta_y > 0.0).astype(np.float32) * same_column,
             local,
+            kinship_proximity,
             control_to_context,
             context_to_control,
         ),
@@ -669,177 +731,6 @@ def _partial_assignment(
     assignment[np.ix_(source_indices, target_indices)] = _mutual_log_assignment(selected)
     return assignment
 
-
-def _relation_vote(
-    soft_assignment: Any,
-    source_bases: Any,
-    target_bases: Any,
-    relation_compatibility: Any,
-) -> Any:
-    np = _require_numpy()
-    compatibility = np_float(0.5) * (
-        relation_compatibility + relation_compatibility.T
-    )
-    source_messages = np.einsum(
-        "rik,kl->ril",
-        source_bases,
-        soft_assignment,
-        optimize=True,
-    )
-    typed = np.einsum(
-        "rq,ril->qil",
-        compatibility,
-        source_messages,
-        optimize=True,
-    )
-    vote = np.einsum("qil,qjl->ij", typed, target_bases, optimize=True)
-    centered = vote - vote.mean(dtype=np.float32)
-    rms = np.sqrt(np.maximum((centered**2).mean(dtype=np.float32), np.finfo(np.float32).eps))
-    return centered / rms
-
-
-def _semantic_anchor_relation_vote(
-    evidence: Any,
-    source_bases: Any,
-    target_bases: Any,
-    compatibility: Any,
-) -> Any:
-    np = _require_numpy()
-    semantic = evidence[..., : len(DIRECT_SEMANTIC_EVIDENCE_NAMES)].sum(axis=-1)
-    source_best_targets = semantic.argmax(axis=1)
-    source_best_scores = semantic[np.arange(semantic.shape[0]), source_best_targets]
-    target_best_sources = semantic.argmax(axis=0)
-    target_best_scores = semantic[target_best_sources, np.arange(semantic.shape[1])]
-    source_margins = source_best_scores.copy()
-    target_margins = target_best_scores.copy()
-    if semantic.shape[1] > 1:
-        source_top = np.partition(semantic, -2, axis=1)[:, -2:]
-        source_margins = source_top.max(axis=1) - source_top.min(axis=1)
-    if semantic.shape[0] > 1:
-        target_top = np.partition(semantic, -2, axis=0)[-2:]
-        target_margins = target_top.max(axis=0) - target_top.min(axis=0)
-    source_indices = np.arange(semantic.shape[0])
-    retained = (
-        (target_best_sources[source_best_targets] == source_indices)
-        & (source_best_scores >= 1.0)
-        & (source_margins >= 0.5)
-        & (target_margins[source_best_targets] >= 0.5)
-    )
-    source_anchors = source_indices[retained]
-    if not len(source_anchors):
-        return np.zeros_like(semantic, dtype=np.float32)
-    target_anchors = source_best_targets[source_anchors]
-    source_binary = (source_bases > 0).astype(np.float32)
-    target_binary = (target_bases > 0).astype(np.float32)
-    source_out = source_binary[:, :, source_anchors]
-    target_out = target_binary[:, :, target_anchors]
-    source_in = source_binary[:, source_anchors, :].transpose(0, 2, 1)
-    target_in = target_binary[:, target_anchors, :].transpose(0, 2, 1)
-    vote = np.einsum(
-        "ria,rq,qja->ij", source_out, compatibility, target_out, optimize=True
-    ) + np.einsum(
-        "ria,rq,qja->ij", source_in, compatibility, target_in, optimize=True
-    )
-    support = (
-        np.einsum("ria,qja->ija", source_out, target_out, optimize=True) > 0
-    ).sum(axis=-1) + (
-        np.einsum("ria,qja->ija", source_in, target_in, optimize=True) > 0
-    ).sum(axis=-1)
-    return vote / np.maximum(support.astype(np.float32), np_float(1.0))
-
-
-def _local_semantic_context_score(
-    evidence: Any,
-    source_bases: Any,
-    target_bases: Any,
-    source_numeric: Any,
-    target_numeric: Any,
-) -> Any:
-    np = _require_numpy()
-    semantic = evidence[..., : len(DIRECT_SEMANTIC_EVIDENCE_NAMES)].sum(axis=-1)
-    hierarchy = [TYPED_RELATION_NAMES.index(name) for name in (
-        "parent", "child", "sibling", "ancestor", "descendant"
-    )]
-    source_actionable = (
-        (source_numeric[:, :3].sum(axis=1) > 0.0) & (source_numeric[:, 3] > 0.0)
-    )
-    target_actionable = (
-        (target_numeric[:, :3].sum(axis=1) > 0.0) & (target_numeric[:, 3] > 0.0)
-    )
-    source_links = (source_bases[hierarchy] > 0).any(axis=0)
-    target_links = (target_bases[hierarchy] > 0).any(axis=0)
-    source_links = (source_links | source_links.T) & (~source_actionable)[None, :]
-    target_links = (target_links | target_links.T) & (~target_actionable)[None, :]
-    source_to_target = np.where(
-        target_links[None, :, :], semantic[:, None, :], np_float(0.0)
-    ).max(axis=2)
-    source_context_to_target = np.where(
-        source_links[:, :, None], semantic[None, :, :], np_float(0.0)
-    ).max(axis=1)
-    context_to_context = np.where(
-        target_links[None, :, :],
-        source_context_to_target[:, None, :],
-        np_float(0.0),
-    ).max(axis=2)
-    return np.maximum(np.maximum(source_to_target, source_context_to_target), context_to_context)
-
-
-def _relational_consensus_features(
-    assignment: Any,
-    source_bases: Any,
-    target_bases: Any,
-) -> Any:
-    np = _require_numpy()
-    anchors = np.exp(assignment)
-    source = source_bases.copy()
-    target = target_bases.copy()
-    source[0] = 0.0
-    target[0] = 0.0
-    outgoing = np.einsum(
-        "ria,ab,qjb->ijrq", source, anchors, target, optimize=True
-    )
-    incoming = np.einsum(
-        "rai,ab,qbj->ijrq", source, anchors, target, optimize=True
-    )
-    return (outgoing + incoming).reshape(
-        assignment.shape[0], assignment.shape[1], len(TYPED_RELATION_NAMES) ** 2
-    )
-
-
-def _relative_geometry_consensus_features(
-    assignment: Any,
-    source_relations: Any,
-    target_relations: Any,
-) -> Any:
-    np = _require_numpy()
-    indices = list(ALIGNMENT_RELATION_FEATURE_INDICES)
-    source = source_relations[..., indices].copy()
-    target = target_relations[..., indices].copy()
-    source[np.arange(len(source)), np.arange(len(source))] = 0.0
-    target[np.arange(len(target)), np.arange(len(target))] = 0.0
-    anchors = np.exp(assignment)
-    outgoing = np.einsum("iak,ab,jbk->ijk", source, anchors, target, optimize=True)
-    incoming = np.einsum("aik,ab,bjk->ijk", source, anchors, target, optimize=True)
-    return outgoing + incoming
-
-
-def _standardize(values: Any) -> Any:
-    np = _require_numpy()
-    centered = values - values.mean(axis=(0, 1), keepdims=True, dtype=np.float32)
-    rms = np.sqrt(
-        np.maximum(
-            (centered**2).mean(axis=(0, 1), keepdims=True, dtype=np.float32),
-            np.finfo(np.float32).eps,
-        )
-    )
-    return centered / rms
-
-
-def _softplus(value: Any) -> Any:
-    np = _require_numpy()
-    return np.logaddexp(np_float(0.0), value)
-
-
 def _visual_inputs(
     graph: UIGraph,
     *,
@@ -852,42 +743,46 @@ def _visual_inputs(
         dtype=np.float32,
     )
     mask = np.zeros((len(graph.nodes), 1), dtype=np.float32)
-    image = _graph_rgb(graph)
+    image = _graph_rgb(graph, canvas_size=canvas_size)
     if image is None:
         return patches, mask
-    if canvas_size > 0 and max(image.shape[:2]) > canvas_size:
-        scale = float(canvas_size) / float(max(image.shape[:2]))
-        image = _resize_rgb_shape(
-            image,
-            height=max(1, round(image.shape[0] * scale)),
-            width=max(1, round(image.shape[1] * scale)),
-        )
-    image_height, image_width = image.shape[:2]
-    graph_width = float(graph.width or image_width)
-    graph_height = float(graph.height or image_height)
-    if graph_width <= 0.0 or graph_height <= 0.0:
-        return patches, mask
+    screenshot_path = str(graph.metadata.get("screenshot_path") or "")
+    screenshot_signature = None
+    if screenshot_path and not isinstance(graph.metadata.get("visual_rgb"), Mapping):
+        try:
+            stat = Path(screenshot_path).stat()
+            screenshot_signature = (int(stat.st_mtime_ns), int(stat.st_size))
+        except OSError:
+            screenshot_signature = None
+    visual_height, visual_width = image.shape[:2]
     for index, node in enumerate(graph.nodes):
-        if bool(node.metadata.get("visual_disabled")) or node.bbox is None:
+        if bool(node.metadata.get("visual_disabled")):
             continue
-        left, top, right, bottom = node.bbox
-        x1 = int(math.floor(left / graph_width * image_width))
-        y1 = int(math.floor(top / graph_height * image_height))
-        x2 = int(math.ceil(right / graph_width * image_width))
-        y2 = int(math.ceil(bottom / graph_height * image_height))
-        x1 = min(max(x1, 0), image_width)
-        x2 = min(max(x2, 0), image_width)
-        y1 = min(max(y1, 0), image_height)
-        y2 = min(max(y2, 0), image_height)
-        if x2 <= x1 or y2 <= y1:
+        bbox = visual_bbox_fraction(
+            graph,
+            node,
+            image_width=visual_width,
+            image_height=visual_height,
+        )
+        if bbox is None:
             continue
-        crop = image[y1:y2, x1:x2]
-        patches[index] = _resize_rgb(crop, patch_size).transpose(2, 0, 1)
+        if screenshot_signature is not None:
+            patch = _cached_screenshot_patch(
+                screenshot_path,
+                int(canvas_size),
+                screenshot_signature[0],
+                screenshot_signature[1],
+                tuple(float(value) for value in bbox),
+                int(patch_size),
+            )
+        else:
+            patch = _sample_rgb_bbox(image, bbox=bbox, size=patch_size)
+        patches[index] = patch.transpose(2, 0, 1)
         mask[index, 0] = np_float(1.0)
     return patches, mask
 
 
-def _graph_rgb(graph: UIGraph) -> Any | None:
+def _graph_rgb(graph: UIGraph, *, canvas_size: int) -> Any | None:
     np = _require_numpy()
     payload = graph.metadata.get("visual_rgb")
     if isinstance(payload, Mapping):
@@ -900,35 +795,93 @@ def _graph_rgb(graph: UIGraph) -> Any | None:
             image = np.frombuffer(raw, dtype=np.uint8)
             if image.size != width * height * 3:
                 return None
-            return image.reshape(height, width, 3)
+            image = image.reshape(height, width, 3)
         except (KeyError, TypeError, ValueError, zlib.error):
             return None
-    screenshot_path = str(graph.metadata.get("screenshot_path") or "")
-    if not screenshot_path:
+    else:
+        screenshot_path = str(graph.metadata.get("screenshot_path") or "")
+        if not screenshot_path:
+            return None
+        try:
+            stat = Path(screenshot_path).stat()
+            return _cached_screenshot_rgb(
+                screenshot_path,
+                int(canvas_size),
+                int(stat.st_mtime_ns),
+                int(stat.st_size),
+            )
+        except (OSError, ValueError):
+            return None
+    if canvas_size <= 0 or max(image.shape[:2]) <= canvas_size:
+        return image
+    try:
+        from PIL import Image
+    except ImportError:
         return None
+    scale = canvas_size / max(image.shape[:2])
+    resized = Image.fromarray(image).resize(
+        (
+            max(1, round(image.shape[1] * scale)),
+            max(1, round(image.shape[0] * scale)),
+        ),
+        resample=Image.Resampling.BILINEAR,
+    )
+    return np.array(resized, dtype=np.uint8, copy=True)
+
+
+@lru_cache(maxsize=32)
+def _cached_screenshot_rgb(
+    screenshot_path: str,
+    canvas_size: int,
+    modified_ns: int,
+    file_size: int,
+) -> Any:
+    """Decode immutable observation screenshots once per runtime process."""
+
+    del modified_ns, file_size
+    np = _require_numpy()
     try:
         from PIL import Image
 
-        with Image.open(screenshot_path) as image:
-            return np.asarray(image.convert("RGB"), dtype=np.uint8)
+        with Image.open(screenshot_path) as loaded:
+            image = np.array(loaded.convert("RGB"), dtype=np.uint8, copy=True)
+        if canvas_size > 0 and max(image.shape[:2]) > canvas_size:
+            scale = canvas_size / max(image.shape[:2])
+            resized = Image.fromarray(image).resize(
+                (
+                    max(1, round(image.shape[1] * scale)),
+                    max(1, round(image.shape[0] * scale)),
+                ),
+                resample=Image.Resampling.BILINEAR,
+            )
+            image = np.array(resized, dtype=np.uint8, copy=True)
+        image.setflags(write=False)
+        return image
     except (ImportError, OSError, ValueError):
         return None
 
 
-def _resize_rgb(image: Any, size: int) -> Any:
-    return _resize_rgb_shape(image, height=size, width=size).astype(
-        _require_numpy().float32,
-        copy=False,
-    ) / np_float(255.0)
-
-
-def _resize_rgb_shape(image: Any, *, height: int, width: int) -> Any:
+def _sample_rgb_bbox(
+    image: Any,
+    *,
+    bbox: tuple[float, float, float, float],
+    size: int,
+) -> Any:
     np = _require_numpy()
     source_height, source_width = image.shape[:2]
-    if source_height == height and source_width == width:
-        return image.copy()
-    ys = np.linspace(0.0, max(0, source_height - 1), height, dtype=np.float32)
-    xs = np.linspace(0.0, max(0, source_width - 1), width, dtype=np.float32)
+    left, top, right, bottom = bbox
+    ys = np.linspace(
+        top * max(0, source_height - 1),
+        bottom * max(0, source_height - 1),
+        size,
+        dtype=np.float32,
+    )
+    xs = np.linspace(
+        left * max(0, source_width - 1),
+        right * max(0, source_width - 1),
+        size,
+        dtype=np.float32,
+    )
     y0 = np.floor(ys).astype(np.int64)
     x0 = np.floor(xs).astype(np.int64)
     y1 = np.minimum(y0 + 1, source_height - 1)
@@ -943,7 +896,30 @@ def _resize_rgb_shape(image: Any, *, height: int, width: int) -> Any:
         image[y1[:, None], x0[None, :]].astype(np.float32) * (np_float(1.0) - wx)
         + image[y1[:, None], x1[None, :]].astype(np.float32) * wx
     )
-    return top * (np_float(1.0) - wy) + bottom * wy
+    sampled = top * (np_float(1.0) - wy) + bottom * wy
+    return sampled.astype(np.float32, copy=False) / np_float(255.0)
+
+
+@lru_cache(maxsize=4096)
+def _cached_screenshot_patch(
+    screenshot_path: str,
+    canvas_size: int,
+    modified_ns: int,
+    file_size: int,
+    bbox: tuple[float, float, float, float],
+    size: int,
+) -> Any:
+    image = _cached_screenshot_rgb(
+        screenshot_path,
+        canvas_size,
+        modified_ns,
+        file_size,
+    )
+    if image is None:
+        return _require_numpy().zeros((size, size, 3), dtype=_require_numpy().float32)
+    patch = _sample_rgb_bbox(image, bbox=bbox, size=size)
+    patch.setflags(write=False)
+    return patch
 
 
 def _gelu(values: Any) -> Any:

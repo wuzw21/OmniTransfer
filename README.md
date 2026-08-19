@@ -1,12 +1,18 @@
 # OmniTransfer
 
 OmniTransfer maps one recorded source UI element to a complete ranked set of
-target UI-element candidates on another device. It does not choose an action,
-accept or reject a candidate, execute on a device, or own fallback policy.
+target UI-element candidates on another device. The mapping is one unified
+four-stage pipeline: multimodal UI encoding, relation-aware association,
+bidirectional candidate decoding, and relative action projection. It does not
+choose an action, accept or reject a candidate, execute on a device, or own
+fallback policy.
 
 ```text
 source XML + source node/point + target XML
-    -> ranked target nodes/points + evidence
+    -> Unified UIGraph
+    -> relation-aware candidate graph
+    -> bidirectional ranked target nodes
+    -> projected target points + evidence
 ```
 
 ## Public Runtime
@@ -28,21 +34,29 @@ result = rank_action_candidates(
 Callers may provide `source_element_id` instead of `source_point`. Every result
 contains the full target ranking, projected target coordinates, candidate
 bounds, pair confidence, rank probability, margin, release id, feature-schema
-hash, and checkpoint hash. An empty ranking is a transfer failure; OmniTransfer
-never replays the source coordinate on the target device.
+hash, checkpoint hash, and the four-stage transfer contract. An empty ranking is
+a transfer failure; OmniTransfer never replays the source coordinate on the
+target device.
+
+The canonical architecture and stage owners are documented in
+[`docs/omnitransfer_unified_pipeline.md`](docs/omnitransfer_unified_pipeline.md).
+The normative next-generation matcher design and its required acceptance gates
+are documented in
+[`docs/interaction_graph_matching_spec.md`](docs/interaction_graph_matching_spec.md).
+Canonical domain terminology is defined in [`CONTEXT.md`](CONTEXT.md).
 
 ## Fixed Runtime Release
 
 ```text
-release id                 omnitransfer-direct-text-alignment-v9.3.1-mobile
-mapping mode               omnitransfer_direct_text_alignment_v9
-architecture               direct text + v9 geometric + Spatial-XML alignment
+release id                 omnitransfer-unified-association-v1-mobile
+mapping mode               omnitransfer_unified_association_v1
+architecture               multimodal node encoder + unified multi-hop local relation graph + one association score
 training data              765 ASE 2023 reviewed-gold page pairs
 development data           104 disjoint ASE 2023 reviewed-gold page pairs
 parameters                 177,372 total; 7,978 alignment; 0 token-lookup
-feature schema             omnitransfer-direct-text-spatial-xml-v9
-feature schema SHA256      fc1706baeff6d8b0e43f5da9b03a62a51086472764d440ed7b4c3a41f71c52f8
-NumPy checkpoint SHA256    b8a6735bd97a7163ad186ec4c869eebbb05634522472035bd9c3b9bc323c5e9e
+feature schema             omnitransfer-unified-association-v1
+feature schema SHA256      a6d0cdbaaf441cff18f7bceba125b34f966202ba4a4b48b36820b6dca251f440
+NumPy checkpoint SHA256    pending unified-association training/export
 ```
 
 The mobile runtime bundles and verifies the NumPy checkpoint. Runtime selection
@@ -54,9 +68,10 @@ families are not runtime fallbacks.
 ```text
 src/omnitransfer/
   runtime.py                 public candidate-ranking boundary
-  numpy_v9_matcher.py        frozen NumPy inference
-  learned_matcher.py         geometric-v9 features and checkpoint I/O
-  geometric_matcher.py       single trainable model
+  ios_adapter.py             canonical iOS XML/screenshot normalization
+  numpy_v9_matcher.py        frozen NumPy unified-association inference
+  learned_matcher.py         node/relation features and checkpoint I/O
+  geometric_matcher.py       single trainable unified-association model
   page_embedding.py          frozen page embedding
   ui_graph.py                UI graph contract
   mapping_dataset.py         correspondence dataset contract
@@ -75,6 +90,15 @@ The supported script inventory is maintained in
 [`scripts/ENTRYPOINTS.md`](scripts/ENTRYPOINTS.md). A script absent from that
 file is internal, pending migration, or unsupported; do not build a second
 entrypoint for the same function.
+
+## iOS Input Boundary
+
+`omnitransfer.ios_adapter` is the single iOS normalization seam. It preserves
+the platform-neutral XML graph while converting mixed capture coordinates into
+one contract: graph/XML bounds are logical XML pixels, while visual bounds are
+screenshot pixels. Pair-pool construction and the unified review materializer
+reuse this adapter; later matching code consumes the canonical graph and does
+not perform a second iOS-specific correction.
 
 ## Canonical Offline Workflow
 
@@ -116,6 +140,20 @@ PYTHONPATH=src:. python scripts/evaluate_geometric_v9_matcher.py \
   --checkpoint /absolute/model.pt \
   --output /absolute/report.json
 ```
+
+Page-level configuration embeddings use the same frozen matcher and learned
+page-attention readout as node mapping:
+
+```bash
+PYTHONPATH=src python scripts/embed_page.py \
+  --input /absolute/page.xml \
+  --screenshot /absolute/page.png \
+  --output /absolute/page-embedding.json
+```
+
+The structured result contains a normalized 64-dimensional vector, node count,
+backend, architecture, and checkpoint hash. `--compare-input` computes cosine
+similarity against another page while preserving both vectors separately.
 
 ## Data Boundary
 

@@ -1,25 +1,21 @@
 #!/usr/bin/env python3
-"""Export one geometric-v9 training checkpoint as the NumPy runtime release."""
+"""Export one unified-association checkpoint as the NumPy runtime release."""
 
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, replace
+from dataclasses import asdict
 import json
 from pathlib import Path
 
 from omnitransfer.experiment_logging import file_sha256
 from omnitransfer.learned_matcher import (
-    DIRECT_TEXT_EVIDENCE_ENCODER,
-    LEARNED_TOKEN_LOOKUP_ENCODER,
     OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE,
     GeometricMatcher,
-    build_geometric_v9_matcher,
-    initialize_direct_text_from_lookup,
     parameter_count,
     save_matcher_checkpoint,
 )
-from omnitransfer.numpy_v9_matcher import save_numpy_geometric_v9_checkpoint
+from omnitransfer.numpy_v9_matcher import save_numpy_unified_association_checkpoint
 
 
 def main() -> None:
@@ -29,7 +25,7 @@ def main() -> None:
     parser.add_argument(
         "--torch-output",
         type=Path,
-        help="Optional direct-text Torch checkpoint retained for training audit.",
+        help="Optional exact Torch checkpoint retained for runtime audit.",
     )
     args = parser.parse_args()
 
@@ -44,19 +40,11 @@ def main() -> None:
     if source.config.architecture != OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE:
         raise SystemExit("input must be a geometric-v9 checkpoint")
 
-    if source.config.text_encoder == LEARNED_TOKEN_LOOKUP_ENCODER:
-        target_config = replace(
-            source.config,
-            text_encoder=DIRECT_TEXT_EVIDENCE_ENCODER,
-        )
-        target_model = build_geometric_v9_matcher(target_config).eval()
-        transferred = initialize_direct_text_from_lookup(target_model, source.model)
-    elif source.config.text_encoder == DIRECT_TEXT_EVIDENCE_ENCODER:
-        target_config = source.config
-        target_model = source.model.eval()
-        transferred = tuple(target_model.state_dict())
-    else:
-        raise SystemExit("unsupported geometric-v9 text encoder")
+    # Runtime uses the exact learned encoder.  Removing the token table would
+    # discard semantic evidence now that candidate-pair text shortcuts are gone.
+    target_config = source.config
+    target_model = source.model.eval()
+    transferred = tuple(target_model.state_dict())
 
     source_parameters = parameter_count(source.model)
     target_parameters = parameter_count(target_model)
@@ -81,7 +69,7 @@ def main() -> None:
                 "runtime_export": migration,
             },
         )
-    save_numpy_geometric_v9_checkpoint(
+    save_numpy_unified_association_checkpoint(
         args.output,
         target_model.state_dict(),
         config=target_config,

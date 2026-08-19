@@ -6,8 +6,11 @@ from omnitransfer.learned_matcher import (
     ALL_NODE_CANDIDATE_POLICY,
     DIRECT_PAIR_EVIDENCE_NAMES,
     DIRECT_TEXT_EVIDENCE_ENCODER,
+    LEGACY_GLOBAL_POOL_VISUAL_ENCODER,
     OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE,
     RELATION_FEATURE_DIM,
+    SPATIAL_CNN_VISUAL_ENCODER,
+    TYPED_RELATION_NAMES,
     XML_NODE_FEATURE_DIM,
     MatcherConfig,
     GeometricMatcher,
@@ -15,9 +18,10 @@ from omnitransfer.learned_matcher import (
     direct_pair_evidence_features,
     encode_graph,
     initialize_direct_text_from_lookup,
+    initialize_nonvisual_from_model,
     matcher_inputs,
     save_matcher_checkpoint,
-    spatial_xml_alignment_choice,
+    typed_relation_bases,
 )
 from omnitransfer.ui_graph import graph_from_record
 
@@ -100,21 +104,18 @@ def test_direct_pair_evidence_has_one_fixed_schema() -> None:
     assert evidence[0] == 1.0
 
 
-def test_spatial_xml_alignment_can_resolve_semantic_ambiguity() -> None:
-    source = _graph("source", first_x=10, second_x=80)
-    target = _graph("target", first_x=80, second_x=10)
-    source_node = source.nodes[2]
-    target_nodes = (target.nodes[2], target.nodes[3])
+def test_local_relation_bases_consume_kinship_distance() -> None:
+    torch = pytest.importorskip("torch", exc_type=ImportError)
+    encoded = encode_graph(_graph("source"))
+    relations = torch.as_tensor(encoded.relation_features, dtype=torch.float32)
+    numeric = torch.as_tensor(encoded.numeric_features, dtype=torch.float32)
 
-    choice = spatial_xml_alignment_choice(
-        (10.0, 8.5),
-        source_node=source_node,
-        target_nodes=target_nodes,
-        source_graph=source,
-        target_graph=target,
-    )
+    bases = typed_relation_bases(relations, numeric)
+    kinship_index = TYPED_RELATION_NAMES.index("kinship_proximity")
 
-    assert choice == 1
+    assert float(bases[kinship_index, 0, 0]) == 0.0
+    assert float(bases[kinship_index, 1, 2]) > 0.0
+    assert float(bases[kinship_index, 2, 3]) > 0.0
 
 
 def test_geometric_v9_checkpoint_round_trips(tmp_path) -> None:
@@ -124,7 +125,7 @@ def test_geometric_v9_checkpoint_round_trips(tmp_path) -> None:
         relation_hidden_dim=16,
         association_dim=24,
         num_heads=4,
-        num_layers=2,
+        association_layers=2,
         dropout=0.0,
     )
     model = build_geometric_v9_matcher(config).eval()
@@ -142,6 +143,126 @@ def test_geometric_v9_checkpoint_round_trips(tmp_path) -> None:
     assert restored.config == config
 
 
+def test_every_refinement_layer_updates_nodes_and_emits_an_assignment() -> None:
+    torch = pytest.importorskip("torch", exc_type=ImportError)
+    config = MatcherConfig(
+        hidden_dim=32,
+        relation_hidden_dim=16,
+        association_dim=24,
+        num_heads=4,
+        association_layers=3,
+        dropout=0.0,
+    )
+    model = build_geometric_v9_matcher(config).eval()
+    source = _graph("source")
+    target = _graph("target", first_x=15, second_x=75)
+
+    with torch.no_grad():
+        output = model(*matcher_inputs(source, target, config=config))
+
+    assert len(output["assignment_scores_by_layer"]) == 3
+    assert len(output["source_states_by_layer"]) == 3
+    assert len(output["target_states_by_layer"]) == 3
+    assert not torch.equal(
+        output["source_states_by_layer"][0],
+        output["source_states_by_layer"][-1],
+    )
+    assert all(
+        scores.shape == (len(source.nodes), len(target.nodes))
+        for scores in output["assignment_scores_by_layer"]
+    )
+
+
+def test_shared_backbone_returns_normalized_configuration_embeddings() -> None:
+    torch = pytest.importorskip("torch", exc_type=ImportError)
+    config = MatcherConfig(
+        hidden_dim=32,
+        relation_hidden_dim=16,
+        association_dim=24,
+        num_heads=4,
+        association_layers=2,
+        dropout=0.0,
+    )
+    model = build_geometric_v9_matcher(config).eval()
+
+    with torch.no_grad():
+        output = model(
+            *matcher_inputs(_graph("source"), _graph("target"), config=config)
+        )
+
+    assert output["source_config_embedding"].shape == (config.hidden_dim,)
+    assert output["target_config_embedding"].shape == (config.hidden_dim,)
+    assert torch.allclose(
+        output["source_config_embedding"].norm(),
+        torch.tensor(1.0),
+        atol=1e-5,
+    )
+
+
+def test_missing_text_and_visual_are_normal_inputs() -> None:
+    torch = pytest.importorskip("torch", exc_type=ImportError)
+    config = MatcherConfig(
+        hidden_dim=32,
+        relation_hidden_dim=16,
+        association_dim=24,
+        num_heads=4,
+        association_layers=2,
+        dropout=0.0,
+    )
+    graph = graph_from_record(
+        {
+            "screen_id": "missing-modalities",
+            "width": 100,
+            "height": 100,
+            "nodes": [
+                {"node_id": "root", "class": "Root"},
+                {
+                    "node_id": "icon",
+                    "parent_id": "root",
+                    "class": "ImageView",
+                    "clickable": True,
+                    "bounds": [20, 20, 40, 40],
+                },
+            ],
+        }
+    )
+    model = build_geometric_v9_matcher(config).eval()
+
+    with torch.no_grad():
+        output = model(*matcher_inputs(graph, graph, config=config))
+
+    assert output["logits_ab"].shape == (2, 2)
+    assert torch.isfinite(output["logits_ab"]).all()
+    assert torch.isfinite(output["source_config_embedding"]).all()
+
+
+def test_runtime_context_keeps_every_requested_target_candidate() -> None:
+    pytest.importorskip("torch", exc_type=ImportError)
+    config = MatcherConfig(
+        hidden_dim=32,
+        relation_hidden_dim=16,
+        association_dim=24,
+        num_heads=4,
+        association_layers=2,
+        source_context_nodes=2,
+        target_context_nodes=2,
+        dropout=0.0,
+    )
+    source = _graph("source")
+    target = _graph("target")
+    candidate_ids = ("first", "second", "context")
+    matcher = GeometricMatcher(build_geometric_v9_matcher(config), config=config)
+
+    prediction = matcher.predict(
+        source,
+        target,
+        source_node_id="first",
+        candidate_node_ids=candidate_ids,
+    )
+
+    assert {node_id for node_id, _ in prediction.scores} == set(candidate_ids)
+
+
 def test_direct_text_release_conversion_preserves_zero_lookup(tmp_path) -> None:
     torch = pytest.importorskip("torch", exc_type=ImportError)
     learned_config = MatcherConfig(
@@ -149,7 +270,7 @@ def test_direct_text_release_conversion_preserves_zero_lookup(tmp_path) -> None:
         relation_hidden_dim=16,
         association_dim=24,
         num_heads=4,
-        num_layers=2,
+        association_layers=2,
         dropout=0.0,
     )
     direct_config = replace(
@@ -171,3 +292,34 @@ def test_direct_text_release_conversion_preserves_zero_lookup(tmp_path) -> None:
     checkpoint = tmp_path / "direct-text-v9.pt"
     save_matcher_checkpoint(checkpoint, direct, config=direct_config)
     assert GeometricMatcher.from_checkpoint(checkpoint).config == direct_config
+
+
+def test_visual_encoder_migration_preserves_new_visual_parameters() -> None:
+    torch = pytest.importorskip("torch", exc_type=ImportError)
+    base_config = MatcherConfig(
+        hidden_dim=32,
+        relation_hidden_dim=16,
+        association_dim=24,
+        num_heads=4,
+        association_layers=2,
+        dropout=0.0,
+    )
+    source = build_geometric_v9_matcher(
+        replace(base_config, visual_encoder=LEGACY_GLOBAL_POOL_VISUAL_ENCODER)
+    )
+    target = build_geometric_v9_matcher(
+        replace(base_config, visual_encoder=SPATIAL_CNN_VISUAL_ENCODER)
+    )
+    for parameter in source.parameters():
+        parameter.data.fill_(0.25)
+    for parameter in target.parameters():
+        parameter.data.fill_(-0.75)
+
+    transferred = initialize_nonvisual_from_model(target, source)
+    target_state = target.state_dict()
+
+    assert transferred
+    assert all(not name.startswith("visual_encoder.") for name in transferred)
+    for name, value in target_state.items():
+        expected = -0.75 if name.startswith("visual_encoder.") else 0.25
+        assert torch.all(value == expected), name

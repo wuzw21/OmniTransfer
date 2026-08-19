@@ -1,37 +1,39 @@
-"""The single trainable OmniTransfer geometric-v9 model."""
+"""The single trainable OmniTransfer contextual graph matcher."""
 
 from __future__ import annotations
 
 import math
 from typing import Any
 
+from omnitransfer.unified_alignment import (
+    UNIFIED_ASSOCIATION_SCHEMA_ID,
+    default_alignment_strategy_registry,
+)
+
 
 def build_geometric_matcher(config: Any) -> Any:
-    """Build geometric-v9 while preserving the released checkpoint layout."""
+    """Build the unified node-encoding and iterative graph-matching model."""
 
     from omnitransfer.learned_matcher import (
         ALIGNMENT_RELATION_FEATURE_INDICES,
         ALL_NODE_CANDIDATE_POLICY,
         DIRECT_PAIR_EVIDENCE_NAMES,
-        DIRECT_SEMANTIC_EVIDENCE_NAMES,
         DIRECT_TEXT_EVIDENCE_ENCODER,
+        DETERMINISTIC_ICON_VISUAL_ENCODER,
         LEARNED_TOKEN_LOOKUP_ENCODER,
-        NODE_DESCRIPTOR_DIM,
+        LEGACY_GLOBAL_POOL_VISUAL_ENCODER,
         OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE,
-        RELATION_FEATURE_DIM,
+        SPATIAL_CNN_VISUAL_ENCODER,
         TEXT_DESCRIPTOR_DIM,
         TYPED_RELATION_NAMES,
         VISUAL_DESCRIPTOR_DIM,
         XML_DESCRIPTOR_DIM,
         XML_NODE_FEATURE_DIM,
-        local_semantic_context_score,
         mutual_log_assignment,
-        relational_consensus_features,
-        relative_geometry_consensus_features,
-        semantic_anchor_relation_vote,
         typed_relation_bases,
         _require_torch,
     )
+    from omnitransfer.visual_descriptor import deterministic_icon_descriptor_torch
 
     cfg = config
     if cfg.architecture != OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE:
@@ -44,88 +46,118 @@ def build_geometric_matcher(config: Any) -> Any:
         raise ValueError("context node limits must be positive")
     if cfg.visual_canvas_size < cfg.visual_patch_size:
         raise ValueError("visual_canvas_size must cover one visual patch")
-    if cfg.num_layers <= 0:
-        raise ValueError("num_layers must be positive")
+    if cfg.association_layers <= 0:
+        raise ValueError("association_layers must be positive")
     if cfg.assignment_head != "partial_assignment":
         raise ValueError("geometric-v9 requires partial assignment")
 
     torch = _require_torch()
     nn = torch.nn
+    relation_count = len(TYPED_RELATION_NAMES)
 
-    class SymmetricUnaryHead(nn.Module):
+    class LocalGraphLayer(nn.Module):
+        """Aggregate one node's typed, nearby UI relatives into its state."""
+
         def __init__(self) -> None:
             super().__init__()
-            self.residual = nn.Sequential(
-                nn.LayerNorm(cfg.hidden_dim * 2),
-                nn.Linear(cfg.hidden_dim * 2, cfg.hidden_dim),
-                nn.GELU(),
-                nn.Dropout(cfg.dropout),
-                nn.Linear(cfg.hidden_dim, 1),
+            self.value = nn.Linear(
+                cfg.hidden_dim, cfg.relation_hidden_dim, bias=False
             )
-            self.logit_scale = nn.Parameter(torch.tensor(math.log(5.0)))
-
-        def forward(self, source_states: Any, target_states: Any) -> Any:
-            normalized_source = torch.nn.functional.normalize(source_states, dim=-1)
-            normalized_target = torch.nn.functional.normalize(target_states, dim=-1)
-            source = source_states[:, None, :].expand(-1, target_states.shape[0], -1)
-            target = target_states[None, :, :].expand(source_states.shape[0], -1, -1)
-            symmetric_pair = torch.cat(
-                (torch.abs(source - target), source * target),
-                dim=-1,
-            )
-            return (
-                self.logit_scale.exp().clamp(max=100.0)
-                * (normalized_source @ normalized_target.T)
-                + self.residual(symmetric_pair).squeeze(-1)
-            )
-
-    class AssociationGraphLayer(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
             self.message_projection = nn.Linear(
-                cfg.association_dim,
-                cfg.association_dim,
+                relation_count * cfg.relation_hidden_dim,
+                cfg.hidden_dim,
                 bias=False,
             )
-            self.message_norm = nn.LayerNorm(cfg.association_dim)
+            self.message_norm = nn.LayerNorm(cfg.hidden_dim)
             self.feed_forward = nn.Sequential(
-                nn.Linear(cfg.association_dim, cfg.association_dim * 2),
+                nn.Linear(cfg.hidden_dim, cfg.hidden_dim * 2),
                 nn.GELU(),
                 nn.Dropout(cfg.dropout),
-                nn.Linear(cfg.association_dim * 2, cfg.association_dim),
+                nn.Linear(cfg.hidden_dim * 2, cfg.hidden_dim),
             )
-            self.output_norm = nn.LayerNorm(cfg.association_dim)
+            self.output_norm = nn.LayerNorm(cfg.hidden_dim)
             self.dropout = nn.Dropout(cfg.dropout)
 
         def forward(
             self,
-            pair_states: Any,
-            anchor_weights: Any,
+            states: Any,
+            relation_bases: Any,
+            relation_compatibility: Any,
+        ) -> Any:
+            # Keep relation types sharp.  A unit diagonal starts close to an
+            # identity routing matrix while remaining fully learnable.
+            compatibility = torch.softmax(
+                5.0 * relation_compatibility, dim=-1
+            )
+            mixed_bases = torch.einsum(
+                "rq,qij->rij", compatibility, relation_bases
+            )
+            relation_messages = torch.einsum(
+                "rij,jd->rid", mixed_bases, self.value(states)
+            )
+            messages = relation_messages.permute(1, 0, 2).reshape(
+                states.shape[0], relation_count * cfg.relation_hidden_dim
+            )
+            states = self.message_norm(
+                states + self.dropout(self.message_projection(messages))
+            )
+            return self.output_norm(
+                states + self.dropout(self.feed_forward(states))
+            )
+
+    class ContextualRefinementLayer(nn.Module):
+        """One shared local-graph and bidirectional cross-page update."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.local = LocalGraphLayer()
+            self.query = nn.Linear(cfg.hidden_dim, cfg.hidden_dim, bias=False)
+            self.key = nn.Linear(cfg.hidden_dim, cfg.hidden_dim, bias=False)
+            self.value = nn.Linear(cfg.hidden_dim, cfg.hidden_dim, bias=False)
+            self.cross_update = nn.Sequential(
+                nn.LayerNorm(cfg.hidden_dim * 4),
+                nn.Linear(cfg.hidden_dim * 4, cfg.hidden_dim * 2),
+                nn.GELU(),
+                nn.Dropout(cfg.dropout),
+                nn.Linear(cfg.hidden_dim * 2, cfg.hidden_dim),
+            )
+            self.cross_norm = nn.LayerNorm(cfg.hidden_dim)
+            self.dropout = nn.Dropout(cfg.dropout)
+
+        def _cross_context(self, query_states: Any, key_states: Any) -> Any:
+            query = self.query(query_states)
+            key = self.key(key_states)
+            scores = (query @ key.T) / math.sqrt(float(cfg.hidden_dim))
+            return torch.softmax(scores, dim=-1) @ self.value(key_states)
+
+        def _update(self, states: Any, context: Any) -> Any:
+            evidence = torch.cat(
+                (states, context, torch.abs(states - context), states * context),
+                dim=-1,
+            )
+            return self.cross_norm(
+                states + self.dropout(self.cross_update(evidence))
+            )
+
+        def forward(
+            self,
+            source_states: Any,
+            target_states: Any,
             source_bases: Any,
             target_bases: Any,
             relation_compatibility: Any,
-        ) -> Any:
-            anchored_states = pair_states * anchor_weights.unsqueeze(-1)
-            source_messages = torch.einsum(
-                "rik,kjd->rijd",
-                source_bases,
-                anchored_states,
+        ) -> tuple[Any, Any]:
+            source_local = self.local(
+                source_states, source_bases, relation_compatibility
             )
-            typed_messages = torch.einsum(
-                "rq,rijd->qijd",
-                relation_compatibility,
-                source_messages,
+            target_local = self.local(
+                target_states, target_bases, relation_compatibility
             )
-            messages = torch.einsum(
-                "qjl,qild->ijd",
-                target_bases,
-                typed_messages,
-            )
-            pair_states = self.message_norm(
-                pair_states + self.dropout(self.message_projection(messages))
-            )
-            return self.output_norm(
-                pair_states + self.dropout(self.feed_forward(pair_states))
+            source_context = self._cross_context(source_local, target_local)
+            target_context = self._cross_context(target_local, source_local)
+            return (
+                self._update(source_local, source_context),
+                self._update(target_local, target_context),
             )
 
     class GeometricAlignmentMatcher(nn.Module):
@@ -133,103 +165,141 @@ def build_geometric_matcher(config: Any) -> Any:
             super().__init__()
             if cfg.text_encoder == LEARNED_TOKEN_LOOKUP_ENCODER:
                 self.token_embedding = nn.Embedding(
-                    cfg.vocab_size,
-                    cfg.token_dim,
-                    padding_idx=0,
+                    cfg.vocab_size, cfg.token_dim, padding_idx=0
                 )
                 self.text_projection = nn.Linear(
-                    cfg.token_dim,
-                    TEXT_DESCRIPTOR_DIM,
+                    cfg.token_dim, TEXT_DESCRIPTOR_DIM
                 )
             elif cfg.text_encoder == DIRECT_TEXT_EVIDENCE_ENCODER:
                 self.present_text = nn.Parameter(torch.zeros(TEXT_DESCRIPTOR_DIM))
             else:
                 raise ValueError(f"unsupported text encoder: {cfg.text_encoder}")
+
             self.xml_projection = nn.Sequential(
                 nn.LayerNorm(XML_NODE_FEATURE_DIM),
                 nn.Linear(XML_NODE_FEATURE_DIM, XML_DESCRIPTOR_DIM),
                 nn.GELU(),
                 nn.Linear(XML_DESCRIPTOR_DIM, XML_DESCRIPTOR_DIM),
             )
-            self.visual_encoder = nn.Sequential(
-                nn.Conv2d(3, 16, kernel_size=5, stride=2, padding=2),
-                nn.GELU(),
-                nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
-                nn.GELU(),
-                nn.Conv2d(
-                    32,
-                    VISUAL_DESCRIPTOR_DIM,
-                    kernel_size=3,
-                    stride=2,
-                    padding=1,
-                ),
-                nn.GELU(),
-                nn.AdaptiveAvgPool2d((1, 1)),
-                nn.Flatten(),
-            )
+            if cfg.visual_encoder == LEGACY_GLOBAL_POOL_VISUAL_ENCODER:
+                self.visual_encoder = nn.Sequential(
+                    nn.Conv2d(3, 16, kernel_size=5, stride=2, padding=2),
+                    nn.GELU(),
+                    nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+                    nn.GELU(),
+                    nn.Conv2d(
+                        32,
+                        VISUAL_DESCRIPTOR_DIM,
+                        kernel_size=3,
+                        stride=2,
+                        padding=1,
+                    ),
+                    nn.GELU(),
+                    nn.AdaptiveAvgPool2d((1, 1)),
+                    nn.Flatten(),
+                )
+            elif cfg.visual_encoder == SPATIAL_CNN_VISUAL_ENCODER:
+                if cfg.visual_patch_size != 32:
+                    raise ValueError("spatial_cnn_v2 requires 32x32 visual patches")
+                self.visual_encoder = nn.Sequential(
+                    nn.Conv2d(3, 16, kernel_size=5, stride=1, padding=2),
+                    nn.GELU(),
+                    nn.Conv2d(16, 24, kernel_size=3, stride=2, padding=1),
+                    nn.GELU(),
+                    nn.Conv2d(24, 32, kernel_size=3, stride=2, padding=1),
+                    nn.GELU(),
+                    nn.Conv2d(32, 48, kernel_size=3, stride=1, padding=1),
+                    nn.GELU(),
+                    nn.Flatten(),
+                    nn.Linear(48 * 8 * 8, VISUAL_DESCRIPTOR_DIM),
+                )
+            elif cfg.visual_encoder == DETERMINISTIC_ICON_VISUAL_ENCODER:
+
+                class DeterministicIconEncoder(nn.Module):
+                    def forward(self, patches: Any) -> Any:
+                        return deterministic_icon_descriptor_torch(
+                            patches, torch=torch
+                        )
+
+                self.visual_encoder = DeterministicIconEncoder()
+            else:
+                raise ValueError(f"unsupported visual encoder: {cfg.visual_encoder}")
+
             self.missing_text = nn.Parameter(torch.zeros(TEXT_DESCRIPTOR_DIM))
             self.missing_visual = nn.Parameter(torch.zeros(VISUAL_DESCRIPTOR_DIM))
-            self.descriptor_fusion = nn.Sequential(
-                nn.LayerNorm(NODE_DESCRIPTOR_DIM),
-                nn.Linear(NODE_DESCRIPTOR_DIM, NODE_DESCRIPTOR_DIM),
-                nn.GELU(),
-                nn.Dropout(cfg.dropout),
-                nn.Linear(NODE_DESCRIPTOR_DIM, NODE_DESCRIPTOR_DIM),
-            )
-            self.descriptor_norm = nn.LayerNorm(NODE_DESCRIPTOR_DIM)
-            self.descriptor_projection = nn.Linear(
-                NODE_DESCRIPTOR_DIM,
-                cfg.hidden_dim,
-                bias=False,
+            self.text_to_hidden = nn.Linear(TEXT_DESCRIPTOR_DIM, cfg.hidden_dim)
+            self.visual_to_hidden = nn.Linear(VISUAL_DESCRIPTOR_DIM, cfg.hidden_dim)
+            self.xml_to_hidden = nn.Linear(XML_DESCRIPTOR_DIM, cfg.hidden_dim)
+            self.modality_type = nn.Parameter(torch.empty(3, cfg.hidden_dim))
+            nn.init.normal_(self.modality_type, std=0.02)
+            self.modality_score = nn.Sequential(
+                nn.LayerNorm(cfg.hidden_dim),
+                nn.Linear(cfg.hidden_dim, 1, bias=False),
             )
             self.input_norm = nn.LayerNorm(cfg.hidden_dim)
-            self.unary_head = SymmetricUnaryHead()
-            self.relation_compatibility = nn.Parameter(
-                torch.eye(len(TYPED_RELATION_NAMES))
-            )
-            self.voting_strengths = nn.Parameter(torch.zeros(cfg.num_layers))
-            pair_feature_dim = NODE_DESCRIPTOR_DIM * 2 + 5
-            self.association_pair_encoder = nn.Sequential(
-                nn.LayerNorm(pair_feature_dim),
-                nn.Linear(pair_feature_dim, cfg.association_dim),
+            self.input_feed_forward = nn.Sequential(
+                nn.Linear(cfg.hidden_dim, cfg.hidden_dim * 2),
                 nn.GELU(),
                 nn.Dropout(cfg.dropout),
-                nn.Linear(cfg.association_dim, cfg.association_dim),
+                nn.Linear(cfg.hidden_dim * 2, cfg.hidden_dim),
             )
+            self.input_output_norm = nn.LayerNorm(cfg.hidden_dim)
+            self.relation_compatibility = nn.Parameter(torch.eye(relation_count))
             self.association_layers = nn.ModuleList(
-                AssociationGraphLayer() for _ in range(cfg.association_layers)
+                ContextualRefinementLayer()
+                for _ in range(cfg.association_layers)
             )
-            self.association_score = nn.Linear(cfg.association_dim, 1, bias=False)
-            nn.init.zeros_(self.association_score.weight)
-            self.direct_evidence_head = nn.Linear(1, 1, bias=False)
-            nn.init.zeros_(self.direct_evidence_head.weight)
-            self.anchor_voting_strength = nn.Parameter(
-                torch.tensor(math.log(math.expm1(2.0)))
+            self.matchability_head = nn.Sequential(
+                nn.LayerNorm(cfg.hidden_dim),
+                nn.Linear(cfg.hidden_dim, 1),
             )
-            self.context_voting_strength = nn.Parameter(
-                torch.tensor(math.log(math.expm1(0.5)))
+            self.logit_scale = nn.Parameter(torch.tensor(math.log(5.0)))
+            self.page_attention = nn.Sequential(
+                nn.LayerNorm(cfg.hidden_dim),
+                nn.Linear(cfg.hidden_dim, 1, bias=False),
             )
             feature_dim = (
                 len(DIRECT_PAIR_EVIDENCE_NAMES)
                 + 16
-                + len(TYPED_RELATION_NAMES) ** 2
+                + relation_count**2
                 + len(ALIGNMENT_RELATION_FEATURE_INDICES)
             )
-            self.local_alignment_score = nn.Sequential(
-                nn.LayerNorm(feature_dim),
-                nn.Linear(feature_dim, cfg.relation_hidden_dim),
-                nn.GELU(),
-                nn.Linear(cfg.relation_hidden_dim, 1, bias=False),
+            self.alignment_strategy = default_alignment_strategy_registry(
+                direct_pair_dimension=len(DIRECT_PAIR_EVIDENCE_NAMES),
+                typed_relation_dimension=relation_count**2,
+                geometry_dimension=len(ALIGNMENT_RELATION_FEATURE_INDICES),
             )
-            nn.init.zeros_(self.local_alignment_score[-1].weight)
+            self.alignment_strategy.validate_dimension(feature_dim)
 
-        def train(self, mode: bool = True) -> Any:
-            super().train(mode)
-            if mode:
-                for module in self.children():
-                    module.eval()
-                self.local_alignment_score.train()
-            return self
+        def _affinity(
+            self, source_states: Any, target_states: Any
+        ) -> tuple[Any, Any, Any]:
+            normalized_source = torch.nn.functional.normalize(
+                source_states, dim=-1
+            )
+            normalized_target = torch.nn.functional.normalize(
+                target_states, dim=-1
+            )
+            source_matchability = self.matchability_head(source_states).squeeze(-1)
+            target_matchability = self.matchability_head(target_states).squeeze(-1)
+            affinity = (
+                self.logit_scale.exp().clamp(max=100.0)
+                * (normalized_source @ normalized_target.T)
+                + 0.5
+                * (
+                    source_matchability[:, None]
+                    + target_matchability[None, :]
+                )
+            )
+            return affinity, source_matchability, target_matchability
+
+        def _page_embedding(self, states: Any) -> Any:
+            weights = torch.softmax(
+                self.page_attention(states).squeeze(-1), dim=0
+            )
+            return torch.nn.functional.normalize(
+                torch.sum(weights[:, None] * states, dim=0), dim=0
+            )
 
         def encode_nodes(
             self,
@@ -245,9 +315,12 @@ def build_geometric_matcher(config: Any) -> Any:
                 pooled_tokens = (embedded * mask).sum(dim=1) / mask.sum(
                     dim=1
                 ).clamp_min(1)
+
             visual_states = self.visual_encoder(visual_patches)
             visual_states = visual_mask * visual_states + (1.0 - visual_mask) * (
-                self.missing_visual.unsqueeze(0).expand(visual_states.shape[0], -1)
+                self.missing_visual.unsqueeze(0).expand(
+                    visual_states.shape[0], -1
+                )
             )
             text_mask = token_ids.ne(0).any(dim=1, keepdim=True).to(
                 dtype=visual_states.dtype
@@ -256,128 +329,40 @@ def build_geometric_matcher(config: Any) -> Any:
                 text_states = self.text_projection(pooled_tokens)
             else:
                 text_states = self.present_text.unsqueeze(0).expand(
-                    token_ids.shape[0],
-                    -1,
+                    token_ids.shape[0], -1
                 )
             text_states = text_mask * text_states + (1.0 - text_mask) * (
                 self.missing_text.unsqueeze(0).expand(text_states.shape[0], -1)
             )
             xml_states = self.xml_projection(numeric_features)
-            raw_descriptor = torch.cat(
-                (text_states, visual_states, xml_states),
-                dim=-1,
+            modalities = torch.stack(
+                (
+                    self.text_to_hidden(text_states),
+                    self.visual_to_hidden(visual_states),
+                    self.xml_to_hidden(xml_states),
+                ),
+                dim=1,
+            ) + self.modality_type.unsqueeze(0)
+            available = torch.cat(
+                (
+                    text_mask,
+                    visual_mask.to(dtype=text_mask.dtype),
+                    torch.ones_like(text_mask),
+                ),
+                dim=1,
             )
-            descriptor = self.descriptor_norm(
-                raw_descriptor + self.descriptor_fusion(raw_descriptor)
+            modality_logits = self.modality_score(modalities).squeeze(-1)
+            modality_logits = modality_logits.masked_fill(available.eq(0.0), -1e4)
+            modality_weights = torch.softmax(modality_logits / 0.25, dim=1)
+            fused = torch.sum(modality_weights.unsqueeze(-1) * modalities, dim=1)
+            states = self.input_norm(fused)
+            states = self.input_output_norm(
+                states + self.input_feed_forward(states)
             )
-            states = self.input_norm(self.descriptor_projection(descriptor))
-            return states, descriptor, raw_descriptor
-
-        @staticmethod
-        def _symmetric_pair_features(
-            source_values: Any,
-            target_values: Any,
-            source_available: Any,
-            target_available: Any,
-        ) -> tuple[Any, Any, Any]:
-            source = source_values[:, None, :]
-            target = target_values[None, :, :]
-            both_available = source_available[:, None] * target_available[None, :]
-            exactly_one_available = torch.abs(
-                source_available[:, None] - target_available[None, :]
+            raw_modalities = torch.cat(
+                (text_states, visual_states, xml_states), dim=-1
             )
-            features = torch.cat(
-                (torch.abs(source - target), source * target),
-                dim=-1,
-            )
-            return (
-                features * both_available.unsqueeze(-1),
-                both_available,
-                exactly_one_available,
-            )
-
-        def _association_pair_states(
-            self,
-            source_modalities: Any,
-            target_modalities: Any,
-            source_text_available: Any,
-            target_text_available: Any,
-            source_visual_available: Any,
-            target_visual_available: Any,
-            anchor_weights: Any,
-        ) -> Any:
-            source_text, source_visual, source_xml = torch.split(
-                source_modalities,
-                (TEXT_DESCRIPTOR_DIM, VISUAL_DESCRIPTOR_DIM, XML_DESCRIPTOR_DIM),
-                dim=-1,
-            )
-            target_text, target_visual, target_xml = torch.split(
-                target_modalities,
-                (TEXT_DESCRIPTOR_DIM, VISUAL_DESCRIPTOR_DIM, XML_DESCRIPTOR_DIM),
-                dim=-1,
-            )
-            text, text_both, text_one = self._symmetric_pair_features(
-                source_text,
-                target_text,
-                source_text_available,
-                target_text_available,
-            )
-            visual, visual_both, visual_one = self._symmetric_pair_features(
-                source_visual,
-                target_visual,
-                source_visual_available,
-                target_visual_available,
-            )
-            xml, _, _ = self._symmetric_pair_features(
-                source_xml,
-                target_xml,
-                torch.ones_like(source_text_available),
-                torch.ones_like(target_text_available),
-            )
-            availability = torch.stack(
-                (text_both, text_one, visual_both, visual_one, anchor_weights),
-                dim=-1,
-            )
-            return self.association_pair_encoder(
-                torch.cat((text, visual, xml, availability), dim=-1)
-            )
-
-        def _relation_vote(
-            self,
-            soft_assignment: Any,
-            source_bases: Any,
-            target_bases: Any,
-        ) -> Any:
-            compatibility = 0.5 * (
-                self.relation_compatibility + self.relation_compatibility.T
-            )
-            source_messages = torch.einsum(
-                "rik,kl->ril",
-                source_bases,
-                soft_assignment,
-            )
-            typed_messages = torch.einsum(
-                "rq,ril->qil",
-                compatibility,
-                source_messages,
-            )
-            vote = torch.einsum(
-                "qil,qjl->ij",
-                typed_messages,
-                target_bases,
-            )
-            centered = vote - vote.mean()
-            return centered / centered.square().mean().clamp_min(
-                torch.finfo(vote.dtype).eps
-            ).sqrt()
-
-        @staticmethod
-        def _standardize(values: Any) -> Any:
-            centered = values - values.mean(dim=(0, 1), keepdim=True)
-            return centered / centered.square().mean(
-                dim=(0, 1),
-                keepdim=True,
-            ).clamp_min(torch.finfo(centered.dtype).eps).sqrt()
+            return states, states, raw_modalities
 
         def forward(
             self,
@@ -407,175 +392,80 @@ def build_geometric_matcher(config: Any) -> Any:
                 target_visual,
                 target_visual_mask,
             )
-            unary_affinity = self.unary_head(source_states, target_states)
             source_bases = typed_relation_bases(source_relations, source_numeric)
             target_bases = typed_relation_bases(target_relations, target_numeric)
-            soft_assignment = torch.exp(mutual_log_assignment(unary_affinity))
+            unary_affinity, _, _ = self._affinity(source_states, target_states)
+
             assignments = []
             affinities = []
-            relation_votes = []
-            soft_assignments = []
-            attention_diagnostics = []
-            for round_index in range(cfg.num_layers):
-                relation_vote = self._relation_vote(
-                    soft_assignment,
-                    source_bases,
-                    target_bases,
-                )
-                affinity = unary_affinity + torch.nn.functional.softplus(
-                    self.voting_strengths[round_index]
-                ) * relation_vote
-                assignment = mutual_log_assignment(affinity)
-                soft_assignment = torch.exp(mutual_log_assignment(affinity))
-                assignments.append(assignment)
-                affinities.append(affinity)
-                relation_votes.append(relation_vote)
-                soft_assignments.append(soft_assignment)
-                attention_diagnostics.append(
-                    {
-                        "soft_assignment": soft_assignment,
-                        "relation_vote": relation_vote,
-                    }
-                )
-            base_affinity = affinities[-1]
-            if direct_pair_evidence.shape != (
-                base_affinity.shape[0],
-                base_affinity.shape[1],
-                RELATION_FEATURE_DIM,
-            ):
-                raise ValueError("direct pair evidence must align with candidate pairs")
-            direct_evidence_residual = self.direct_evidence_head(
-                direct_pair_evidence[
-                    ..., : len(DIRECT_SEMANTIC_EVIDENCE_NAMES)
-                ].sum(dim=-1, keepdim=True)
-            ).squeeze(-1)
-            anchor_weights = torch.exp(
-                mutual_log_assignment(base_affinity + direct_evidence_residual)
-            )
-            pair_states = self._association_pair_states(
-                source_modalities,
-                target_modalities,
-                source_token_ids.ne(0).any(dim=1).to(base_affinity.dtype),
-                target_token_ids.ne(0).any(dim=1).to(base_affinity.dtype),
-                source_visual_mask.squeeze(-1).to(base_affinity.dtype),
-                target_visual_mask.squeeze(-1).to(base_affinity.dtype),
-                anchor_weights,
-            )
-            compatibility = 0.5 * (
-                self.relation_compatibility + self.relation_compatibility.T
-            )
-            association_states = []
+            source_states_by_layer = []
+            target_states_by_layer = []
+            source_matchability_by_layer = []
+            target_matchability_by_layer = []
             for layer in self.association_layers:
-                pair_states = layer(
-                    pair_states,
-                    anchor_weights,
+                source_states, target_states = layer(
+                    source_states,
+                    target_states,
                     source_bases,
                     target_bases,
-                    compatibility,
+                    self.relation_compatibility,
                 )
-                association_states.append(pair_states)
-            association_residual = self.association_score(pair_states).squeeze(-1)
-            anchor_relation_vote = semantic_anchor_relation_vote(
-                direct_pair_evidence,
-                source_bases,
-                target_bases,
-                compatibility,
-            )
-            anchor_vote_residual = torch.nn.functional.softplus(
-                self.anchor_voting_strength
-            ) * anchor_relation_vote
-            context_relation_score = local_semantic_context_score(
-                direct_pair_evidence,
-                source_bases,
-                target_bases,
-                source_numeric,
-                target_numeric,
-            )
-            context_vote_residual = torch.nn.functional.softplus(
-                self.context_voting_strength
-            ) * context_relation_score
-            affinity = (
-                base_affinity
-                + association_residual
-                + direct_evidence_residual
-                + anchor_vote_residual
-                + context_vote_residual
-            )
-            assignment = mutual_log_assignment(affinity)
-            score_components = torch.stack(
-                (
-                    unary_affinity,
-                    base_affinity,
-                    association_residual,
-                    direct_evidence_residual,
-                    anchor_vote_residual,
-                    context_relation_score,
-                    context_vote_residual,
-                    affinity,
-                ),
-                dim=-1,
-            )
-            local_consensus = self._standardize(
-                relational_consensus_features(
-                    assignment,
-                    source_bases,
-                    target_bases,
+                affinity, source_matchability, target_matchability = self._affinity(
+                    source_states, target_states
                 )
-            )
-            geometry_consensus = self._standardize(
-                relative_geometry_consensus_features(
-                    assignment,
-                    source_relations,
-                    target_relations,
-                )
-            )
-            local_features = torch.cat(
-                (
-                    direct_pair_evidence,
-                    torch.tanh(score_components / 5.0),
-                    self._standardize(score_components),
-                    local_consensus,
-                    geometry_consensus,
-                ),
-                dim=-1,
-            )
-            local_residual = self.local_alignment_score(local_features).squeeze(-1)
-            final_affinity = affinity + local_residual
-            final_assignment = mutual_log_assignment(final_affinity)
+                affinities.append(affinity)
+                assignments.append(mutual_log_assignment(affinity))
+                source_states_by_layer.append(source_states)
+                target_states_by_layer.append(target_states)
+                source_matchability_by_layer.append(source_matchability)
+                target_matchability_by_layer.append(target_matchability)
+
+            final_affinity = affinities[-1]
+            final_assignment = assignments[-1]
+            raw_weights = tuple(range(1, len(assignments) + 1))
+            weight_sum = float(sum(raw_weights))
+            assignment_weights = tuple(value / weight_sum for value in raw_weights)
             return {
                 "logits_ab": final_assignment,
                 "logits_ba": final_assignment.T,
                 "affinity": final_affinity,
-                "unary_affinity": unary_affinity,
-                "base_affinity": base_affinity,
-                "association_residual": association_residual,
-                "direct_evidence_residual": direct_evidence_residual,
-                "anchor_relation_vote": anchor_relation_vote,
-                "anchor_vote_residual": anchor_vote_residual,
-                "context_relation_score": context_relation_score,
-                "context_vote_residual": context_vote_residual,
+                "association_score": final_affinity,
                 "direct_pair_evidence": direct_pair_evidence,
-                "v9_affinity": affinity,
-                "local_alignment_residual": local_residual,
-                "local_alignment_base_residual": local_residual,
-                "geometry_alignment_residual": torch.zeros_like(local_residual),
-                "local_alignment_consensus": local_consensus,
-                "local_alignment_geometry": geometry_consensus,
-                "assignment_scores_by_layer": (final_assignment,),
-                "assignment_loss_weights": (1.0,),
-                "affinities_by_layer": (final_affinity,),
-                "base_assignment_scores_by_layer": tuple(assignments),
-                "base_affinities_by_layer": tuple(affinities),
-                "relation_votes_by_layer": tuple(relation_votes),
-                "soft_assignments_by_layer": tuple(soft_assignments),
-                "attention_by_layer": tuple(attention_diagnostics),
-                "association_states_by_layer": tuple(association_states),
+                "unary_affinity": unary_affinity,
+                "alignment_strategy_schema": self.alignment_strategy.schema_id,
+                "alignment_strategy": self.alignment_strategy.metadata(),
+                "association_schema": UNIFIED_ASSOCIATION_SCHEMA_ID,
+                "assignment_scores_by_layer": tuple(assignments),
+                "assignment_loss_weights": assignment_weights,
+                "affinities_by_layer": tuple(affinities),
+                "source_states_by_layer": tuple(source_states_by_layer),
+                "target_states_by_layer": tuple(target_states_by_layer),
+                "source_matchability_by_layer": tuple(
+                    source_matchability_by_layer
+                ),
+                "target_matchability_by_layer": tuple(
+                    target_matchability_by_layer
+                ),
                 "source_relation_bases": source_bases,
                 "target_relation_bases": target_bases,
                 "source_descriptors": source_descriptors,
                 "target_descriptors": target_descriptors,
+                "source_visual_descriptors": source_modalities[
+                    :,
+                    TEXT_DESCRIPTOR_DIM : TEXT_DESCRIPTOR_DIM
+                    + VISUAL_DESCRIPTOR_DIM,
+                ],
+                "target_visual_descriptors": target_modalities[
+                    :,
+                    TEXT_DESCRIPTOR_DIM : TEXT_DESCRIPTOR_DIM
+                    + VISUAL_DESCRIPTOR_DIM,
+                ],
+                "source_visual_mask": source_visual_mask,
+                "target_visual_mask": target_visual_mask,
                 "source_states": source_states,
                 "target_states": target_states,
+                "source_config_embedding": self._page_embedding(source_states),
+                "target_config_embedding": self._page_embedding(target_states),
             }
 
     return GeometricAlignmentMatcher()

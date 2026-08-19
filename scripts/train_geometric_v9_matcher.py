@@ -15,12 +15,18 @@ from omnitransfer.experiment_logging import (
     runtime_environment,
     source_revision,
 )
+from omnitransfer.unified_alignment import ALIGNMENT_STRATEGY_SCHEMA_ID
 from omnitransfer.learned_matcher import (
     ALL_NODE_CANDIDATE_POLICY,
+    DETERMINISTIC_ICON_VISUAL_ENCODER,
+    LEGACY_GLOBAL_POOL_VISUAL_ENCODER,
     NODE_DESCRIPTOR_DIM,
     OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE,
+    SPATIAL_CNN_VISUAL_ENCODER,
     MatcherConfig,
     GeometricMatcher,
+    build_geometric_v9_matcher,
+    initialize_nonvisual_from_model,
     parameter_count,
     save_matcher_checkpoint,
 )
@@ -79,13 +85,27 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--hidden-dim", type=int, default=NODE_DESCRIPTOR_DIM)
     parser.add_argument("--num-heads", type=int, default=4)
-    parser.add_argument("--num-layers", type=int, default=3)
+    parser.add_argument("--association-layers", type=int, default=2)
     parser.add_argument("--source-context-nodes", type=int, default=48)
     parser.add_argument("--target-context-nodes", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--descriptor-loss-weight", type=float, default=0.20)
     parser.add_argument("--descriptor-learning-rate-scale", type=float, default=0.25)
+    parser.add_argument("--visual-descriptor-loss-weight", type=float, default=1.0)
+    parser.add_argument("--visual-descriptor-temperature", type=float, default=0.07)
+    parser.add_argument("--strategy-loss-weight", type=float, default=0.10)
+    parser.add_argument("--matchability-loss-weight", type=float, default=0.20)
+    parser.add_argument(
+        "--visual-encoder",
+        choices=(
+            DETERMINISTIC_ICON_VISUAL_ENCODER,
+            LEGACY_GLOBAL_POOL_VISUAL_ENCODER,
+            SPATIAL_CNN_VISUAL_ENCODER,
+        ),
+        default=None,
+        help="Replace only geometric-v9's visual encoder; pretrained runs migrate all nonvisual weights.",
+    )
     parser.add_argument("--progress-interval", type=int, default=1000)
     parser.add_argument(
         "--visual-dropout-probability",
@@ -109,16 +129,21 @@ def _validate_args(args: argparse.Namespace) -> None:
         "--synthetic-pairs-per-page": args.synthetic_pairs_per_page,
         "--cross-page-pair-repeats": args.cross_page_pair_repeats,
         "--descriptor-loss-weight": args.descriptor_loss_weight,
+        "--visual-descriptor-loss-weight": args.visual_descriptor_loss_weight,
+        "--strategy-loss-weight": args.strategy_loss_weight,
+        "--matchability-loss-weight": args.matchability_loss_weight,
     }
     for name, value in non_negative.items():
         if value < 0:
             raise SystemExit(f"{name} must be non-negative")
     if args.synthetic_pairs_per_page == 0 and args.cross_page_pair_repeats == 0:
         raise SystemExit("training requires synthetic or cross-page pairs")
-    if args.num_layers <= 0:
-        raise SystemExit("--num-layers must be positive")
+    if args.association_layers <= 0:
+        raise SystemExit("--association-layers must be positive")
     if not 0.0 < args.descriptor_learning_rate_scale <= 1.0:
         raise SystemExit("--descriptor-learning-rate-scale must be in (0, 1]")
+    if args.visual_descriptor_temperature <= 0.0:
+        raise SystemExit("--visual-descriptor-temperature must be positive")
     for name, value in {
         "--visual-dropout-probability": args.visual_dropout_probability,
     }.items():
@@ -150,19 +175,32 @@ def main() -> None:
         config = MatcherConfig(
             hidden_dim=args.hidden_dim,
             num_heads=args.num_heads,
-            num_layers=args.num_layers,
+            association_layers=args.association_layers,
             source_context_nodes=args.source_context_nodes,
             target_context_nodes=args.target_context_nodes,
             architecture=OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE,
             candidate_policy=ALL_NODE_CANDIDATE_POLICY,
+            visual_encoder=args.visual_encoder or MatcherConfig.visual_encoder,
         )
         pretrained_model = None
         pretrained_mode = None
     else:
         pretrained = _load_geometric_checkpoint(args.pretrained, device=args.device)
-        config = pretrained.config
-        pretrained_model = pretrained.model
-        pretrained_mode = "exact_geometric_v9_resume"
+        if args.visual_encoder and args.visual_encoder != pretrained.config.visual_encoder:
+            config = replace(pretrained.config, visual_encoder=args.visual_encoder)
+            pretrained_model = build_geometric_v9_matcher(config)
+            transferred = initialize_nonvisual_from_model(
+                pretrained_model,
+                pretrained.model,
+            )
+            pretrained_mode = (
+                f"visual_encoder_migration:{pretrained.config.visual_encoder}"
+                f"->{args.visual_encoder}:{len(transferred)}"
+            )
+        else:
+            config = pretrained.config
+            pretrained_model = pretrained.model
+            pretrained_mode = "exact_geometric_v9_resume"
 
     augment = scaled_augment_config(
         args.augmentation_strength,
@@ -200,6 +238,7 @@ def main() -> None:
         "augmentation": asdict(augment),
         "synthetic_pairs_per_page": args.synthetic_pairs_per_page,
         "cross_page_pair_repeats": args.cross_page_pair_repeats,
+        "alignment_strategy_schema": ALIGNMENT_STRATEGY_SCHEMA_ID,
     }
     print(json.dumps(preview, ensure_ascii=False), flush=True)
     if args.dry_run:
@@ -232,6 +271,7 @@ def main() -> None:
             "epochs": args.epochs,
             "learning_rate": args.learning_rate,
             "runtime": runtime_environment(args.device),
+            "alignment_strategy_schema": ALIGNMENT_STRATEGY_SCHEMA_ID,
         }
     )
 
@@ -284,6 +324,10 @@ def main() -> None:
         cross_page_pair_repeats=args.cross_page_pair_repeats,
         descriptor_weight=args.descriptor_loss_weight,
         descriptor_learning_rate_scale=args.descriptor_learning_rate_scale,
+        visual_descriptor_weight=args.visual_descriptor_loss_weight,
+        visual_descriptor_temperature=args.visual_descriptor_temperature,
+        strategy_weight=args.strategy_loss_weight,
+        matchability_weight=args.matchability_loss_weight,
     )
     evaluation_pairs = validation_pairs or pairs
     evaluation_split = "dev" if validation_pairs else "training_fit_smoke"
@@ -311,6 +355,7 @@ def main() -> None:
         "training": {"history": history},
         "evaluation": {"split": evaluation_split, "metrics": metrics},
         "evaluation_boundary": "formal metrics require held-out human gold",
+        "alignment_strategy_schema": ALIGNMENT_STRATEGY_SCHEMA_ID,
     }
     save_matcher_checkpoint(
         args.output,
