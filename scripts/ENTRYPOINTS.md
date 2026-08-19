@@ -30,7 +30,28 @@ PYTHONPATH=src python scripts/clean_mapping_dataset.py \
 ```
 
 This writes `cleaned.jsonl`, `quarantine.jsonl`, and a hash manifest. The
-policy excludes clickability and parent-child equivalence.
+policy excludes clickability and parent-child equivalence. In cleaning schema
+v2, an exact source semantic value found on any non-gold target endpoint is
+quarantined even when that target is a parent, child, or sibling of the gold
+endpoint.
+
+MobileViews can provide Android structural pretraining, but not invented
+Android-to-iOS gold. The default builder pairs adjacent states from the same
+package/activity and uses unique resource-ID/class or semantic/class keys only
+to create auditable pseudo labels. Those identity fields remain forbidden model
+inputs:
+
+```bash
+PYTHONPATH=src python scripts/build_mobileviews_pretraining_dataset.py \
+  --input /absolute/mobileviews-graphs.jsonl \
+  --output-dir /absolute/mobileviews-pretraining \
+  --mode state-transition \
+  --maximum-pages 5000 \
+  --per-package-cap 4
+```
+
+Use `--mode same-observation` only for an explicit augmentation ablation; it is
+not the default mapping corpus.
 
 ## Review
 
@@ -73,6 +94,21 @@ PYTHONPATH=src:. python scripts/evaluate_geometric_v9_matcher.py \
 
 Training supports only geometric-v9 with all XML nodes as candidates. A
 pretrained checkpoint can only resume the same model exactly.
+
+Audit whether each relation layer helps before changing the decoder:
+
+```bash
+PYTHONPATH=src python scripts/evaluate_association_depth.py \
+  --checkpoint /absolute/model.pt \
+  --dataset /absolute/dataset/dev.jsonl \
+  --split dev \
+  --output /absolute/association-depth.json
+```
+
+Runtime ranking uses one confidence-adaptive decoder over the final two shared
+association layers. It selects the layer with the larger candidate probability
+margin for the current source node; this is adaptive depth, not a semantic
+branch or an additional hand-written relation score.
 
 The hard-coded local-context branch is offline-only and exists to test whether
 the four difficult data slices contain useful signal before changing training:

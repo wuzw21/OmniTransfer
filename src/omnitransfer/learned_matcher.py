@@ -289,6 +289,34 @@ def mutual_log_assignment(affinity: Any) -> Any:
     )
 
 
+def confidence_adaptive_assignment_row(
+    output: dict[str, Any],
+    *,
+    source_index: int,
+    candidate_indices: Iterable[int],
+    transpose: bool = False,
+) -> tuple[Any, int]:
+    """Select the sharper of the last two shared association layers."""
+
+    candidates = list(candidate_indices)
+    assignment_layers = tuple(output.get("assignment_scores_by_layer") or ())
+    selected_layer = len(assignment_layers) - 1
+    final_matrix = output["logits_ba"] if transpose else output["logits_ab"]
+    selected_logits = final_matrix[source_index][candidates]
+    if len(assignment_layers) < 2 or len(candidates) < 2:
+        return selected_logits, selected_layer
+    previous_matrix = assignment_layers[-2].T if transpose else assignment_layers[-2]
+    previous_logits = previous_matrix[source_index][candidates]
+    torch = _require_torch()
+    previous_probability = torch.softmax(previous_logits, dim=0)
+    final_probability = torch.softmax(selected_logits, dim=0)
+    previous_margin = torch.topk(previous_probability, 2).values.diff().abs()[0]
+    final_margin = torch.topk(final_probability, 2).values.diff().abs()[0]
+    if previous_margin > final_margin:
+        return previous_logits, len(assignment_layers) - 2
+    return selected_logits, selected_layer
+
+
 def typed_relation_bases(relations: Any, numeric_features: Any) -> Any:
     """Build row-normalized UI relation bases for structured matching."""
 
@@ -565,8 +593,18 @@ class GeometricMatcher:
         )
         with torch.no_grad():
             output = self.model(*inputs)
-            selected_logits = output["logits_ab"][source_index][candidate_indices]
-            selected_affinity = output["affinity"][source_index][candidate_indices]
+            affinity_layers = tuple(output.get("affinities_by_layer") or ())
+            selected_logits, selected_layer = confidence_adaptive_assignment_row(
+                output,
+                source_index=source_index,
+                candidate_indices=candidate_indices,
+            )
+            selected_affinity_matrix = (
+                affinity_layers[selected_layer]
+                if affinity_layers
+                else output["affinity"]
+            )
+            selected_affinity = selected_affinity_matrix[source_index][candidate_indices]
             rank_probabilities = torch.softmax(selected_logits, dim=0)
             match_probabilities = torch.sigmoid(selected_affinity)
         ranked = sorted(

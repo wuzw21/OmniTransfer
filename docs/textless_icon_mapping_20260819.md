@@ -196,3 +196,63 @@ PYTHONPATH=src python scripts/build_ui_correspondence_review.py \
   --checkpoint /absolute/geometric-v9.npz \
   --serve
 ```
+
+## Endpoint audit and relation-depth follow-up
+
+The unified ASE test error audit now separates strict benchmark errors from
+pending label conflicts. Of 1,286 directional test correspondences, the
+confidence-adaptive decoder has 248 strict errors. Forty of those predict a
+target with exactly the source semantics while the declared target is blank
+(32) or has conflicting semantics (8). They remain errors until manual review;
+the report exposes the resulting 80.72%-to-83.83% strict-to-best-case interval
+instead of silently relabeling the benchmark.
+
+This exposed a mismatch in cleaning schema v1: the manifest prohibited
+parent-child equivalence, but exact semantics within a two-hop target family
+were exempted from quarantine. Schema v2 compares only exact declared target
+endpoints. On the 839-pair ASE training set it quarantines 239 of 5,380 mapping
+rows, compared with 38 in v1. The 201 newly exposed rows are review candidates,
+not automatically corrected labels.
+
+A screenshot-complete v2 fine-tune was evaluated against the resumed
+checkpoint on all 230 dev screenshots. The trained epoch reached 75.93% versus
+the 76.31% resumed baseline, so checkpoint selection retained the original
+weights. Quarantining conflicts is necessary for future supervision but simply
+removing 4.44% of labels does not improve an already-trained model; reviewed
+replacement endpoints or additional cross-layout mappings are required.
+
+The relation architecture itself is useful. On held-out ASE dev, descriptor,
+unary assignment, and the three shared association layers reach 63.92%,
+65.96%, 72.86%, 75.67%, and 76.25% Top-1 respectively. The failure is fixed
+depth on some rows, not relation reasoning as a whole. Selecting the sharper
+of the final two layer distributions raises dev Top-1 to 76.76%; the same
+frozen policy reaches 80.72% on test versus 80.02% at the final layer.
+
+## MobileViews structural corpus
+
+MobileViews is Android-only and therefore is not cross-platform gold. A
+leakage-safe builder selects pages using text-less nodes with semantic local
+relatives, comparable siblings, list structures, transient layers, and deep
+hierarchy. Clickability, resource IDs, package names, graph IDs, and origin IDs
+are not node-identity inputs.
+
+The first materialized corpus contains 2,000 pages from 1,368 packages and
+130,989 exact same-observation node identities. All selected pages contain
+text-less local-context and sibling-hard-negative structure; 1,905 contain
+lists and 311 contain popup/dialog evidence. An initial remote evaluation was
+invalid because its ASE JSON retained workstation-absolute screenshot paths;
+that run is excluded. After rematerializing all 230 dev screenshots on the GPU
+host, the original checkpoint reached 76.31% and the 200-update
+MobileViews-only pilot reached 68.58% Top-1. The pilot is therefore rejected:
+same-screen structural identity cannot replace cross-layout supervision.
+MobileViews remains auxiliary data, and any future mixed model must improve ASE
+dev before test evaluation or runtime release.
+
+The replacement state-transition corpus pairs different observations from the
+same package/activity with a source-row gap of at most four. Resource IDs and
+unique semantic keys create pseudo labels only and remain unavailable to the
+model. The current v2 materialization contains 1,000 pairs from 438 packages
+and 16,684 pseudo matches: 777 pairs change node count, 766 contain list
+structure, 174 contain popup/dialog evidence, and none has identical XML. Its
+labels are intentionally `unreviewed`; it must pass sampled review and be mixed
+at controlled weight rather than treated as formal gold.

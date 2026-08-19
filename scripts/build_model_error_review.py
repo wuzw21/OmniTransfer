@@ -61,8 +61,13 @@ def select_balanced_errors(errors: list[dict[str, Any]], limit: int) -> list[dic
     for error in errors:
         for group in _selection_groups(error):
             buckets[group].append(error)
-    selected: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    # Label conflicts are not ordinary model errors. Keep every one in the
+    # review queue before balancing the remaining true-error slices, otherwise
+    # a small display limit can hide bad supervision behind model statistics.
+    selected = [
+        row for row in errors if row["diagnosis"].get("needs_label_audit")
+    ][:limit]
+    seen = {_error_key(row) for row in selected}
     cursor = Counter()
     while len(selected) < limit:
         progressed = False

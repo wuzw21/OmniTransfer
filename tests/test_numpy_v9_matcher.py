@@ -177,3 +177,41 @@ def test_v9_numpy_page_embedding_matches_contextual_torch_readout(tmp_path: Path
     assert actual.shape == (torch_matcher.config.hidden_dim,)
     assert np.linalg.norm(actual) == pytest.approx(1.0, abs=1e-5)
     np.testing.assert_allclose(actual, expected, rtol=2e-4, atol=2e-4)
+
+
+def test_runtime_uses_sharper_of_last_two_contextual_layers() -> None:
+    source = graph_from_record(
+        {"screen_id": "source", "nodes": [{"node_id": "s", "class": "View"}]}
+    )
+    target = graph_from_record(
+        {
+            "screen_id": "target",
+            "nodes": [
+                {"node_id": "correct", "class": "View"},
+                {"node_id": "wrong", "class": "View"},
+                {"node_id": "other", "class": "View"},
+            ],
+        }
+    )
+    matcher = NumpyGeometricAlignmentMatcher({}, config=MatcherConfig())
+    previous = np.asarray([[6.0, 1.0, 0.0]], dtype=np.float32)
+    final = np.asarray([[1.0, 1.1, 1.0]], dtype=np.float32)
+    output = {
+        "logits_ab": final,
+        "affinity": final,
+        "assignment_scores_by_layer": (previous, final),
+        "affinities_by_layer": (previous, final),
+    }
+
+    prediction = matcher._predict_from_output(
+        source,
+        target,
+        source_index=0,
+        candidate_indices=[0, 1, 2],
+        output=output,
+        min_probability=0.0,
+        min_margin=0.0,
+    )
+
+    assert prediction.target_node is not None
+    assert prediction.target_node.node_id == "correct"

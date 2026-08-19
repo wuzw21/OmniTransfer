@@ -86,6 +86,13 @@ def classify_prediction_error(
     exact_source_prediction = bool(source_text) and predicted_text == source_text
     exact_source_gold = source_text in gold_texts
     needs_label_audit = exact_source_prediction and not exact_source_gold
+    label_audit_reason = None
+    if needs_label_audit:
+        label_audit_reason = (
+            "prediction_exact_source_semantics_gold_blank"
+            if not gold_texts
+            else "prediction_exact_source_semantics_gold_disagrees"
+        )
     rank = int(row.get("gold_rank") or 0)
     return {
         "availability": availability_slice(source, best_gold),
@@ -95,6 +102,7 @@ def classify_prediction_error(
         "granularity_mismatch": relation
         in {"prediction_descendant_of_gold", "prediction_ancestor_of_gold"},
         "needs_label_audit": needs_label_audit,
+        "label_audit_reason": label_audit_reason,
         "gold_rank_bucket": "rank_2_3" if 1 < rank <= 3 else "rank_4_5" if rank <= 5 else "rank_gt_5",
     }
 
@@ -112,6 +120,7 @@ def analyze_prediction_errors(
     stage_counts: Counter[str] = Counter()
     structure_counts: Counter[str] = Counter()
     rank_counts: Counter[str] = Counter()
+    label_audit_counts: Counter[str] = Counter()
     app_totals: Counter[str] = Counter()
     app_errors: Counter[str] = Counter()
     for row in rows:
@@ -134,6 +143,8 @@ def analyze_prediction_errors(
         stage_counts[diagnosis["model_stage"]] += 1
         structure_counts[diagnosis["structural_relation"]] += 1
         rank_counts[diagnosis["gold_rank_bucket"]] += 1
+        if diagnosis["needs_label_audit"]:
+            label_audit_counts[str(diagnosis["label_audit_reason"])] += 1
         app_errors[app] += 1
     slices = {
         name: {
@@ -162,11 +173,13 @@ def analyze_prediction_errors(
     hard_coverage = training_coverage["mixed"] + training_coverage["both_textless"]
     total_coverage = sum(training_coverage.values())
     hard_fraction = hard_coverage / total_coverage if total_coverage else 0.0
+    strict_correct = len(rows) - len(errors)
+    audit_pending = sum(label_audit_counts.values())
     return {
         "schema_version": "omnitransfer.mapping_error_analysis.v1",
         "summary": {
             "total_predictions": len(rows),
-            "correct": len(rows) - len(errors),
+            "correct": strict_correct,
             "errors": len(errors),
             "error_rate": len(errors) / len(rows) if rows else 0.0,
         },
@@ -174,6 +187,18 @@ def analyze_prediction_errors(
         "model_stage": dict(sorted(stage_counts.items())),
         "structural_relation": dict(sorted(structure_counts.items())),
         "gold_rank": dict(sorted(rank_counts.items())),
+        "label_audit": {
+            "pending_errors": audit_pending,
+            "reasons": dict(sorted(label_audit_counts.items())),
+            "strict_top1_accuracy": strict_correct / len(rows) if rows else 0.0,
+            "top1_accuracy_if_all_pending_gold_are_wrong": (
+                (strict_correct + audit_pending) / len(rows) if rows else 0.0
+            ),
+            "policy": (
+                "pending rows remain strict errors until human review; "
+                "never train against or relabel them automatically"
+            ),
+        },
         "apps": apps,
         "training_coverage": training_coverage,
         "diagnosis": {

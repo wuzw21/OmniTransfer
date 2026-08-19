@@ -15,6 +15,7 @@ from omnitransfer.learned_matcher import (
     MatcherConfig,
     GeometricMatcher,
     build_geometric_v9_matcher,
+    confidence_adaptive_assignment_row,
     direct_pair_evidence_features,
     encode_graph,
     initialize_direct_text_from_lookup,
@@ -323,3 +324,23 @@ def test_visual_encoder_migration_preserves_new_visual_parameters() -> None:
     for name, value in target_state.items():
         expected = -0.75 if name.startswith("visual_encoder.") else 0.25
         assert torch.all(value == expected), name
+
+
+def test_torch_decoder_uses_sharper_previous_association_layer() -> None:
+    torch = pytest.importorskip("torch", exc_type=ImportError)
+    previous = torch.tensor([[6.0, 1.0, 0.0]])
+    final = torch.tensor([[1.0, 1.1, 1.0]])
+    output = {
+        "logits_ab": final,
+        "logits_ba": final.T,
+        "assignment_scores_by_layer": (previous, final),
+    }
+
+    selected, layer = confidence_adaptive_assignment_row(
+        output,
+        source_index=0,
+        candidate_indices=[0, 1, 2],
+    )
+
+    assert layer == 0
+    assert int(torch.argmax(selected)) == 0

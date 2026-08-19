@@ -16,6 +16,7 @@ from omnitransfer.learned_matcher import (
     EncodedGraph,
     MatcherConfig,
     build_geometric_v9_matcher,
+    confidence_adaptive_assignment_row,
     encode_graph,
     matcher_inputs,
 )
@@ -567,7 +568,6 @@ def evaluate_correspondence_pairs(
                 descriptor_affinity = normalized_source @ normalized_target.T
             for (
                 direction,
-                logits,
                 descriptor_logits,
                 positive_targets,
                 source_nodes,
@@ -578,7 +578,6 @@ def evaluate_correspondence_pairs(
             ) in (
                 (
                     "a_to_b",
-                    output["logits_ab"],
                     descriptor_affinity,
                     pair.positive_targets_a_to_b,
                     pair.graph_a.nodes,
@@ -589,7 +588,6 @@ def evaluate_correspondence_pairs(
                 ),
                 (
                     "b_to_a",
-                    output["logits_ba"],
                     (
                         descriptor_affinity.T
                         if descriptor_affinity is not None
@@ -607,7 +605,12 @@ def evaluate_correspondence_pairs(
                 for row_index, target_indices in enumerate(positive_targets):
                     if not target_indices:
                         continue
-                    selected_logits = logits[row_index, candidate_indices]
+                    selected_logits, selected_layer = confidence_adaptive_assignment_row(
+                        output,
+                        source_index=row_index,
+                        candidate_indices=candidate_indices,
+                        transpose=component_transpose,
+                    )
                     ranked_positions = torch.argsort(
                         selected_logits,
                         descending=True,
@@ -697,12 +700,13 @@ def evaluate_correspondence_pairs(
                                 ],
                                 "score_components": _evaluation_score_components(
                                     output,
-                                    assignment_logits=logits,
+                                    assignment_row=selected_logits,
                                     descriptor_affinity=descriptor_logits,
                                     row_index=row_index,
                                     predicted_index=ranked[0],
                                     gold_indices=target_indices,
                                     transpose=component_transpose,
+                                    selected_layer=selected_layer,
                                 ),
                             }
                         )
@@ -729,6 +733,7 @@ def evaluate_correspondence_pairs(
                         )
     return {
         "schema_version": "omnitransfer_correspondence_metrics_v1",
+        "decoder": "confidence_adaptive_last_two",
         "pair_count": len(pair_list),
         "direction_count": len(pair_list) * 2,
         "positive_total": positive_total,
@@ -806,19 +811,17 @@ def _evaluation_node(node: UINode, *, index: int) -> dict[str, Any]:
 def _evaluation_score_components(
     output: dict[str, Any],
     *,
-    assignment_logits: Any,
+    assignment_row: Any,
     descriptor_affinity: Any | None,
     row_index: int,
     predicted_index: int,
     gold_indices: tuple[int, ...],
     transpose: bool,
+    selected_layer: int,
 ) -> dict[str, dict[str, float]]:
     """Expose how each learned or explicit score treats prediction and gold."""
 
-    raw_components = {
-        "log_assignment": assignment_logits,
-        "descriptor_affinity": descriptor_affinity,
-    }
+    raw_components = {"descriptor_affinity": descriptor_affinity}
     model_components = {
         name: output.get(name)
         for name in (
@@ -832,6 +835,17 @@ def _evaluation_score_components(
     if transformer_residuals:
         model_components["transformer_residual"] = transformer_residuals[-1]
     components: dict[str, dict[str, float]] = {}
+    assignment_prediction = float(assignment_row[predicted_index].detach().cpu())
+    assignment_gold = max(
+        float(assignment_row[target_index].detach().cpu())
+        for target_index in gold_indices
+    )
+    components["log_assignment"] = {
+        "prediction": assignment_prediction,
+        "best_gold": assignment_gold,
+        "gold_minus_prediction": assignment_gold - assignment_prediction,
+        "selected_association_layer": float(selected_layer + 1),
+    }
     for name, values in raw_components.items():
         if values is None or getattr(values, "ndim", 0) != 2:
             continue

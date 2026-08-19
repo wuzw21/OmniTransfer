@@ -11,7 +11,7 @@ from typing import Any, Iterable, Mapping
 from omnitransfer.mapping_dataset import validate_ui_correspondence_pair
 
 
-CLEANING_SCHEMA_VERSION = "omnitransfer.mapping_data_cleaning.v1"
+CLEANING_SCHEMA_VERSION = "omnitransfer.mapping_data_cleaning.v2"
 
 
 @dataclass(frozen=True)
@@ -88,7 +88,7 @@ def clean_ui_correspondence_records(
         "source_data_mutated": False,
         "policy": {
             "semantic_unit_expansion": "disabled",
-            "semantic_conflict": "quarantine_exact_match_outside_gold_family",
+            "semantic_conflict": "quarantine_exact_match_outside_gold_endpoints",
             "formal_eval": "never_relabel_in_place",
         },
     }
@@ -122,14 +122,14 @@ def _clean_match(
         for node_id, node in target_nodes.items()
         if direct_source_semantics & _semantic_values(node)
     }
-    exact_in_gold_family = exact_anywhere & target_family
+    exact_in_gold_endpoints = exact_anywhere & set(original_targets)
     if (
         quarantine_conflicts
         and direct_source_semantics
         and exact_anywhere
-        and not exact_in_gold_family
+        and not exact_in_gold_endpoints
     ):
-        return dict(match), "exact_semantic_conflict_outside_gold_family"
+        return dict(match), "exact_semantic_conflict_outside_gold_endpoints"
 
     slices = set(pair_slices)
     source_has_semantics = bool(direct_source_semantics)

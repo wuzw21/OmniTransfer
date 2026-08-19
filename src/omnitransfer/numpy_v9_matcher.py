@@ -225,8 +225,23 @@ class NumpyGeometricAlignmentMatcher:
         min_probability: float,
         min_margin: float,
     ) -> LearnedMatch:
+        assignment_layers = tuple(output.get("assignment_scores_by_layer") or ())
+        affinity_layers = tuple(output.get("affinities_by_layer") or ())
+        selected_layer = len(assignment_layers) - 1
         selected_logits = output["logits_ab"][source_index][candidate_indices].copy()
-        selected_affinity = output["affinity"][source_index][candidate_indices]
+        if len(assignment_layers) >= 2 and len(candidate_indices) >= 2:
+            previous_logits = assignment_layers[-2][source_index][candidate_indices]
+            previous_probability = _softmax(previous_logits, axis=0)
+            final_probability = _softmax(selected_logits, axis=0)
+            previous_top = sorted(previous_probability, reverse=True)[:2]
+            final_top = sorted(final_probability, reverse=True)[:2]
+            if previous_top[0] - previous_top[1] > final_top[0] - final_top[1]:
+                selected_layer = len(assignment_layers) - 2
+                selected_logits = previous_logits.copy()
+        selected_affinity_matrix = (
+            affinity_layers[selected_layer] if affinity_layers else output["affinity"]
+        )
+        selected_affinity = selected_affinity_matrix[source_index][candidate_indices]
         rank_probabilities = _softmax(selected_logits, axis=0)
         match_probabilities = _sigmoid(selected_affinity)
         ranked = sorted(
@@ -314,6 +329,8 @@ class NumpyGeometricAlignmentMatcher:
         source_bases = _typed_relation_bases(source_relations, source_numeric)
         target_bases = _typed_relation_bases(target_relations, target_numeric)
         unary_affinity, _, _ = self._affinity(source_states, target_states)
+        assignments = []
+        affinities = []
         for layer_index in range(self.config.association_layers):
             source_states, target_states = self._contextual_layer(
                 source_states,
@@ -322,6 +339,9 @@ class NumpyGeometricAlignmentMatcher:
                 target_bases,
                 layer_index,
             )
+            layer_affinity, _, _ = self._affinity(source_states, target_states)
+            affinities.append(layer_affinity)
+            assignments.append(_mutual_log_assignment(layer_affinity))
         association_score, source_matchability, target_matchability = self._affinity(
             source_states, target_states
         )
@@ -332,6 +352,8 @@ class NumpyGeometricAlignmentMatcher:
             "association_score": association_score,
             "direct_pair_evidence": direct_evidence,
             "unary_affinity": unary_affinity,
+            "assignment_scores_by_layer": tuple(assignments),
+            "affinities_by_layer": tuple(affinities),
             "source_matchability": source_matchability,
             "target_matchability": target_matchability,
             "source_config_embedding": self._page_embedding(source_states),

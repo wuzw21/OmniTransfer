@@ -114,7 +114,7 @@ def test_cleaner_marks_one_sided_and_textless_local_context() -> None:
     assert "one_sided_semantics" in slices[1]
 
 
-def test_cleaner_quarantines_exact_semantic_conflict_outside_gold_family() -> None:
+def test_cleaner_quarantines_exact_semantic_conflict_outside_gold_endpoints() -> None:
     source = [_node("s", text="Create Account")]
     target = [
         _node("gold", text="Have an account? Sign in"),
@@ -131,9 +131,30 @@ def test_cleaner_quarantines_exact_semantic_conflict_outside_gold_family() -> No
     assert result.cleaned == ()
     assert len(result.quarantine) == 1
     assert result.quarantine[0]["provenance"]["cleaning_reason"] == (
-        "exact_semantic_conflict_outside_gold_family"
+        "exact_semantic_conflict_outside_gold_endpoints"
     )
     assert result.quarantine[0]["provenance"]["cleaning_conflicting_target_node_ids"] == ["other"]
+
+
+def test_cleaner_does_not_treat_parent_child_as_same_gold_endpoint() -> None:
+    source = [_node("s", text="Create Account")]
+    target = [
+        _node("parent", text="Have an account? Sign in", child_ids=["exact"]),
+        _node("exact", text="Create Account", parent_id="parent"),
+    ]
+    record = _record(
+        source,
+        target,
+        {"source_node_id": "s", "target_node_ids": ["parent"], "label": "correspondence"},
+    )
+
+    result = clean_ui_correspondence_records([record])
+
+    assert result.cleaned == ()
+    assert result.quarantine[0]["provenance"]["cleaning_reason"] == (
+        "exact_semantic_conflict_outside_gold_endpoints"
+    )
+    assert result.manifest["parent_child_equivalence"] == "disabled"
 
 
 def test_cleaner_marks_only_comparable_siblings_as_hard_negatives() -> None:

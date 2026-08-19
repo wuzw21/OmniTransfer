@@ -110,3 +110,31 @@ def test_analysis_reports_hard_slice_coverage_instead_of_only_total_size() -> No
     assert report["slices"]["mixed"]["error_rate"] == 1.0
     assert report["training_coverage"]["mixed"] == 4
     assert report["diagnosis"]["dataset_too_small"] == "hard_slices_underrepresented"
+
+
+def test_exact_source_semantics_disagreement_is_pending_label_audit() -> None:
+    row = _prediction(
+        source=_node("s", text="Create Account"),
+        gold=_node("g", text="Have an account? Sign in"),
+        predicted=_node("p", text="Create Account"),
+        descriptor_delta=-0.2,
+        gold_rank=8,
+    )
+
+    report = analyze_prediction_errors([row])
+
+    diagnosis = report["errors"][0]["diagnosis"]
+    assert diagnosis["needs_label_audit"] is True
+    assert diagnosis["label_audit_reason"] == (
+        "prediction_exact_source_semantics_gold_disagrees"
+    )
+    assert report["label_audit"] == {
+        "pending_errors": 1,
+        "reasons": {"prediction_exact_source_semantics_gold_disagrees": 1},
+        "strict_top1_accuracy": 0.0,
+        "top1_accuracy_if_all_pending_gold_are_wrong": 1.0,
+        "policy": (
+            "pending rows remain strict errors until human review; "
+            "never train against or relabel them automatically"
+        ),
+    }
