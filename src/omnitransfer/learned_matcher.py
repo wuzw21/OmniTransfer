@@ -21,7 +21,13 @@ from omnitransfer.ui_graph import (
 )
 
 RELATION_FEATURE_DIM = 18
-XML_NODE_FEATURE_DIM = 32
+LEGACY_XML_NODE_FEATURE_DIM = 32
+PARENT_RELATIVE_LAYOUT_FEATURE_DIM = 6
+NODE_STATE_FEATURE_DIM = 12
+XML_NODE_FEATURE_DIM = (
+    LEGACY_XML_NODE_FEATURE_DIM + PARENT_RELATIVE_LAYOUT_FEATURE_DIM
+)
+STATE_AWARE_XML_NODE_FEATURE_DIM = XML_NODE_FEATURE_DIM + NODE_STATE_FEATURE_DIM
 TEXT_DESCRIPTOR_DIM = 48
 VISUAL_DESCRIPTOR_DIM = 48
 MULTISCALE_VISUAL_DESCRIPTOR_DIM = VISUAL_DESCRIPTOR_DIM * 2
@@ -29,7 +35,9 @@ XML_DESCRIPTOR_DIM = 32
 NODE_DESCRIPTOR_DIM = (
     TEXT_DESCRIPTOR_DIM + VISUAL_DESCRIPTOR_DIM + XML_DESCRIPTOR_DIM
 )
-GEOMETRIC_FEATURE_SCHEMA_ID = "omnitransfer-direct-pair-evidence-v7"
+LEGACY_GEOMETRIC_FEATURE_SCHEMA_ID = "omnitransfer-direct-pair-evidence-v7"
+GEOMETRIC_FEATURE_SCHEMA_ID = "omnitransfer-parent-relative-layout-v8"
+STATE_AWARE_GEOMETRIC_FEATURE_SCHEMA_ID = "omnitransfer-state-aware-v9"
 OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE = (
     "omnitransfer_geometric_alignment_v9"
 )
@@ -90,12 +98,36 @@ ALIGNMENT_RELATION_FEATURE_INDICES = (
     17,
 )
 LEARNED_TOKEN_LOOKUP_ENCODER = "learned_token_lookup"
+HASHED_NGRAM_TEXT_ENCODER = "hashed_ngram_v1"
 DIRECT_TEXT_EVIDENCE_ENCODER = "direct_text_evidence"
+LEGACY_NODE_ANCHOR_ENCODER = "router_anchor_v1"
+SPARSE_NODE_ANCHOR_ENCODER = "sparse_node_anchor_v2"
+DIRECT_CONCAT_NODE_ENCODER = "direct_concat_v1"
+SPARSEMAX_MODALITY_ROUTER = "sparsemax_v1"
+ST_HARD_TOP1_MODALITY_ROUTER = "st_hard_top1_v1"
+NO_MODALITY_ROUTER = "none"
+SOFTMAX_MODALITY_ROUTER = "softmax_v9"
+LEGACY_UNIFORM_TYPED_RELATION_SELECTOR = "uniform_typed_v1"
+LEGACY_SPARSE_USEFUL_NEIGHBOR_SELECTOR = "sparse_useful_v1"
 ALL_NODE_CANDIDATE_POLICY = "all_nodes"
 LEGACY_GLOBAL_POOL_VISUAL_ENCODER = "legacy_global_pool_v1"
 SPATIAL_CNN_VISUAL_ENCODER = "spatial_cnn_v2"
 DETERMINISTIC_ICON_VISUAL_ENCODER = "deterministic_icon_v1"
 MULTISCALE_HASH_VISUAL_ENCODER = "multiscale_hash_v2"
+MULTISCALE_RESIDUAL_VISUAL_ENCODER = "multiscale_residual_v3"
+SEMANTIC_EXACT_DECODER_TOP_K = 0
+SEMANTIC_EXACT_DECODER_MAX_MARGIN = 1.0
+REPLACEMENT_SCORE_UPDATE = "replacement_v1"
+UNARY_RESIDUAL_SCORE_UPDATE = "unary_plus_local_v2"
+FIXED_NEIGHBOR_SELECTION = "fixed_priority_v1"
+LEARNED_NEIGHBOR_SELECTION = "learned_relation_v2"
+
+
+def is_multiscale_visual_encoder(visual_encoder: str) -> bool:
+    return visual_encoder in {
+        MULTISCALE_HASH_VISUAL_ENCODER,
+        MULTISCALE_RESIDUAL_VISUAL_ENCODER,
+    }
 
 
 @dataclass(frozen=True)
@@ -105,12 +137,15 @@ class MatcherConfig:
     vocab_size: int = 8192
     max_tokens: int = 48
     token_dim: int = 48
-    hidden_dim: int = NODE_DESCRIPTOR_DIM
+    hidden_dim: int = 64
     relation_hidden_dim: int = 24
     association_dim: int = 64
-    association_layers: int = 2
+    association_layers: int = 3
     num_heads: int = 4
     dropout: float = 0.05
+    router_policy: str = SOFTMAX_MODALITY_ROUTER
+    router_temperature: float = 0.25
+    router_softmax_leak: float = 0.0
     visual_patch_size: int = 32
     visual_canvas_size: int = 384
     visual_encoder: str = DETERMINISTIC_ICON_VISUAL_ENCODER
@@ -120,15 +155,39 @@ class MatcherConfig:
     architecture: str = OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE
     assignment_head: str = "partial_assignment"
     text_encoder: str = LEARNED_TOKEN_LOOKUP_ENCODER
+    node_anchor_encoder: str = LEGACY_NODE_ANCHOR_ENCODER
     candidate_policy: str = ALL_NODE_CANDIDATE_POLICY
+    direct_pair_evidence: bool = False
+    local_semantic_context: bool = False
+    pairwise_local_correspondence: bool = True
+    correspondence_pair_state: bool = True
+    learned_multi_neighbor_context: bool = True
+    state_embedding_dim: int = 1024
+    semantic_exact_decoder_bonus: float = 0.0
+    semantic_exact_decoder_top_k: int = SEMANTIC_EXACT_DECODER_TOP_K
+    semantic_exact_decoder_max_margin: float = SEMANTIC_EXACT_DECODER_MAX_MARGIN
+    feature_schema_id: str = STATE_AWARE_GEOMETRIC_FEATURE_SCHEMA_ID
+    score_update: str = UNARY_RESIDUAL_SCORE_UPDATE
+    neighbor_selection: str = LEARNED_NEIGHBOR_SELECTION
+    local_neighbor_limit: int = 5
 
 
 def visual_descriptor_dim(visual_encoder: str) -> int:
     return (
         MULTISCALE_VISUAL_DESCRIPTOR_DIM
-        if visual_encoder == MULTISCALE_HASH_VISUAL_ENCODER
+        if is_multiscale_visual_encoder(visual_encoder)
         else VISUAL_DESCRIPTOR_DIM
     )
+
+
+def xml_node_feature_dim(feature_schema_id: str) -> int:
+    if feature_schema_id == LEGACY_GEOMETRIC_FEATURE_SCHEMA_ID:
+        return LEGACY_XML_NODE_FEATURE_DIM
+    if feature_schema_id == GEOMETRIC_FEATURE_SCHEMA_ID:
+        return XML_NODE_FEATURE_DIM
+    if feature_schema_id == STATE_AWARE_GEOMETRIC_FEATURE_SCHEMA_ID:
+        return STATE_AWARE_XML_NODE_FEATURE_DIM
+    raise ValueError(f"unsupported matcher feature schema: {feature_schema_id}")
 
 
 @dataclass(frozen=True)
@@ -166,6 +225,23 @@ class LearnedMatch:
     scores: tuple[tuple[str, float], ...]
 
 
+@dataclass(frozen=True)
+class EncodedPage:
+    """One observation encoded once for page matching and repeated node maps."""
+
+    graph: UIGraph
+    output: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class PageMatch:
+    """One cached all-node score matrix between two encoded observations."""
+
+    source: EncodedPage
+    target: EncodedPage
+    output: dict[str, Any]
+
+
 def encode_graph(
     graph: UIGraph,
     *,
@@ -175,19 +251,36 @@ def encode_graph(
     """Encode UI attributes and pairwise relations without fixed match weights."""
 
     cfg = config or MatcherConfig()
-    feature_schema_id = feature_schema_id or GEOMETRIC_FEATURE_SCHEMA_ID
-    if feature_schema_id != GEOMETRIC_FEATURE_SCHEMA_ID:
+    feature_schema_id = feature_schema_id or cfg.feature_schema_id
+    if feature_schema_id not in {
+        LEGACY_GEOMETRIC_FEATURE_SCHEMA_ID,
+        GEOMETRIC_FEATURE_SCHEMA_ID,
+        STATE_AWARE_GEOMETRIC_FEATURE_SCHEMA_ID,
+    }:
         raise ValueError(f"unsupported matcher feature schema: {feature_schema_id}")
+    relation_context = (
+        _relation_context(graph) if cfg.local_semantic_context else None
+    )
     return EncodedGraph(
         graph_id=graph.graph_id,
         node_ids=tuple(node.node_id for node in graph.nodes),
         origin_ids=tuple(node.origin_id for node in graph.nodes),
         token_ids=tuple(
-            _multimodal_text_token_ids(node, config=cfg)
+            _multimodal_text_token_ids(
+                node,
+                graph=graph,
+                relation_context=relation_context,
+                config=cfg,
+            )
             for node in graph.nodes
         ),
         numeric_features=tuple(
-            _multimodal_xml_features(node, graph) for node in graph.nodes
+            _multimodal_xml_features(
+                node,
+                graph,
+                feature_schema_id=feature_schema_id,
+            )
+            for node in graph.nodes
         ),
         relation_features=_relation_features(graph),
     )
@@ -201,7 +294,10 @@ def cross_relation_features(
 ) -> Any:
     """Return direct pair evidence under the geometric-v9 contract."""
 
-    if feature_schema_id != GEOMETRIC_FEATURE_SCHEMA_ID:
+    if feature_schema_id not in {
+        LEGACY_GEOMETRIC_FEATURE_SCHEMA_ID,
+        GEOMETRIC_FEATURE_SCHEMA_ID,
+    }:
         raise ValueError(f"unsupported matcher feature schema: {feature_schema_id}")
     return tuple(
         tuple(
@@ -244,11 +340,11 @@ def direct_pair_evidence_features(
     target_class_tokens = set(target_class.split())
     source_class_hash = _hashed_attribute_features(
         source.class_name,
-        XML_NODE_FEATURE_DIM - 4,
+        LEGACY_XML_NODE_FEATURE_DIM - 4,
     )
     target_class_hash = _hashed_attribute_features(
         target.class_name,
-        XML_NODE_FEATURE_DIM - 4,
+        LEGACY_XML_NODE_FEATURE_DIM - 4,
     )
     source_toggle = _is_toggle_node(source)
     target_toggle = _is_toggle_node(target)
@@ -300,35 +396,12 @@ def mutual_log_assignment(affinity: Any) -> Any:
     )
 
 
-def confidence_adaptive_assignment_row(
-    output: dict[str, Any],
+def typed_relation_bases(
+    relations: Any,
+    numeric_features: Any,
     *,
-    source_index: int,
-    candidate_indices: Iterable[int],
-    transpose: bool = False,
-) -> tuple[Any, int]:
-    """Select the sharper of the last two shared association layers."""
-
-    candidates = list(candidate_indices)
-    assignment_layers = tuple(output.get("assignment_scores_by_layer") or ())
-    selected_layer = len(assignment_layers) - 1
-    final_matrix = output["logits_ba"] if transpose else output["logits_ab"]
-    selected_logits = final_matrix[source_index][candidates]
-    if len(assignment_layers) < 2 or len(candidates) < 2:
-        return selected_logits, selected_layer
-    previous_matrix = assignment_layers[-2].T if transpose else assignment_layers[-2]
-    previous_logits = previous_matrix[source_index][candidates]
-    torch = _require_torch()
-    previous_probability = torch.softmax(previous_logits, dim=0)
-    final_probability = torch.softmax(selected_logits, dim=0)
-    previous_margin = torch.topk(previous_probability, 2).values.diff().abs()[0]
-    final_margin = torch.topk(final_probability, 2).values.diff().abs()[0]
-    if previous_margin > final_margin:
-        return previous_logits, len(assignment_layers) - 2
-    return selected_logits, selected_layer
-
-
-def typed_relation_bases(relations: Any, numeric_features: Any) -> Any:
+    feature_schema_id: str = GEOMETRIC_FEATURE_SCHEMA_ID,
+) -> Any:
     """Build row-normalized UI relation bases for structured matching."""
 
     torch = _require_torch()
@@ -344,9 +417,11 @@ def typed_relation_bases(relations: Any, numeric_features: Any) -> Any:
     if numeric_features.shape[1] < 4:
         raise ValueError("numeric features must expose action and enabled state")
 
+    xml_node_feature_dim(feature_schema_id)
     identity = relations[..., 0].clamp(0.0, 1.0)
     non_identity = 1.0 - identity
     local = relations[..., 17].clamp(0.0, 1.0) * non_identity
+    sibling = relations[..., 3].clamp(0.0, 1.0)
     same_row = relations[..., 6].clamp(0.0, 1.0) * local
     same_column = relations[..., 7].clamp(0.0, 1.0) * local
     kinship_proximity = (
@@ -374,7 +449,7 @@ def typed_relation_bases(relations: Any, numeric_features: Any) -> Any:
             identity,
             relations[..., 1].clamp(0.0, 1.0),
             relations[..., 2].clamp(0.0, 1.0),
-            relations[..., 3].clamp(0.0, 1.0),
+            sibling,
             relations[..., 4].clamp(0.0, 1.0),
             relations[..., 5].clamp(0.0, 1.0),
             same_row,
@@ -416,6 +491,66 @@ def build_geometric_v9_matcher(
     return build_geometric_matcher(cfg)
 
 
+def _discard_legacy_relation_neighbor_selector(
+    config_payload: dict[str, Any],
+) -> None:
+    selector = config_payload.pop(
+        "relation_neighbor_selector",
+        LEGACY_UNIFORM_TYPED_RELATION_SELECTOR,
+    )
+    if selector == LEGACY_SPARSE_USEFUL_NEIGHBOR_SELECTOR:
+        raise ValueError(
+            "sparse_useful_v1 checkpoints are rejected because the selector "
+            "failed its causal ablation"
+        )
+    if selector != LEGACY_UNIFORM_TYPED_RELATION_SELECTOR:
+        raise ValueError(f"unsupported legacy relation neighbor selector: {selector}")
+
+
+def page_inputs(
+    graph: UIGraph,
+    *,
+    config: MatcherConfig | None = None,
+    device: str | Any = "cpu",
+    feature_schema_id: str | None = None,
+) -> tuple[Any, ...]:
+    """Encode one observation into reusable matcher input tensors."""
+
+    torch = _require_torch()
+    cfg = config or MatcherConfig()
+    feature_schema_id = feature_schema_id or cfg.feature_schema_id
+    encoded = encode_graph(
+        graph,
+        config=cfg,
+        feature_schema_id=feature_schema_id,
+    )
+    token_ids = torch.as_tensor(
+        encoded.token_ids,
+        dtype=torch.long,
+        device=device,
+    )
+    numeric = torch.as_tensor(
+        encoded.numeric_features,
+        dtype=torch.float32,
+        device=device,
+    )
+    relations = torch.as_tensor(
+        encoded.relation_features,
+        dtype=torch.float32,
+        device=device,
+    )
+    visual, visual_mask = _visual_inputs(
+        graph,
+        patch_size=cfg.visual_patch_size,
+        canvas_size=cfg.visual_canvas_size,
+        visual_encoder=cfg.visual_encoder,
+        context_scale=cfg.visual_context_scale,
+        torch=torch,
+        device=device,
+    )
+    return token_ids, numeric, relations, visual, visual_mask
+
+
 def matcher_inputs(
     source: UIGraph,
     target: UIGraph,
@@ -424,93 +559,25 @@ def matcher_inputs(
     device: str | Any = "cpu",
     feature_schema_id: str | None = None,
 ) -> tuple[Any, ...]:
-    """Convert two complete UI graphs to geometric-v9 tensors."""
+    """Convert two observations to the model's stable public input order."""
 
-    torch = _require_torch()
-    cfg = config or MatcherConfig()
-    feature_schema_id = feature_schema_id or GEOMETRIC_FEATURE_SCHEMA_ID
-    encoded_source = encode_graph(
+    source_inputs = page_inputs(
         source,
-        config=cfg,
+        config=config,
+        device=device,
         feature_schema_id=feature_schema_id,
     )
-    encoded_target = encode_graph(
+    target_inputs = page_inputs(
         target,
-        config=cfg,
+        config=config,
+        device=device,
         feature_schema_id=feature_schema_id,
-    )
-    source_token_ids = torch.as_tensor(
-        encoded_source.token_ids,
-        dtype=torch.long,
-        device=device,
-    )
-    target_token_ids = torch.as_tensor(
-        encoded_target.token_ids,
-        dtype=torch.long,
-        device=device,
-    )
-    source_numeric = torch.as_tensor(
-        encoded_source.numeric_features,
-        dtype=torch.float32,
-        device=device,
-    )
-    target_numeric = torch.as_tensor(
-        encoded_target.numeric_features,
-        dtype=torch.float32,
-        device=device,
-    )
-    source_relations = torch.as_tensor(
-        encoded_source.relation_features,
-        dtype=torch.float32,
-        device=device,
-    )
-    target_relations = torch.as_tensor(
-        encoded_target.relation_features,
-        dtype=torch.float32,
-        device=device,
-    )
-    # The contextual matcher compares final node states as one dense matrix.
-    # Keep this compatibility input shape for exporters, but do not rebuild the
-    # retired Python-level candidate-pair evidence table on every mapping.
-    pair_relations = torch.zeros(
-        (
-            len(source.nodes),
-            len(target.nodes),
-            len(DIRECT_PAIR_EVIDENCE_NAMES),
-        ),
-        dtype=torch.float32,
-        device=device,
-    )
-    source_visual, source_visual_mask = _visual_inputs(
-        source,
-        patch_size=cfg.visual_patch_size,
-        canvas_size=cfg.visual_canvas_size,
-        visual_encoder=cfg.visual_encoder,
-        context_scale=cfg.visual_context_scale,
-        torch=torch,
-        device=device,
-    )
-    target_visual, target_visual_mask = _visual_inputs(
-        target,
-        patch_size=cfg.visual_patch_size,
-        canvas_size=cfg.visual_canvas_size,
-        visual_encoder=cfg.visual_encoder,
-        context_scale=cfg.visual_context_scale,
-        torch=torch,
-        device=device,
     )
     return (
-        source_token_ids,
-        source_numeric,
-        source_relations,
-        target_token_ids,
-        target_numeric,
-        target_relations,
-        pair_relations,
-        source_visual,
-        source_visual_mask,
-        target_visual,
-        target_visual_mask,
+        *source_inputs[:3],
+        *target_inputs[:3],
+        *source_inputs[3:],
+        *target_inputs[3:],
     )
 
 
@@ -523,10 +590,12 @@ class GeometricMatcher:
         *,
         config: MatcherConfig | None = None,
         device: str = "cpu",
+        checkpoint_load_mode: str = "fresh_model",
     ) -> None:
         self.model = model
         self.config = config or MatcherConfig()
         self.device = device
+        self.checkpoint_load_mode = checkpoint_load_mode
         self.model.to(device)
         self.model.eval()
 
@@ -542,12 +611,194 @@ class GeometricMatcher:
         config_payload = dict(payload["matcher_config"])
         if "visual_encoder" not in config_payload:
             config_payload["visual_encoder"] = LEGACY_GLOBAL_POOL_VISUAL_ENCODER
+        config_payload.setdefault(
+            "feature_schema_id",
+            LEGACY_GEOMETRIC_FEATURE_SCHEMA_ID,
+        )
+        config_payload.setdefault("correspondence_pair_state", False)
+        config_payload.setdefault("learned_multi_neighbor_context", False)
+        config_payload.setdefault("score_update", REPLACEMENT_SCORE_UPDATE)
+        config_payload.setdefault("neighbor_selection", FIXED_NEIGHBOR_SELECTION)
+        config_payload.setdefault("local_neighbor_limit", 8)
+        _discard_legacy_relation_neighbor_selector(config_payload)
+        if int(config_payload.get("state_embedding_dim") or 0) <= 0:
+            config_payload["state_embedding_dim"] = MatcherConfig().state_embedding_dim
         config = MatcherConfig(**config_payload)
         if config.architecture != OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE:
             raise ValueError("only geometric-v9 checkpoints are supported")
         model = build_geometric_v9_matcher(config)
-        model.load_state_dict(payload["state_dict"])
-        return cls(model, config=config, device=device)
+        state_dict = dict(payload["state_dict"])
+        if payload.get("schema_version") == "omnitransfer.page_local_matcher.v1":
+            target_state = model.state_dict()
+            deprecated = {
+                "local_context_projection.weight",
+                "local_fusion_norm.weight",
+                "local_fusion_norm.bias",
+                "state_to_pair.weight",
+                "page_pair_context.0.weight",
+                "page_pair_context.0.bias",
+                "page_pair_context.1.weight",
+                "page_pair_context.1.bias",
+            }
+            unexpected = set(state_dict).difference(target_state)
+            if unexpected.difference(deprecated):
+                raise ValueError(
+                    "checkpoint contains unsupported parameters: "
+                    + ", ".join(sorted(unexpected.difference(deprecated)))
+                )
+            compatible = {}
+            for name, target in target_state.items():
+                value = state_dict.get(name)
+                if value is None:
+                    continue
+                if value.shape == target.shape:
+                    compatible[name] = value
+                    continue
+                if name in {
+                    "pair_scorer.0.weight",
+                    "pair_scorer.0.bias",
+                } and value.ndim == target.ndim == 1:
+                    compatible[name] = value[: target.shape[0]]
+                    continue
+                if (
+                    name == "pair_scorer.1.weight"
+                    and value.ndim == target.ndim == 2
+                    and value.shape[0] == target.shape[0]
+                    and value.shape[1] > target.shape[1]
+                ):
+                    compatible[name] = value[:, : target.shape[1]]
+            missing = set(target_state).difference(compatible)
+            if missing:
+                raise ValueError(
+                    "checkpoint is missing required parameters: "
+                    + ", ".join(sorted(missing))
+                )
+            model.load_state_dict(compatible)
+            checkpoint_load_mode = (
+                "page_local_matcher_without_preaggregation"
+                if unexpected
+                else "exact_page_local_matcher"
+            )
+        elif "association_layer.transport_output.weight" in state_dict:
+            raise ValueError(
+                "iterative router-anchor checkpoints cannot initialize the "
+                "page-local matcher; retraining is required"
+            )
+        else:
+            migrated_state = model.state_dict()
+            for name, value in state_dict.items():
+                target = migrated_state.get(name)
+                if (
+                    target is not None
+                    and target.shape == value.shape
+                    and not name.startswith("association_layer.")
+                ):
+                    migrated_state[name] = value
+            model.load_state_dict(migrated_state)
+            checkpoint_load_mode = "compatible_encoder_initialization"
+        return cls(
+            model,
+            config=config,
+            device=device,
+            checkpoint_load_mode=checkpoint_load_mode,
+        )
+
+    def encode_page(self, observation: UIGraph) -> EncodedPage:
+        """Encode screenshot, XML, local relations, and state exactly once."""
+
+        torch = _require_torch()
+        inputs = page_inputs(
+            observation,
+            config=self.config,
+            device=self.device,
+            feature_schema_id=self.config.feature_schema_id,
+        )
+        with torch.inference_mode():
+            output = self.model.encode_page(*inputs)
+        return EncodedPage(graph=observation, output=output)
+
+    def match_page(self, source: EncodedPage, target: EncodedPage) -> PageMatch:
+        """Compute the complete correspondence matrix once for two pages."""
+
+        torch = _require_torch()
+        with torch.inference_mode():
+            output = self.model.match_pages(source.output, target.output)
+        return PageMatch(source=source, target=target, output=output)
+
+    def map_node(
+        self,
+        page_match: PageMatch,
+        *,
+        source_node_id: str,
+        candidate_node_ids: Iterable[str] | None = None,
+        min_probability: float = 0.0,
+        min_margin: float = 0.0,
+    ) -> LearnedMatch:
+        """Read one source row from a cached page match without recomputation."""
+
+        torch = _require_torch()
+        source_index = next(
+            (
+                index
+                for index, node in enumerate(page_match.source.graph.nodes)
+                if node.node_id == source_node_id
+            ),
+            None,
+        )
+        if source_index is None:
+            return LearnedMatch(None, 0.0, 0.0, "source_node_missing", ())
+        allowed = set(
+            candidate_node_ids
+            or (node.node_id for node in page_match.target.graph.nodes)
+        )
+        candidate_indices = [
+            index
+            for index, node in enumerate(page_match.target.graph.nodes)
+            if node.node_id in allowed
+        ]
+        if not candidate_indices:
+            return LearnedMatch(None, 0.0, 0.0, "target_candidates_missing", ())
+        with torch.inference_mode():
+            selected_logits = page_match.output["logits_ab"][source_index][
+                candidate_indices
+            ]
+            rank_probabilities = torch.softmax(selected_logits, dim=0)
+            match_probability = float(rank_probabilities.max())
+        ranked = sorted(
+            (
+                (
+                    page_match.target.graph.nodes[index].node_id,
+                    float(rank_probabilities[position]),
+                )
+                for position, index in enumerate(candidate_indices)
+            ),
+            key=lambda item: (-item[1], item[0]),
+        )
+        best_id, best_probability = ranked[0]
+        second_probability = max(
+            (score for _, score in ranked[1:]),
+            default=0.0,
+        )
+        margin = best_probability - second_probability
+        scores = tuple(ranked)
+        if match_probability < min_probability or margin <= min_margin:
+            return LearnedMatch(
+                None,
+                match_probability,
+                margin,
+                "learned_low_confidence",
+                scores,
+            )
+        target_node = next(
+            node for node in page_match.target.graph.nodes if node.node_id == best_id
+        )
+        return LearnedMatch(
+            target_node,
+            match_probability,
+            margin,
+            "learned_match",
+            scores,
+        )
 
     def predict(
         self,
@@ -559,7 +810,6 @@ class GeometricMatcher:
         min_probability: float = 0.0,
         min_margin: float = 0.0,
     ) -> LearnedMatch:
-        torch = _require_torch()
         source_node = next(
             (node for node in source.nodes if node.node_id == source_node_id),
             None,
@@ -590,7 +840,13 @@ class GeometricMatcher:
         target_context = multi_anchor_context_graph(
             target,
             anchor_node_ids=allowed,
-            max_nodes=max(self.config.target_context_nodes, len(allowed)),
+            max_nodes=min(
+                len(target.nodes),
+                max(
+                    self.config.target_context_nodes,
+                    len(allowed) + 3 * self.config.local_neighbor_limit,
+                ),
+            ),
         )
         candidate_indices = [
             index
@@ -599,59 +855,17 @@ class GeometricMatcher:
         ]
         if not candidate_indices:
             return LearnedMatch(None, 0.0, 0.0, "target_candidates_missing", ())
-        inputs = matcher_inputs(
-            source_context,
-            target_context,
-            config=self.config,
-            device=self.device,
-            feature_schema_id=GEOMETRIC_FEATURE_SCHEMA_ID,
-        )
-        with torch.no_grad():
-            output = self.model(*inputs)
-            affinity_layers = tuple(output.get("affinities_by_layer") or ())
-            selected_logits, selected_layer = confidence_adaptive_assignment_row(
-                output,
-                source_index=source_index,
-                candidate_indices=candidate_indices,
-            )
-            selected_affinity_matrix = (
-                affinity_layers[selected_layer]
-                if affinity_layers
-                else output["affinity"]
-            )
-            selected_affinity = selected_affinity_matrix[source_index][candidate_indices]
-            rank_probabilities = torch.softmax(selected_logits, dim=0)
-            match_probabilities = torch.sigmoid(selected_affinity)
-        ranked = sorted(
-            (
-                (
-                    target_context.nodes[index].node_id,
-                    float(rank_probabilities[position]),
-                )
-                for position, index in enumerate(candidate_indices)
+        source_page = self.encode_page(source_context)
+        target_page = self.encode_page(target_context)
+        page_match = self.match_page(source_page, target_page)
+        return self.map_node(
+            page_match,
+            source_node_id=source_node_id,
+            candidate_node_ids=(
+                target_context.nodes[index].node_id for index in candidate_indices
             ),
-            key=lambda item: (-item[1], item[0]),
-        )
-        best_id, best_probability = ranked[0]
-        best_position = next(
-            position
-            for position, index in enumerate(candidate_indices)
-            if target_context.nodes[index].node_id == best_id
-        )
-        match_probability = float(match_probabilities[best_position])
-        second_probability = max(
-            (score for _, score in ranked[1:]),
-            default=0.0,
-        )
-        margin = best_probability - second_probability
-        scores = tuple(ranked)
-        if match_probability < min_probability or margin < min_margin:
-            return LearnedMatch(
-                None, match_probability, margin, "learned_low_confidence", scores
-            )
-        target_node = next(node for node in target.nodes if node.node_id == best_id)
-        return LearnedMatch(
-            target_node, match_probability, margin, "learned_match", scores
+            min_probability=min_probability,
+            min_margin=min_margin,
         )
 
 
@@ -675,13 +889,111 @@ def save_matcher_checkpoint(
         raise ValueError("only geometric-v9 checkpoints are supported")
     torch.save(
         {
-            "schema_version": "omnitransfer.learned_geometric_alignment.v9",
+            "schema_version": "omnitransfer.page_local_matcher.v1",
             "matcher_config": asdict(config),
             "state_dict": model.state_dict(),
             "metadata": dict(metadata or {}),
         },
         output,
     )
+
+
+NODE_ENCODER_PARAMETER_PREFIXES = (
+    "token_embedding.",
+    "text_projection.",
+    "xml_projection.",
+    "visual_encoder.",
+    "present_text",
+    "missing_text",
+    "missing_visual",
+    "text_to_hidden.",
+    "visual_to_hidden.",
+    "xml_to_hidden.",
+    "modality_type",
+    "modality_score.",
+    "input_norm.",
+    "input_feed_forward.",
+    "input_output_norm.",
+    "logit_scale",
+)
+V9_BACKBONE_PARAMETER_PREFIXES = (
+    *NODE_ENCODER_PARAMETER_PREFIXES,
+    "relation_compatibility",
+    "association_layers.",
+    "matchability_head.",
+    "page_attention.",
+)
+
+
+def initialize_node_encoder_from_checkpoint(
+    model: Any,
+    checkpoint: str | Path,
+) -> tuple[str, ...]:
+    """Load only compatible node/unary parameters into a fresh matcher."""
+
+    return _initialize_parameters_from_checkpoint(
+        model,
+        checkpoint,
+        prefixes=NODE_ENCODER_PARAMETER_PREFIXES,
+        description="node encoder",
+    )
+
+
+def initialize_v9_backbone_from_checkpoint(
+    model: Any,
+    checkpoint: str | Path,
+) -> tuple[str, ...]:
+    """Restore the trained v9 backbone while leaving new local fusion fresh."""
+
+    return _initialize_parameters_from_checkpoint(
+        model,
+        checkpoint,
+        prefixes=V9_BACKBONE_PARAMETER_PREFIXES,
+        description="v9 backbone",
+    )
+
+
+def _initialize_parameters_from_checkpoint(
+    model: Any,
+    checkpoint: str | Path,
+    *,
+    prefixes: tuple[str, ...],
+    description: str,
+) -> tuple[str, ...]:
+    """Load a named compatible subset, widening the current XML input safely."""
+
+    torch = _require_torch()
+    payload = torch.load(Path(checkpoint), map_location="cpu")
+    source_state = dict(payload["state_dict"])
+    target_state = model.state_dict()
+    transferred: list[str] = []
+    for name, source_value in source_state.items():
+        if not name.startswith(prefixes):
+            continue
+        target_value = target_state.get(name)
+        if target_value is None:
+            continue
+        if (
+            name == "xml_projection.1.weight"
+            and target_value.ndim == source_value.ndim == 2
+            and target_value.shape[0] == source_value.shape[0]
+            and target_value.shape[1] > source_value.shape[1]
+        ):
+            widened = target_value.detach().clone().zero_()
+            widened[:, : source_value.shape[1]] = source_value.to(
+                target_value.device
+            )
+            target_state[name] = widened
+            transferred.append(name)
+            continue
+        if target_value.shape != source_value.shape:
+            continue
+        target_state[name] = source_value.to(target_value.device)
+        transferred.append(name)
+    if not transferred:
+        raise ValueError(f"checkpoint has no compatible {description} parameters")
+    model.load_state_dict(target_state)
+    return tuple(sorted(transferred))
 
 
 def parameter_count(model: Any) -> int:
@@ -733,12 +1045,34 @@ def initialize_nonvisual_from_model(
     target_model: Any,
     source_model: Any,
 ) -> tuple[str, ...]:
-    """Migrate geometric-v9 while replacing only its visual encoder."""
+    """Migrate compatible geometric-v9 weights into a rebuilt encoder."""
 
     source_state = source_model.state_dict()
     target_state = target_model.state_dict()
     transferred: list[str] = []
     for target_name, target_value in target_state.items():
+        if target_name.startswith("visual_encoder.features."):
+            source_name = target_name.replace(
+                "visual_encoder.features.",
+                "visual_encoder.",
+                1,
+            )
+            source_value = source_state.get(source_name)
+            if source_value is not None and source_value.shape == target_value.shape:
+                target_state[target_name] = source_value.detach().clone()
+                transferred.append(target_name)
+            continue
+        if target_name.startswith("visual_encoder.dense_readout."):
+            source_name = target_name.replace(
+                "visual_encoder.dense_readout.",
+                "visual_encoder.9.",
+                1,
+            )
+            source_value = source_state.get(source_name)
+            if source_value is not None and source_value.shape == target_value.shape:
+                target_state[target_name] = source_value.detach().clone()
+                transferred.append(target_name)
+            continue
         if target_name.startswith("visual_encoder."):
             continue
         source_value = source_state.get(target_name)
@@ -765,7 +1099,68 @@ def initialize_nonvisual_from_model(
             target_state[target_name] = widened
             transferred.append(target_name)
             continue
+        if (
+            source_value is not None
+            and target_name == "visual_to_hidden.weight"
+            and target_value.ndim == source_value.ndim == 2
+            and target_value.shape[0] == source_value.shape[0]
+            and source_value.shape[1] == target_value.shape[1] * 2
+        ):
+            target_state[target_name] = source_value[
+                :, : target_value.shape[1]
+            ].detach().clone()
+            transferred.append(target_name)
+            continue
+        if target_name == "visual_context_to_hidden.weight":
+            widened_source = source_state.get("visual_to_hidden.weight")
+            residual = target_value.detach().clone().zero_()
+            if (
+                widened_source is not None
+                and widened_source.ndim == residual.ndim == 2
+                and widened_source.shape[0] == residual.shape[0]
+                and widened_source.shape[1] == residual.shape[1] * 2
+            ):
+                residual.copy_(widened_source[:, residual.shape[1] :])
+            target_state[target_name] = residual
+            transferred.append(target_name)
+            continue
         if source_value is None or source_value.shape != target_value.shape:
+            if target_name.startswith("association_layer.") or (
+                target_name.startswith("direct_pair_projection.")
+            ) or (
+                ".pairwise_relation_projection." in target_name
+            ) or (
+                ".pairwise_gate." in target_name
+            ) or (
+                ".pair_state_" in target_name
+            ) or (
+                ".source_pair_feedback." in target_name
+            ) or (
+                ".target_pair_feedback." in target_name
+            ) or (
+                ".neighbor_" in target_name
+            ) or (
+                target_name.startswith("state_embedding_projection.")
+            ) or (
+                target_name.startswith("stable_state_")
+            ) or (
+                target_name.startswith("active_state_")
+            ) or (
+                target_name.startswith("active_state_decoder.")
+            ) or (
+                target_name.startswith("stable_pair_state_bridge.")
+            ) or (
+                target_name.startswith("active_pair_state_bridge.")
+            ) or (
+                target_name == "layout_projection.weight"
+            ) or (
+                target_name == "state_projection.weight"
+            ) or (
+                target_name.startswith("text_token_")
+            ) or (
+                target_name.startswith("xml_anchor_")
+            ):
+                continue
             if target_name == "missing_visual" or target_name.startswith(
                 "visual_to_hidden."
             ):
@@ -804,7 +1199,7 @@ def _visual_inputs(
     device: str | Any,
 ) -> tuple[Any, Any]:
     screenshot_path = str(graph.metadata.get("screenshot_path") or "")
-    channels = 6 if visual_encoder == MULTISCALE_HASH_VISUAL_ENCODER else 3
+    channels = 6 if is_multiscale_visual_encoder(visual_encoder) else 3
     empty = torch.zeros(
         (len(graph.nodes), channels, patch_size, patch_size),
         dtype=torch.float32,
@@ -869,7 +1264,7 @@ def _visual_inputs(
         torch=torch,
         device=device,
     )
-    if visual_encoder == MULTISCALE_HASH_VISUAL_ENCODER:
+    if is_multiscale_visual_encoder(visual_encoder):
         context_boxes = torch.as_tensor(
             normalized_context_boxes,
             dtype=torch.float32,
@@ -1004,11 +1399,25 @@ def _load_rgb_array(
         return np.array(image, dtype=np.uint8, copy=True), original_size
 
 
+def configure_visual_image_cache(maxsize: int) -> int:
+    """Resize the process-local decoded screenshot cache without changing runtime."""
+
+    if maxsize <= 0:
+        raise ValueError("visual image cache size must be positive")
+    global _load_rgb_array
+    uncached_loader = getattr(_load_rgb_array, "__wrapped__", _load_rgb_array)
+    _load_rgb_array.cache_clear()
+    _load_rgb_array = lru_cache(maxsize=int(maxsize))(uncached_loader)
+    return int(maxsize)
+
+
 
 
 def _multimodal_text_token_ids(
     node: UINode,
     *,
+    graph: UIGraph,
+    relation_context: _RelationContext | None,
     config: MatcherConfig,
 ) -> tuple[int, ...]:
     pieces: list[str] = []
@@ -1029,6 +1438,31 @@ def _multimodal_text_token_ids(
                     f"{field_name}:ngram:{padded[index : index + 3]}"
                     for index in range(len(padded) - 2)
                 )
+    if (
+        config.local_semantic_context
+        and not _semantic_fields(node)
+    ):
+        if relation_context is None:
+            raise ValueError("local semantic context requires relation context")
+        for relation, anchor in _local_semantic_anchors(
+            node,
+            graph,
+            relation_context=relation_context,
+        ):
+            pieces.append(f"context:relation:{relation}")
+            for value in (anchor.text, anchor.content_desc):
+                normalized = _normalize_text(value)
+                if not normalized:
+                    continue
+                for word in re.findall(r"[^\W_]+", normalized, flags=re.UNICODE):
+                    for field_name in ("text", "desc"):
+                        pieces.append(f"{field_name}:word:{word}")
+                        if len(word) >= 3:
+                            padded = f"^{word}$"
+                            pieces.extend(
+                                f"{field_name}:ngram:{padded[index : index + 3]}"
+                                for index in range(len(padded) - 2)
+                            )
     token_ids: list[int] = []
     seen: set[int] = set()
     for piece in pieces:
@@ -1042,6 +1476,58 @@ def _multimodal_text_token_ids(
     return tuple(token_ids + [0] * (config.max_tokens - len(token_ids)))
 
 
+def _local_semantic_anchors(
+    node: UINode,
+    graph: UIGraph,
+    *,
+    relation_context: _RelationContext | None = None,
+) -> tuple[tuple[str, UINode], ...]:
+    """Return the nearest labelled relatives without changing node identity."""
+
+    context = relation_context or _relation_context(graph)
+    node_index = context.node_indices[node.node_id]
+    node_center = context.centers[node_index]
+    candidates: list[tuple[int, float, int, str, UINode]] = []
+    for index, candidate in enumerate(graph.nodes):
+        if candidate.node_id == node.node_id or not _semantic_fields(candidate):
+            continue
+        tree_distance = _context_tree_distance(
+            node.node_id,
+            candidate.node_id,
+            context,
+        )
+        candidate_center = context.centers[index]
+        spatial_distance = math.hypot(
+            candidate_center[0] - node_center[0],
+            candidate_center[1] - node_center[1],
+        )
+        if candidate.parent_id == node.node_id:
+            relation = "child"
+            priority = 0
+        elif node.parent_id == candidate.node_id:
+            relation = "parent"
+            priority = 0
+        elif node.parent_id and node.parent_id == candidate.parent_id:
+            relation = "sibling"
+            priority = 1
+        elif tree_distance <= 3:
+            relation = "local_branch"
+            priority = 2
+        elif spatial_distance <= 0.15:
+            relation = "spatial_neighbor"
+            priority = 3
+        else:
+            continue
+        candidates.append(
+            (priority, spatial_distance, index, relation, candidate)
+        )
+    if not candidates:
+        return ()
+    candidates.sort(key=lambda value: value[:3])
+    _, _, _, relation, candidate = candidates[0]
+    return ((relation, candidate),)
+
+
 
 
 
@@ -1053,6 +1539,8 @@ def _multimodal_text_token_ids(
 def _multimodal_xml_features(
     node: UINode,
     graph: UIGraph,
+    *,
+    feature_schema_id: str,
 ) -> tuple[float, ...]:
     bbox = _normalized_bbox(node.bbox, graph)
     if bbox is None:
@@ -1068,11 +1556,7 @@ def _multimodal_xml_features(
             1.0,
         )
         has_bbox = 1.0
-    class_features = _hashed_attribute_features(
-        node.class_name,
-        XML_NODE_FEATURE_DIM - 10,
-    )
-    values = (
+    common = (
         float(node.clickable),
         float(node.editable),
         float(node.scrollable),
@@ -1083,11 +1567,108 @@ def _multimodal_xml_features(
         area,
         aspect,
         min(float(node.depth) / 32.0, 1.0),
-        *class_features,
     )
-    if len(values) != XML_NODE_FEATURE_DIM:
+    class_features = _hashed_attribute_features(
+        node.class_name,
+        LEGACY_XML_NODE_FEATURE_DIM - len(common),
+    )
+    legacy_values = (*common, *class_features)
+    if feature_schema_id == LEGACY_GEOMETRIC_FEATURE_SCHEMA_ID:
+        values = legacy_values
+    elif feature_schema_id == GEOMETRIC_FEATURE_SCHEMA_ID:
+        values = (
+            *legacy_values,
+            *_parent_relative_layout_features(node, graph),
+        )
+    elif feature_schema_id == STATE_AWARE_GEOMETRIC_FEATURE_SCHEMA_ID:
+        values = (
+            *legacy_values,
+            *_parent_relative_layout_features(node, graph),
+            *_node_state_features(node),
+        )
+    else:
+        raise ValueError(f"unsupported matcher feature schema: {feature_schema_id}")
+    if len(values) != xml_node_feature_dim(feature_schema_id):
         raise AssertionError("unexpected XML node feature dimension")
     return values
+
+
+def _node_state_features(node: UINode) -> tuple[float, ...]:
+    values = []
+    for name in (
+        "visible",
+        "checked",
+        "selected",
+        "focused",
+        "expanded",
+        "password",
+    ):
+        values.extend(
+            (
+                float(bool(node.metadata.get(name, False))),
+                float(bool(node.metadata.get(f"{name}_present", False))),
+            )
+        )
+    return tuple(values)
+
+
+def _parent_relative_layout_features(
+    node: UINode,
+    graph: UIGraph,
+) -> tuple[float, ...]:
+    nodes_by_id = {candidate.node_id: candidate for candidate in graph.nodes}
+    parent = nodes_by_id.get(node.parent_id or "")
+    siblings = parent.child_ids if parent is not None else (node.node_id,)
+    try:
+        sibling_index = siblings.index(node.node_id)
+    except ValueError:
+        sibling_index = 0
+    sibling_count = max(len(siblings), 1)
+    sibling_position = (
+        float(sibling_index) / float(sibling_count - 1)
+        if sibling_count > 1
+        else 0.5
+    )
+    sibling_count_feature = min(math.log2(float(sibling_count) + 1.0) / 6.0, 1.0)
+
+    node_bbox = _normalized_bbox(node.bbox, graph)
+    parent_bbox = _normalized_bbox(parent.bbox, graph) if parent is not None else None
+    if node_bbox is None or parent_bbox is None:
+        parent_center_x = parent_center_y = 0.0
+        parent_width = parent_height = 0.0
+    else:
+        parent_box_width = max(parent_bbox[2] - parent_bbox[0], 1e-6)
+        parent_box_height = max(parent_bbox[3] - parent_bbox[1], 1e-6)
+        node_center_x = (node_bbox[0] + node_bbox[2]) / 2.0
+        node_center_y = (node_bbox[1] + node_bbox[3]) / 2.0
+        parent_center_x = _clip(
+            2.0 * (node_center_x - parent_bbox[0]) / parent_box_width - 1.0,
+            -1.0,
+            1.0,
+        )
+        parent_center_y = _clip(
+            2.0 * (node_center_y - parent_bbox[1]) / parent_box_height - 1.0,
+            -1.0,
+            1.0,
+        )
+        parent_width = _clip(
+            (node_bbox[2] - node_bbox[0]) / parent_box_width,
+            0.0,
+            1.0,
+        )
+        parent_height = _clip(
+            (node_bbox[3] - node_bbox[1]) / parent_box_height,
+            0.0,
+            1.0,
+        )
+    return (
+        2.0 * sibling_position - 1.0,
+        sibling_count_feature,
+        parent_center_x,
+        parent_center_y,
+        parent_width,
+        parent_height,
+    )
 
 
 def _hashed_attribute_features(value: str, dimension: int) -> tuple[float, ...]:
@@ -1207,6 +1788,15 @@ def _relation_matrix(
     target_centers = np.asarray(target_context.centers, dtype=np.float32)
     source_sizes = np.asarray(source_context.sizes, dtype=np.float32)
     target_sizes = np.asarray(target_context.sizes, dtype=np.float32)
+    source_bbox_present = np.asarray(
+        [bbox is not None for bbox in source_context.bboxes],
+        dtype=bool,
+    )
+    target_bbox_present = np.asarray(
+        [bbox is not None for bbox in target_context.bboxes],
+        dtype=bool,
+    )
+    bbox_pair_present = source_bbox_present[:, None] & target_bbox_present[None, :]
     delta_x = target_centers[None, :, 0] - source_centers[:, None, 0]
     delta_y = target_centers[None, :, 1] - source_centers[:, None, 1]
     source_width = source_sizes[:, None, 0]
@@ -1220,7 +1810,7 @@ def _relation_matrix(
             0.02,
         )
         * 0.5
-    )
+    ) & bbox_pair_present
     same_column = (
         np.abs(delta_x)
         <= np.maximum(
@@ -1228,7 +1818,7 @@ def _relation_matrix(
             0.02,
         )
         * 0.5
-    )
+    ) & bbox_pair_present
     overlap = _pairwise_iou(source_context.bboxes, target_context.bboxes, np=np)
     parent = np.zeros((source_count, target_count), dtype=bool)
     child = np.zeros_like(parent)
@@ -1291,23 +1881,54 @@ def _relation_matrix(
     values[..., 6] = same_row
     values[..., 7] = same_column
     values[..., 8] = overlap > 0.0
-    values[..., 9] = np.clip(delta_x, -1.0, 1.0)
-    values[..., 10] = np.clip(delta_y, -1.0, 1.0)
-    values[..., 11] = np.minimum(np.abs(delta_x), 1.0)
-    values[..., 12] = np.minimum(np.abs(delta_y), 1.0)
-    values[..., 13] = np.clip(
-        np.log(np.maximum(target_width, 1e-6) / np.maximum(source_width, 1e-6)) / 4.0,
-        -1.0,
-        1.0,
+    values[..., 9] = np.where(
+        bbox_pair_present, np.clip(delta_x, -1.0, 1.0), 0.0
     )
-    values[..., 14] = np.clip(
-        np.log(np.maximum(target_height, 1e-6) / np.maximum(source_height, 1e-6)) / 4.0,
-        -1.0,
-        1.0,
+    values[..., 10] = np.where(
+        bbox_pair_present, np.clip(delta_y, -1.0, 1.0), 0.0
     )
-    values[..., 15] = overlap
+    values[..., 11] = np.where(
+        bbox_pair_present, np.minimum(np.abs(delta_x), 1.0), 0.0
+    )
+    values[..., 12] = np.where(
+        bbox_pair_present, np.minimum(np.abs(delta_y), 1.0), 0.0
+    )
+    values[..., 13] = np.where(
+        bbox_pair_present,
+        np.clip(
+            np.log(
+                np.maximum(target_width, 1e-6)
+                / np.maximum(source_width, 1e-6)
+            )
+            / 4.0,
+            -1.0,
+            1.0,
+        ),
+        0.0,
+    )
+    values[..., 14] = np.where(
+        bbox_pair_present,
+        np.clip(
+            np.log(
+                np.maximum(target_height, 1e-6)
+                / np.maximum(source_height, 1e-6)
+            )
+            / 4.0,
+            -1.0,
+            1.0,
+        ),
+        0.0,
+    )
+    values[..., 15] = np.where(bbox_pair_present, overlap, 0.0)
     values[..., 16] = np.minimum(tree_distance / 16.0, 1.0)
-    values[..., 17] = sibling | parent | child | (np.hypot(delta_x, delta_y) <= 0.25)
+    values[..., 17] = (
+        sibling
+        | parent
+        | child
+        | ancestor
+        | descendant
+        | (bbox_pair_present & (np.hypot(delta_x, delta_y) <= 0.25))
+    )
     return values
 
 
@@ -1594,6 +2215,83 @@ def _token_bucket(piece: str, vocab_size: int) -> int:
         raise ValueError("vocab_size must be at least 2")
     digest = hashlib.blake2b(piece.encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(digest, "big") % (vocab_size - 1) + 1
+
+
+def hashed_ngram_descriptor_torch(token_ids: Any, *, torch: Any) -> Any:
+    """Create a fixed CountSketch-style descriptor from hashed text pieces."""
+
+    if token_ids.ndim != 2:
+        raise ValueError("token_ids must be a two-dimensional tensor")
+    token_ids = token_ids.to(dtype=torch.long)
+    valid = token_ids.gt(0)
+    descriptor = torch.zeros(
+        (token_ids.shape[0], TEXT_DESCRIPTOR_DIM),
+        dtype=torch.float32,
+        device=token_ids.device,
+    )
+    bucket_multipliers = (1315423911, 2654435761, 374761393, 668265263)
+    sign_multipliers = (31, 131, 911, 3571)
+    offsets = (17, 31, 47, 73)
+    for bucket_multiplier, sign_multiplier, offset in zip(
+        bucket_multipliers,
+        sign_multipliers,
+        offsets,
+        strict=True,
+    ):
+        buckets = torch.remainder(
+            token_ids * bucket_multiplier + offset,
+            TEXT_DESCRIPTOR_DIM,
+        )
+        signs = torch.where(
+            torch.remainder(token_ids * sign_multiplier + offset, 2).eq(0),
+            torch.ones_like(token_ids, dtype=torch.float32),
+            -torch.ones_like(token_ids, dtype=torch.float32),
+        )
+        descriptor.scatter_add_(1, buckets, signs * valid.to(torch.float32))
+    count = valid.sum(dim=1, keepdim=True).clamp_min(1).to(torch.float32)
+    return descriptor / count
+
+
+def hashed_ngram_descriptor_numpy(token_ids: Any) -> Any:
+    """NumPy counterpart of the fixed signed text descriptor."""
+
+    np = _require_numpy()
+    token_ids = np.asarray(token_ids, dtype=np.int64)
+    if token_ids.ndim != 2:
+        raise ValueError("token_ids must be a two-dimensional array")
+    valid = token_ids > 0
+    descriptor = np.zeros(
+        (token_ids.shape[0], TEXT_DESCRIPTOR_DIM),
+        dtype=np.float32,
+    )
+    bucket_multipliers = (1315423911, 2654435761, 374761393, 668265263)
+    sign_multipliers = (31, 131, 911, 3571)
+    offsets = (17, 31, 47, 73)
+    rows = np.broadcast_to(
+        np.arange(token_ids.shape[0])[:, None],
+        token_ids.shape,
+    )
+    for bucket_multiplier, sign_multiplier, offset in zip(
+        bucket_multipliers,
+        sign_multipliers,
+        offsets,
+        strict=True,
+    ):
+        buckets = (
+            token_ids * bucket_multiplier + offset
+        ) % TEXT_DESCRIPTOR_DIM
+        signs = np.where(
+            (token_ids * sign_multiplier + offset) % 2 == 0,
+            1.0,
+            -1.0,
+        )
+        np.add.at(
+            descriptor,
+            (rows, buckets),
+            (signs * valid).astype(np.float32),
+        )
+    count = np.maximum(valid.sum(axis=1, keepdims=True), 1).astype(np.float32)
+    return descriptor / count
 
 
 def _clip(value: float, minimum: float, maximum: float) -> float:

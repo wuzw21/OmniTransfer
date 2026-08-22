@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field, replace
 import json
 import math
@@ -11,6 +12,8 @@ from typing import Any, Iterable
 
 
 BBox = tuple[float, float, float, float]
+
+_XML_OBSERVATION_ALIAS_PATHS = "_omnitransfer_observation_alias_paths"
 
 
 @dataclass(frozen=True)
@@ -435,13 +438,42 @@ def _looks_like_flat_node_container(payload: dict[str, Any]) -> bool:
 
 def _nodes_from_flat_list(items: list[Any]) -> list[UINode]:
     raw_nodes = [item for item in items if isinstance(item, dict)]
+    declared_ids = [
+        _node_id_from_payload(item, fallback=str(index))
+        for index, item in enumerate(raw_nodes)
+    ]
     node_ids: list[str] = []
-    for index, item in enumerate(raw_nodes):
-        node_ids.append(_node_id_from_payload(item, fallback=str(index)))
+    used_ids: set[str] = set()
+    for index, declared_id in enumerate(declared_ids):
+        node_id = declared_id
+        suffix = index
+        while node_id in used_ids:
+            node_id = f"{declared_id}#{suffix}"
+            suffix += 1
+        node_ids.append(node_id)
+        used_ids.add(node_id)
+    internal_ids_by_declared: dict[str, list[tuple[int, str]]] = {}
+    for index, (declared_id, node_id) in enumerate(
+        zip(declared_ids, node_ids, strict=True)
+    ):
+        internal_ids_by_declared.setdefault(declared_id, []).append((index, node_id))
+
+    def resolve_parent(index: int, item: dict[str, Any]) -> str | None:
+        declared_parent = _parent_id_from_payload(item)
+        if declared_parent is None:
+            return None
+        candidates = internal_ids_by_declared.get(declared_parent, ())
+        if not candidates:
+            return declared_parent if declared_parent in used_ids else None
+        preceding = [candidate for candidate in candidates if candidate[0] < index]
+        return (preceding[-1] if preceding else candidates[0])[1]
+
     children_by_parent: dict[str | None, list[str]] = {}
     parent_by_id = {
-        node_id: _parent_id_from_payload(item)
-        for item, node_id in zip(raw_nodes, node_ids, strict=True)
+        node_id: resolve_parent(index, item)
+        for index, (item, node_id) in enumerate(
+            zip(raw_nodes, node_ids, strict=True)
+        )
     }
     depths = _depths_from_parents(parent_by_id)
     for node_id, parent_id in parent_by_id.items():
@@ -492,7 +524,8 @@ def _nodes_from_nested_tree(root: dict[str, Any]) -> list[UINode]:
 
 
 def _graph_from_xml(xml_text: str, *, graph_id: str, width: float | None, height: float | None) -> UIGraph:
-    root = ET.fromstring(xml_text)
+    raw_root = ET.fromstring(xml_text)
+    root, aliases_collapsed = _canonicalize_xml_capture_aliases(raw_root)
     nodes: list[UINode] = []
 
     declared_width, declared_height = _xml_screen_size(root)
@@ -533,7 +566,98 @@ def _graph_from_xml(xml_text: str, *, graph_id: str, width: float | None, height
         nodes=tuple(nodes),
         width=width,
         height=height,
-        metadata={"source_format": "xml"},
+        metadata={
+            "source_format": "xml",
+            "observation_aliases_collapsed": aliases_collapsed,
+        },
+    )
+
+
+def _canonicalize_xml_capture_aliases(
+    root: ET.Element,
+) -> tuple[ET.Element, int]:
+    """Collapse repeated observations of the same visible XML hit region.
+
+    Some Android dumps concatenate several captures of one scroll container
+    under the same window root.  Those copies are Raw Node aliases, not distinct
+    visible controls.  A stable resource ID is only used to identify aliases
+    inside one observation and one exact hit region; it is never used as a
+    cross-observation correspondence answer.
+    """
+
+    aliases_collapsed = 0
+
+    def canonical(
+        aliases: list[tuple[ET.Element, str]],
+    ) -> ET.Element:
+        nonlocal aliases_collapsed
+        first, _ = aliases[0]
+        element = copy.copy(first)
+        element[:] = []
+        original_paths = tuple(path for _, path in aliases)
+        if len(original_paths) > 1:
+            aliases_collapsed += len(original_paths) - 1
+            element.attrib[_XML_OBSERVATION_ALIAS_PATHS] = json.dumps(
+                original_paths,
+                ensure_ascii=False,
+            )
+
+        child_groups: list[list[tuple[ET.Element, str]]] = []
+        child_group_indices: dict[tuple[Any, ...], int] = {}
+        for alias, alias_path in aliases:
+            for child_index, child in enumerate(list(alias)):
+                child_path = f"{alias_path}.{child_index}"
+                key = _xml_capture_alias_key(child)
+                group_index = child_group_indices.get(key)
+                if group_index is None:
+                    child_group_indices[key] = len(child_groups)
+                    child_groups.append([(child, child_path)])
+                else:
+                    child_groups[group_index].append((child, child_path))
+        for group in child_groups:
+            element.append(canonical(group))
+        return element
+
+    return canonical([(root, "0")]), aliases_collapsed
+
+
+def _xml_capture_alias_key(element: ET.Element) -> tuple[Any, ...]:
+    attributes = element.attrib
+    class_name = str(attributes.get("class") or element.tag.rsplit("}", 1)[-1])
+    resource_id = str(
+        attributes.get("resource-id")
+        or attributes.get("resource_id")
+        or ""
+    )
+    bbox = _bounds_from_payload(attributes)
+    if resource_id and bbox is not None:
+        return (
+            "stable-hit-region",
+            class_name,
+            resource_id,
+            bbox,
+            str(attributes.get("text") or ""),
+            str(attributes.get("content-desc") or attributes.get("content_desc") or ""),
+            str(attributes.get("clickable") or ""),
+            str(attributes.get("enabled") or ""),
+            str(attributes.get("selected") or ""),
+            str(attributes.get("checked") or ""),
+        )
+    return ("exact-subtree", _xml_subtree_fingerprint(element))
+
+
+def _xml_subtree_fingerprint(element: ET.Element) -> tuple[Any, ...]:
+    attributes = tuple(
+        sorted(
+            (str(key), str(value))
+            for key, value in element.attrib.items()
+            if str(key) not in {"index", _XML_OBSERVATION_ALIAS_PATHS}
+        )
+    )
+    return (
+        element.tag,
+        attributes,
+        tuple(_xml_subtree_fingerprint(child) for child in list(element)),
     )
 
 
@@ -594,15 +718,26 @@ def _node_from_payload(
 
 
 def _node_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    visible_raw = _first_present(payload, ("visible", "is_visible", "isVisible"))
     metadata: dict[str, Any] = {
         "raw_keys": tuple(sorted(str(key) for key in payload.keys())),
-        "visible": not _explicit_false(
-            _first_present(payload, ("visible", "is_visible", "isVisible"))
-        ),
+        "visible": not _explicit_false(visible_raw),
+        "visible_present": visible_raw is not None,
     }
     declared_metadata = payload.get("metadata")
     if isinstance(declared_metadata, dict):
         metadata.update(declared_metadata)
+    state_aliases = {
+        "checked": ("checked", "is_checked", "isChecked"),
+        "selected": ("selected", "is_selected", "isSelected"),
+        "focused": ("focused", "is_focused", "isFocused"),
+        "expanded": ("expanded", "is_expanded", "isExpanded"),
+        "password": ("password", "is_password", "isPassword", "secure"),
+    }
+    for name, aliases in state_aliases.items():
+        raw_value = _first_present(payload, aliases)
+        metadata[f"{name}_present"] = raw_value is not None
+        metadata[name] = _truthy(raw_value) if raw_value is not None else False
     visual_bbox = _parse_bounds(
         _first_present(payload, ("visual-bbox", "visual_bbox"))
     )
@@ -612,6 +747,15 @@ def _node_metadata(payload: dict[str, Any]) -> dict[str, Any]:
         metadata["candidate"] = _truthy(payload.get("candidate"))
     if "node-id" in payload:
         metadata["declared_node_id"] = str(payload["node-id"])
+    raw_alias_paths = payload.get(_XML_OBSERVATION_ALIAS_PATHS)
+    if raw_alias_paths:
+        try:
+            alias_paths = tuple(str(value) for value in json.loads(raw_alias_paths))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            alias_paths = ()
+        if alias_paths:
+            metadata["observation_alias_paths"] = alias_paths
+            metadata["observation_alias_count"] = len(alias_paths)
     return metadata
 
 

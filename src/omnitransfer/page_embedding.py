@@ -27,6 +27,13 @@ DEFAULT_PAGE_EMBEDDING_CHECKPOINT_SHA256 = (
     "c262f03c32c4b88d2933323fe2b33007281224ef1a8aae1418a9844d354de232"
 )
 PAGE_EMBEDDING_TYPE = "configuration"
+STABLE_CONFIGURATION_EMBEDDING_TYPE = "stable_configuration"
+ACTIVE_STATE_EMBEDDING_TYPE = "active_state"
+PAGE_EMBEDDING_TYPES = (
+    STABLE_CONFIGURATION_EMBEDDING_TYPE,
+    ACTIVE_STATE_EMBEDDING_TYPE,
+    PAGE_EMBEDDING_TYPE,
+)
 
 
 @dataclass(frozen=True)
@@ -124,7 +131,23 @@ class OmniTransferPageEmbedder:
             self._torch = torch
         else:
             raise ValueError("page embedding checkpoint must be .npz or .pt")
-        self.embedding_dim = self.config.hidden_dim
+        if self.numpy_matcher is not None:
+            # The frozen NumPy checkpoint's page readout is the contextual
+            # association vector, whose width is association_dim.  Older
+            # configs also carry state_embedding_dim for the torch model;
+            # using that field here would advertise a width the NumPy readout
+            # does not produce.
+            combined_dim = int(self.config.association_dim)
+        else:
+            combined_dim = self.config.state_embedding_dim or self.config.hidden_dim
+        stable_dim = combined_dim
+        active_dim = combined_dim
+        self.embedding_dims = {
+            PAGE_EMBEDDING_TYPE: combined_dim,
+            STABLE_CONFIGURATION_EMBEDDING_TYPE: stable_dim,
+            ACTIVE_STATE_EMBEDDING_TYPE: active_dim,
+        }
+        self.embedding_dim = combined_dim
         self.architecture = self.config.architecture
         self.text_encoder = self.config.text_encoder
 
@@ -136,10 +159,10 @@ class OmniTransferPageEmbedder:
         pixels: dict[str, Any] | None = None,
         embedding_type: str = PAGE_EMBEDDING_TYPE,
     ) -> PageEmbedding:
-        if embedding_type != PAGE_EMBEDDING_TYPE:
+        if embedding_type not in PAGE_EMBEDDING_TYPES:
             raise ValueError(
                 f"unsupported page embedding type: {embedding_type}; "
-                f"available={PAGE_EMBEDDING_TYPE}"
+                f"available={','.join(PAGE_EMBEDDING_TYPES)}"
             )
         pixels = dict(pixels or {})
         screenshot = _available_screenshot(pixels)
@@ -153,8 +176,8 @@ class OmniTransferPageEmbedder:
         graph = graph_from_record(record, graph_id=graph_id)
         if not graph.nodes:
             raise ValueError(f"page {graph_id} has no XML nodes")
-        vector = self._embed_graph(graph)
-        if len(vector) != self.embedding_dim:
+        vector = self._embed_graph(graph, embedding_type=embedding_type)
+        if len(vector) != self.embedding_dims[embedding_type]:
             raise ValueError("page embedding dimension mismatch")
         if not all(math.isfinite(value) for value in vector):
             raise ValueError("page embedding contains non-finite values")
@@ -185,9 +208,24 @@ class OmniTransferPageEmbedder:
 
         return list(self.embed(xml, graph_id=graph_id, pixels=pixels).vector)
 
-    def _embed_graph(self, graph: UIGraph) -> tuple[float, ...]:
+    def _embed_graph(
+        self,
+        graph: UIGraph,
+        *,
+        embedding_type: str,
+    ) -> tuple[float, ...]:
         if self.numpy_matcher is not None:
-            return tuple(float(value) for value in self.numpy_matcher.page_embedding(graph))
+            if embedding_type != PAGE_EMBEDDING_TYPE:
+                raise ValueError(
+                    "NumPy page embedding backend only exposes configuration "
+                    "readout"
+                )
+            return tuple(
+                float(value)
+                for value in self.numpy_matcher.page_embedding(
+                    graph,
+                )
+            )
         if self.model is None or self._torch is None:
             raise RuntimeError("page embedding backend is not initialized")
         inputs = matcher_inputs(
@@ -197,7 +235,19 @@ class OmniTransferPageEmbedder:
             device=self.device,
         )
         with self._torch.inference_mode():
-            vector = self.model(*inputs)["source_config_embedding"]
+            output = self.model.encode_page(
+                inputs[0],
+                inputs[1],
+                inputs[2],
+                inputs[6],
+                inputs[7],
+            )
+            key = {
+                PAGE_EMBEDDING_TYPE: "page_embedding",
+                STABLE_CONFIGURATION_EMBEDDING_TYPE: "stable_state_embedding",
+                ACTIVE_STATE_EMBEDDING_TYPE: "active_state_embedding",
+            }[embedding_type]
+            vector = output[key]
         return tuple(float(value) for value in vector.detach().cpu().tolist())
 
 
@@ -221,6 +271,9 @@ __all__ = [
     "DEFAULT_PAGE_EMBEDDING_CHECKPOINT",
     "DEFAULT_PAGE_EMBEDDING_CHECKPOINT_SHA256",
     "OmniTransferPageEmbedder",
+    "ACTIVE_STATE_EMBEDDING_TYPE",
     "PAGE_EMBEDDING_TYPE",
+    "PAGE_EMBEDDING_TYPES",
     "PageEmbedding",
+    "STABLE_CONFIGURATION_EMBEDDING_TYPE",
 ]
