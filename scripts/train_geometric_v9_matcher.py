@@ -16,8 +16,12 @@ from pathlib import Path
 from typing import Any
 
 from omnitransfer.learned_matcher import (
+    DETERMINISTIC_ICON_VISUAL_ENCODER,
     GeometricMatcher,
+    LOCAL_ORDER_GEOMETRIC_FEATURE_SCHEMA_ID,
     MatcherConfig,
+    MULTISCALE_RESIDUAL_VISUAL_ENCODER,
+    STATE_AWARE_GEOMETRIC_FEATURE_SCHEMA_ID,
     V9_BACKBONE_PARAMETER_PREFIXES,
     build_geometric_v9_matcher,
     initialize_node_encoder_from_checkpoint,
@@ -31,6 +35,22 @@ from omnitransfer.self_supervised import (
     CorrespondencePair,
     batch_supervised_node_matching_loss,
 )
+
+
+FRESH_BACKBONE_PARAMETER_PREFIXES = (
+    "local_order_projection.",
+)
+
+
+def _is_fresh_backbone_parameter(model: Any, name: str) -> bool:
+    if name.startswith(FRESH_BACKBONE_PARAMETER_PREFIXES):
+        return True
+    trainable_visual = hasattr(model.visual_encoder, "dense_readout")
+    return trainable_visual and (
+        name.startswith("visual_encoder.")
+        or name.startswith("visual_to_hidden.")
+        or name == "missing_visual"
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -76,6 +96,30 @@ def _parser() -> argparse.ArgumentParser:
         choices=(1, 2, 3),
         default=3,
         help="Ablate the number of correspondence updates; production stays fixed after Dev selection.",
+    )
+    parser.add_argument(
+        "--local-correspondence-heads",
+        type=int,
+        choices=(1, 4),
+        default=4,
+        help="Ablate one versus four simultaneous local correspondence anchors.",
+    )
+    parser.add_argument(
+        "--no-exact-local-order",
+        action="store_true",
+        help="Ablation only: use the state-aware v9 XML schema without exact local order.",
+    )
+    parser.add_argument(
+        "--visual-encoder",
+        choices=(
+            DETERMINISTIC_ICON_VISUAL_ENCODER,
+            MULTISCALE_RESIDUAL_VISUAL_ENCODER,
+        ),
+        default=DETERMINISTIC_ICON_VISUAL_ENCODER,
+        help=(
+            "Use the stable fixed descriptor or its lightweight trainable "
+            "tight-crop plus context residual."
+        ),
     )
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument(
@@ -292,6 +336,24 @@ def _run_epoch(
                         "node_top1": _mean(
                             rows[-progress_every:], "node_top1_accuracy"
                         ),
+                        "node_top2": (
+                            (
+                                sum(
+                                    row.get("final_rank_one_rows", 0.0)
+                                    + row.get("final_rank_two_rows", 0.0)
+                                    for row in rows[-progress_every:]
+                                )
+                                / sum(
+                                    row.get("supervised_query_rows", 0.0)
+                                    for row in rows[-progress_every:]
+                                )
+                            )
+                            if sum(
+                                row.get("supervised_query_rows", 0.0)
+                                for row in rows[-progress_every:]
+                            )
+                            else 0.0
+                        ),
                         "unary_top1": _mean(
                             rows[-progress_every:], "unary_node_top1_accuracy"
                         ),
@@ -305,6 +367,10 @@ def _run_epoch(
                         ),
                         "score_margin": _mean(
                             rows[-progress_every:], "node_score_margin"
+                        ),
+                        "final_rank2_rows": sum(
+                            row.get("final_rank_two_rows", 0.0)
+                            for row in rows[-progress_every:]
                         ),
                     },
                     sort_keys=True,
@@ -352,6 +418,15 @@ def _run_epoch(
             if supervised_query_rows
             else 0.0
         ),
+        "node_top2_accuracy": (
+            (
+                sum(float(row.get("final_rank_one_rows", 0.0)) for row in rows)
+                + sum(float(row.get("final_rank_two_rows", 0.0)) for row in rows)
+            )
+            / supervised_query_rows
+            if supervised_query_rows
+            else 0.0
+        ),
         "unary_node_top1_accuracy": (
             unary_node_top1_correct / supervised_query_rows
             if supervised_query_rows
@@ -363,6 +438,15 @@ def _run_epoch(
         ),
         "refinement_hurt": sum(
             float(row.get("refinement_hurt", 0.0)) for row in rows
+        ),
+        "final_rank_one_rows": sum(
+            float(row.get("final_rank_one_rows", 0.0)) for row in rows
+        ),
+        "final_rank_two_rows": sum(
+            float(row.get("final_rank_two_rows", 0.0)) for row in rows
+        ),
+        "final_rank_three_plus_rows": sum(
+            float(row.get("final_rank_three_plus_rows", 0.0)) for row in rows
         ),
         "human_node_labels": sum(
             float(row.get("human_node_labels", 0.0)) for row in rows
@@ -405,7 +489,9 @@ def _optimizer_parameter_groups(
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-        is_node_encoder = name.startswith(V9_BACKBONE_PARAMETER_PREFIXES)
+        is_node_encoder = name.startswith(
+            V9_BACKBONE_PARAMETER_PREFIXES
+        ) and not _is_fresh_backbone_parameter(model, name)
         uses_decay = parameter.ndim >= 2 and "embedding" not in name
         grouped[(is_node_encoder, uses_decay)].append(parameter)
     return [
@@ -428,7 +514,9 @@ def _freeze_v9_backbone(model: Any) -> tuple[str, ...]:
 
     frozen = []
     for name, parameter in model.named_parameters():
-        if name.startswith(V9_BACKBONE_PARAMETER_PREFIXES):
+        if name.startswith(
+            V9_BACKBONE_PARAMETER_PREFIXES
+        ) and not _is_fresh_backbone_parameter(model, name):
             parameter.requires_grad_(False)
             frozen.append(name)
     return tuple(frozen)
@@ -449,7 +537,16 @@ def main() -> None:
         torch.cuda.manual_seed_all(args.seed)
         torch.set_float32_matmul_precision("high")
 
-    config = MatcherConfig(association_layers=args.association_layers)
+    config = MatcherConfig(
+        association_layers=args.association_layers,
+        num_heads=args.local_correspondence_heads,
+        visual_encoder=args.visual_encoder,
+        feature_schema_id=(
+            STATE_AWARE_GEOMETRIC_FEATURE_SCHEMA_ID
+            if args.no_exact_local_order
+            else LOCAL_ORDER_GEOMETRIC_FEATURE_SCHEMA_ID
+        ),
+    )
     train_pairs, _, train_manifest = load_ui_correspondence_pairs(
         args.inputs,
         matcher_config=config,
@@ -515,6 +612,7 @@ def main() -> None:
     history: list[dict[str, Any]] = []
     best_validation = math.inf
     best_validation_accuracy = -math.inf
+    best_validation_top2 = -math.inf
     best_epoch = 0
     run_start = time.perf_counter()
     for epoch in range(1, args.epochs + 1):
@@ -565,15 +663,27 @@ def main() -> None:
             if validation_metrics
             else train_metrics["node_top1_accuracy"]
         )
+        selection_top2 = (
+            validation_metrics["node_top2_accuracy"]
+            if validation_metrics
+            else train_metrics["node_top2_accuracy"]
+        )
         if (
             selection_accuracy > best_validation_accuracy
             or (
                 selection_accuracy == best_validation_accuracy
-                and selection_loss < best_validation
+                and (
+                    selection_top2 > best_validation_top2
+                    or (
+                        selection_top2 == best_validation_top2
+                        and selection_loss < best_validation
+                    )
+                )
             )
         ):
             best_validation = selection_loss
             best_validation_accuracy = selection_accuracy
+            best_validation_top2 = selection_top2
             best_epoch = epoch
             save_matcher_checkpoint(
                 args.output,
@@ -616,8 +726,9 @@ def main() -> None:
     report = {
         "schema_version": "omnitransfer.supervised_page_local_training.v1",
         "method": (
-            "complete trained v9 multimodal and contextual backbone -> learned "
-            "five-neighbour local fusion -> three correspondence-conditioned "
+            "complete trained v9 multimodal and contextual backbone -> exact "
+            "local-order evidence -> learned five-neighbour multi-anchor fusion "
+            "-> three correspondence-conditioned "
             "updates -> one "
             "symmetric cross-platform node cross-entropy"
         ),
@@ -651,7 +762,10 @@ def main() -> None:
         },
         "hard_rows": {
             "weight": args.hard_row_weight,
-            "definition": "1 + weight * (1 - detached gold probability)",
+            "definition": (
+                "1 + weight * sigmoid(strongest_non_gold - gold), only when "
+                "the final gold rank is one or two"
+            ),
             "runtime_effect": "none",
         },
         "metric_contract": {
@@ -662,7 +776,9 @@ def main() -> None:
             "best_checkpoint_train": (
                 "selected checkpoint fixed-model full Train pass"
             ),
-            "checkpoint_selection": "fixed validation Top-1 then validation loss",
+            "checkpoint_selection": (
+                "fixed validation Top-1, then Top-2, then loss"
+            ),
         },
         "matcher_config": asdict(config),
         "parameters": parameter_count(model),
@@ -671,6 +787,7 @@ def main() -> None:
             "node_width": config.hidden_dim,
             "local_relation_width": config.relation_hidden_dim,
             "local_neighbours_per_node": config.local_neighbor_limit,
+            "local_correspondence_heads": config.num_heads,
             "correspondence_stages": config.association_layers,
             "trained_v9_contextual_layers": config.association_layers,
             "null_class": False,
@@ -699,6 +816,7 @@ def main() -> None:
         "best_epoch": best_epoch,
         "best_validation_loss": best_validation,
         "best_validation_top1_accuracy": best_validation_accuracy,
+        "best_validation_top2_accuracy": best_validation_top2,
         "best_checkpoint_train": best_checkpoint_train_metrics,
         "elapsed_seconds": time.perf_counter() - run_start,
         "checkpoint": str(args.output.resolve()),

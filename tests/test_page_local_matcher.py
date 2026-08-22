@@ -7,13 +7,17 @@ import pytest
 from omnitransfer.learned_matcher import (
     GeometricMatcher,
     MatcherConfig,
+    MULTISCALE_RESIDUAL_VISUAL_ENCODER,
+    STATE_AWARE_GEOMETRIC_FEATURE_SCHEMA_ID,
     build_geometric_v9_matcher,
     initialize_node_encoder_from_checkpoint,
     initialize_v9_backbone_from_checkpoint,
     matcher_inputs,
     save_matcher_checkpoint,
 )
+from omnitransfer.visual_descriptor import multiscale_hash_descriptor_torch
 from omnitransfer.self_supervised import (
+    _final_margin_row_weight,
     AugmentConfig,
     UnlabeledPagePair,
     batch_self_view_node_matching_loss,
@@ -127,7 +131,7 @@ def _page_with_unrelated_missing_boxes(graph_id: str):
     )
 
 
-def test_missing_bounds_do_not_create_false_spatial_neighbours() -> None:
+def test_missing_bounds_do_not_remove_nodes_from_learned_neighbour_pool() -> None:
     torch = pytest.importorskip("torch", exc_type=ImportError)
     config = MatcherConfig(dropout=0.0)
     page = _page_with_unrelated_missing_boxes("missing-boxes")
@@ -143,7 +147,19 @@ def test_missing_bounds_do_not_create_false_spatial_neighbours() -> None:
     right_slots = slots.eq(right).nonzero(as_tuple=False).flatten()
 
     assert right_slots.numel() == 1
-    assert not bool(output["source_relation_mask"][left, right_slots[0]])
+    assert bool(output["source_relation_mask"][left, right_slots[0]])
+    relation = matcher_inputs(page, page, config=config)[2]
+    assert torch.count_nonzero(relation[left, right, 9:16]) == 0
+
+
+def test_neighbor_distance_is_trainable_not_a_fixed_bonus() -> None:
+    torch = pytest.importorskip("torch", exc_type=ImportError)
+    config = MatcherConfig(dropout=0.0)
+    model = build_geometric_v9_matcher(config)
+
+    assert model.neighbor_relation_score.weight.requires_grad
+    weights = model.neighbor_relation_score.weight.detach()
+    assert torch.count_nonzero(weights[0, 9:17]) > 0
 
 
 def test_final_scores_learn_through_soft_correspondence_anchors() -> None:
@@ -165,6 +181,38 @@ def test_final_scores_learn_through_soft_correspondence_anchors() -> None:
     assert output["source_neighbor_selection_scores"].requires_grad
     assert model.neighbor_query.weight.grad is not None
     assert float(model.neighbor_query.weight.grad.abs().sum()) > 0.0
+    assert model.neighbor_relation_score.weight.grad is not None
+    geometry_gradient = model.neighbor_relation_score.weight.grad[..., 9:17]
+    assert float(geometry_gradient.abs().sum()) > 0.0
+
+
+def test_multiscale_visual_residual_starts_stable_then_learns() -> None:
+    torch = pytest.importorskip("torch", exc_type=ImportError)
+    torch.manual_seed(31)
+    config = MatcherConfig(
+        visual_encoder=MULTISCALE_RESIDUAL_VISUAL_ENCODER,
+        dropout=0.0,
+    )
+    model = build_geometric_v9_matcher(config).train()
+    patches = torch.rand(4, 6, 32, 32)
+
+    fixed = multiscale_hash_descriptor_torch(patches, torch=torch)
+    initial = model.visual_encoder(patches)
+
+    assert torch.allclose(initial, fixed)
+    initial.square().mean().backward()
+    assert model.visual_encoder.dense_readout.weight.grad is not None
+    assert float(model.visual_encoder.dense_readout.weight.grad.abs().sum()) > 0.0
+
+    optimizer = torch.optim.SGD(model.visual_encoder.parameters(), lr=0.1)
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    learned = model.visual_encoder(patches)
+    learned.square().mean().backward()
+
+    assert not torch.allclose(learned, fixed)
+    assert model.visual_encoder.features[0].weight.grad is not None
+    assert float(model.visual_encoder.features[0].weight.grad.abs().sum()) > 0.0
 
 
 def test_correspondence_is_refined_three_times_through_one_matcher_path() -> None:
@@ -187,6 +235,28 @@ def test_correspondence_is_refined_three_times_through_one_matcher_path() -> Non
         for values in correspondences
     )
     assert not torch.allclose(correspondences[0], correspondences[-1])
+
+
+def test_local_correspondence_uses_all_configured_attention_heads() -> None:
+    torch = pytest.importorskip("torch", exc_type=ImportError)
+    config = MatcherConfig(num_heads=4, dropout=0.0)
+    source = _page("source-multi-anchor")
+    target = _page("target-multi-anchor", reverse_cards=True)
+    model = build_geometric_v9_matcher(config).eval()
+
+    with torch.no_grad():
+        output = model(*matcher_inputs(source, target, config=config))
+
+    weights = output["local_match_head_weights"]
+    valid = (
+        output["source_relation_mask"][:, None, None, :, None]
+        & output["target_relation_mask"][None, :, None, None, :]
+    ).any(dim=(-1, -2)).expand(-1, -1, config.num_heads)
+    assert weights.shape[2] == config.num_heads
+    assert torch.allclose(
+        weights.sum(dim=(-1, -2))[valid],
+        torch.ones_like(weights.sum(dim=(-1, -2))[valid]),
+    )
 
 
 def test_v9_node_encoder_fuses_only_available_modalities_into_64d_states() -> None:
@@ -341,6 +411,29 @@ def test_hard_rows_are_reweighted_inside_the_same_assignment_loss() -> None:
     assert 1.0 < details["mean_training_row_weight"] <= 4.0
 
 
+def test_hard_row_weight_uses_only_the_final_rank_two_margin() -> None:
+    torch = pytest.importorskip("torch", exc_type=ImportError)
+    rank_two = torch.tensor([0.0, 0.6, -1.0], requires_grad=True)
+    rank_three = torch.tensor([0.0, 0.6, 0.4], requires_grad=True)
+    gold = torch.tensor([0], dtype=torch.long)
+
+    rank_two_weight, rank_two_position, rank_two_margin = (
+        _final_margin_row_weight(rank_two, gold, hard_row_weight=3.0)
+    )
+    rank_three_weight, rank_three_position, _ = _final_margin_row_weight(
+        rank_three,
+        gold,
+        hard_row_weight=3.0,
+    )
+
+    assert rank_two_position == 2
+    assert rank_two_margin == pytest.approx(-0.6)
+    assert 2.5 < float(rank_two_weight) < 3.5
+    assert rank_three_position == 3
+    assert float(rank_three_weight) == 1.0
+    assert not rank_two_weight.requires_grad
+
+
 def test_local_relation_evidence_survives_an_uncertain_correspondence() -> None:
     torch = pytest.importorskip("torch", exc_type=ImportError)
     config = MatcherConfig(dropout=0.0)
@@ -362,7 +455,7 @@ def test_local_relation_evidence_survives_an_uncertain_correspondence() -> None:
         zero_correspondence = torch.zeros(
             len(source.nodes), len(target.nodes), dtype=pair_features.dtype
         )
-        context, weights, anchors, _ = model._local_match(
+        context, weights, anchors, _, _ = model._local_match(
             pair_features,
             zero_correspondence,
             source_page["relation_tokens"],
@@ -787,6 +880,61 @@ def test_node_encoder_can_initialize_a_fresh_local_matcher(tmp_path) -> None:
         source.modality_score[1].weight,
     )
     assert torch.equal(target.pair_scorer[-1].weight, original_local)
+
+
+def test_local_order_model_preserves_the_initialized_v9_xml_encoder(tmp_path) -> None:
+    torch = pytest.importorskip("torch", exc_type=ImportError)
+    legacy_config = MatcherConfig(
+        feature_schema_id=STATE_AWARE_GEOMETRIC_FEATURE_SCHEMA_ID,
+        dropout=0.0,
+    )
+    source = build_geometric_v9_matcher(legacy_config)
+    checkpoint = tmp_path / "state-aware-v9.pt"
+    save_matcher_checkpoint(checkpoint, source, config=legacy_config)
+    target = build_geometric_v9_matcher(MatcherConfig(dropout=0.0))
+
+    transferred = initialize_v9_backbone_from_checkpoint(target, checkpoint)
+
+    assert "xml_projection.0.weight" in transferred
+    assert "xml_projection.1.weight" in transferred
+    assert torch.equal(
+        target.xml_projection[1].weight,
+        source.xml_projection[1].weight,
+    )
+    assert torch.count_nonzero(target.local_order_projection[-1].weight) == 0
+
+
+def test_trainable_multiscale_visual_preserves_old_v9_visual_start(tmp_path) -> None:
+    torch = pytest.importorskip("torch", exc_type=ImportError)
+    source_config = MatcherConfig(dropout=0.0)
+    source = build_geometric_v9_matcher(source_config)
+    checkpoint = tmp_path / "fixed-visual-v9.pt"
+    save_matcher_checkpoint(checkpoint, source, config=source_config)
+    target = build_geometric_v9_matcher(
+        MatcherConfig(
+            visual_encoder=MULTISCALE_RESIDUAL_VISUAL_ENCODER,
+            dropout=0.0,
+        )
+    )
+
+    transferred = initialize_v9_backbone_from_checkpoint(target, checkpoint)
+
+    assert "missing_visual" in transferred
+    assert "visual_to_hidden.weight" in transferred
+    assert torch.equal(
+        target.missing_visual[: source.missing_visual.shape[0]],
+        source.missing_visual,
+    )
+    assert torch.count_nonzero(
+        target.missing_visual[source.missing_visual.shape[0] :]
+    ) == 0
+    assert torch.equal(
+        target.visual_to_hidden.weight[:, : source.visual_to_hidden.in_features],
+        source.visual_to_hidden.weight,
+    )
+    assert torch.count_nonzero(
+        target.visual_to_hidden.weight[:, source.visual_to_hidden.in_features :]
+    ) == 0
 
 
 def test_trained_v9_backbone_initializes_without_overwriting_new_local_fusion(

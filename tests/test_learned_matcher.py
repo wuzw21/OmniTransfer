@@ -4,11 +4,12 @@ import pytest
 
 from omnitransfer.learned_matcher import (
     ALL_NODE_CANDIDATE_POLICY,
+    LOCAL_ORDER_GEOMETRIC_FEATURE_SCHEMA_ID,
+    LOCAL_ORDER_XML_NODE_FEATURE_DIM,
     LEGACY_NODE_ANCHOR_ENCODER,
     OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE,
     RELATION_FEATURE_DIM,
     SOFTMAX_MODALITY_ROUTER,
-    STATE_AWARE_GEOMETRIC_FEATURE_SCHEMA_ID,
     MatcherConfig,
     build_geometric_v9_matcher,
     configure_visual_image_cache,
@@ -75,7 +76,7 @@ def test_default_config_describes_only_the_page_local_model() -> None:
     assert config.hidden_dim == 64
     assert config.association_layers == 3
     assert config.assignment_head == "partial_assignment"
-    assert config.feature_schema_id == STATE_AWARE_GEOMETRIC_FEATURE_SCHEMA_ID
+    assert config.feature_schema_id == LOCAL_ORDER_GEOMETRIC_FEATURE_SCHEMA_ID
     assert config.state_embedding_dim == 1024
 
 
@@ -111,6 +112,19 @@ def test_graph_encoding_retains_structure_order_and_reliability() -> None:
         reordered_first
     ]
     assert encoded.relation_features[2][3][3] == 1.0
+
+
+def test_graph_encoding_preserves_exact_local_order_as_categorical_evidence() -> None:
+    graph = _graph("exact-local-order")
+
+    encoded = encode_graph(graph)
+    first = encoded.numeric_features[encoded.node_ids.index("first")]
+    second = encoded.numeric_features[encoded.node_ids.index("second")]
+
+    assert len(first) == LOCAL_ORDER_XML_NODE_FEATURE_DIM
+    assert first[-144:] != second[-144:]
+    assert sum(first[-144:]) == pytest.approx(9.0)
+    assert sum(second[-144:]) == pytest.approx(9.0)
 
 
 def test_flat_repeated_resource_ids_remain_distinct_graph_nodes() -> None:

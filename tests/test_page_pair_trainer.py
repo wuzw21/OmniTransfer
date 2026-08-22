@@ -3,7 +3,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from omnitransfer.learned_matcher import MatcherConfig, build_geometric_v9_matcher
+from omnitransfer.learned_matcher import (
+    MULTISCALE_RESIDUAL_VISUAL_ENCODER,
+    MatcherConfig,
+    build_geometric_v9_matcher,
+)
 from omnitransfer.self_supervised import make_correspondence_training_pair
 from omnitransfer.ui_graph import graph_from_record
 from scripts.train_geometric_v9_matcher import (
@@ -131,6 +135,45 @@ def test_optimizer_does_not_decay_embeddings_norms_or_biases() -> None:
     assert learning_rate_by_parameter[id(model.pair_scorer[1].weight)] == 1e-4
 
 
+def test_fresh_visual_and_local_order_layers_use_the_full_learning_rate() -> None:
+    pytest.importorskip("torch", exc_type=ImportError)
+    model = build_geometric_v9_matcher(
+        MatcherConfig(
+            visual_encoder=MULTISCALE_RESIDUAL_VISUAL_ENCODER,
+            dropout=0.0,
+        )
+    )
+
+    groups = _optimizer_parameter_groups(
+        model,
+        weight_decay=0.05,
+        learning_rate=3e-4,
+        node_learning_rate_scale=0.1,
+    )
+    learning_rate_by_parameter = {
+        id(parameter): float(group["lr"])
+        for group in groups
+        for parameter in group["params"]
+    }
+
+    assert learning_rate_by_parameter[id(model.text_to_hidden.weight)] == pytest.approx(
+        3e-5
+    )
+    assert (
+        learning_rate_by_parameter[id(model.visual_encoder.features[0].weight)]
+        == 3e-4
+    )
+    assert (
+        learning_rate_by_parameter[id(model.visual_encoder.dense_readout.weight)]
+        == 3e-4
+    )
+    assert learning_rate_by_parameter[id(model.visual_to_hidden.weight)] == 3e-4
+    assert (
+        learning_rate_by_parameter[id(model.local_order_projection[1].weight)]
+        == 3e-4
+    )
+
+
 def test_freeze_v9_backbone_leaves_new_local_path_trainable() -> None:
     pytest.importorskip("torch", exc_type=ImportError)
     model = build_geometric_v9_matcher(MatcherConfig(dropout=0.0))
@@ -143,6 +186,23 @@ def test_freeze_v9_backbone_leaves_new_local_path_trainable() -> None:
     assert model.pair_scorer[-1].weight.requires_grad
     assert model.neighbor_query.weight.requires_grad
     assert model.state_attention.weight.requires_grad
+
+
+def test_freeze_v9_backbone_does_not_freeze_fresh_visual_or_order_layers() -> None:
+    pytest.importorskip("torch", exc_type=ImportError)
+    model = build_geometric_v9_matcher(
+        MatcherConfig(
+            visual_encoder=MULTISCALE_RESIDUAL_VISUAL_ENCODER,
+            dropout=0.0,
+        )
+    )
+
+    _freeze_v9_backbone(model)
+
+    assert model.visual_encoder.features[0].weight.requires_grad
+    assert model.visual_encoder.dense_readout.weight.requires_grad
+    assert model.visual_to_hidden.weight.requires_grad
+    assert model.local_order_projection[1].weight.requires_grad
 
 
 def _page(graph_id: str):

@@ -27,11 +27,14 @@ def build_geometric_matcher(config: Any) -> Any:
         LEARNED_NEIGHBOR_SELECTION,
         LEARNED_TOKEN_LOOKUP_ENCODER,
         LEGACY_GLOBAL_POOL_VISUAL_ENCODER,
+        LOCAL_ORDER_FEATURE_DIM,
+        LOCAL_ORDER_GEOMETRIC_FEATURE_SCHEMA_ID,
         MULTISCALE_HASH_VISUAL_ENCODER,
         MULTISCALE_RESIDUAL_VISUAL_ENCODER,
         OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE,
         RELATION_FEATURE_DIM,
         SPATIAL_CNN_VISUAL_ENCODER,
+        STATE_AWARE_XML_NODE_FEATURE_DIM,
         TEXT_DESCRIPTOR_DIM,
         TYPED_RELATION_NAMES,
         UNARY_RESIDUAL_SCORE_UPDATE,
@@ -58,6 +61,8 @@ def build_geometric_matcher(config: Any) -> Any:
         raise ValueError("hidden_dim must be positive")
     if cfg.relation_hidden_dim <= 0:
         raise ValueError("relation_hidden_dim must be positive")
+    if cfg.num_heads <= 0 or cfg.relation_hidden_dim % cfg.num_heads:
+        raise ValueError("num_heads must divide relation_hidden_dim")
     if cfg.association_layers <= 0:
         raise ValueError("page-local matching requires correspondence stages")
     if cfg.source_context_nodes <= 0 or cfg.target_context_nodes <= 0:
@@ -80,9 +85,15 @@ def build_geometric_matcher(config: Any) -> Any:
     nn = torch.nn
     visual_dim = visual_descriptor_dim(cfg.visual_encoder)
     numeric_dim = xml_node_feature_dim(cfg.feature_schema_id)
+    base_numeric_dim = (
+        STATE_AWARE_XML_NODE_FEATURE_DIM
+        if cfg.feature_schema_id == LOCAL_ORDER_GEOMETRIC_FEATURE_SCHEMA_ID
+        else numeric_dim
+    )
     max_neighbours = cfg.local_neighbor_limit
     state_slots = cfg.state_embedding_dim // cfg.hidden_dim
     relation_count = len(TYPED_RELATION_NAMES)
+    local_head_dim = cfg.relation_hidden_dim // cfg.num_heads
 
     class DeterministicIconEncoder(nn.Module):
         def forward(self, patches: Any) -> Any:
@@ -91,6 +102,32 @@ def build_geometric_matcher(config: Any) -> Any:
     class MultiscaleHashEncoder(nn.Module):
         def forward(self, patches: Any) -> Any:
             return multiscale_hash_descriptor_torch(patches, torch=torch)
+
+    class MultiscaleResidualEncoder(nn.Module):
+        """Keep the stable descriptor and learn only its missing visual evidence."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.features = nn.Sequential(
+                nn.Conv2d(6, 16, kernel_size=5, padding=2),
+                nn.GELU(),
+                nn.Conv2d(16, 24, kernel_size=3, stride=2, padding=1),
+                nn.GELU(),
+                nn.Conv2d(24, 32, kernel_size=3, stride=2, padding=1),
+                nn.GELU(),
+                nn.AdaptiveAvgPool2d((4, 4)),
+                nn.Flatten(),
+            )
+            self.dense_readout = nn.Linear(
+                32 * 4 * 4,
+                visual_dim,
+            )
+            nn.init.zeros_(self.dense_readout.weight)
+            nn.init.zeros_(self.dense_readout.bias)
+
+        def forward(self, patches: Any) -> Any:
+            fixed = multiscale_hash_descriptor_torch(patches, torch=torch)
+            return fixed + self.dense_readout(self.features(patches))
 
     def make_visual_encoder() -> Any:
         if cfg.visual_encoder == LEGACY_GLOBAL_POOL_VISUAL_ENCODER:
@@ -127,11 +164,12 @@ def build_geometric_matcher(config: Any) -> Any:
             )
         if cfg.visual_encoder == DETERMINISTIC_ICON_VISUAL_ENCODER:
             return DeterministicIconEncoder()
-        if cfg.visual_encoder in {
-            MULTISCALE_HASH_VISUAL_ENCODER,
-            MULTISCALE_RESIDUAL_VISUAL_ENCODER,
-        }:
+        if cfg.visual_encoder == MULTISCALE_HASH_VISUAL_ENCODER:
             return MultiscaleHashEncoder()
+        if cfg.visual_encoder == MULTISCALE_RESIDUAL_VISUAL_ENCODER:
+            if cfg.visual_patch_size != 32:
+                raise ValueError("multiscale residual encoding requires 32x32 crops")
+            return MultiscaleResidualEncoder()
         raise ValueError(f"unsupported visual encoder: {cfg.visual_encoder}")
 
     class LocalGraphLayer(nn.Module):
@@ -261,11 +299,20 @@ def build_geometric_matcher(config: Any) -> Any:
             self.missing_text = nn.Parameter(torch.zeros(TEXT_DESCRIPTOR_DIM))
             self.missing_visual = nn.Parameter(torch.zeros(visual_dim))
             self.xml_projection = nn.Sequential(
-                nn.LayerNorm(numeric_dim),
-                nn.Linear(numeric_dim, XML_DESCRIPTOR_DIM),
+                nn.LayerNorm(base_numeric_dim),
+                nn.Linear(base_numeric_dim, XML_DESCRIPTOR_DIM),
                 nn.GELU(),
                 nn.Linear(XML_DESCRIPTOR_DIM, XML_DESCRIPTOR_DIM),
             )
+            if cfg.feature_schema_id == LOCAL_ORDER_GEOMETRIC_FEATURE_SCHEMA_ID:
+                self.local_order_projection = nn.Sequential(
+                    nn.LayerNorm(LOCAL_ORDER_FEATURE_DIM),
+                    nn.Linear(LOCAL_ORDER_FEATURE_DIM, XML_DESCRIPTOR_DIM),
+                    nn.GELU(),
+                    nn.Linear(XML_DESCRIPTOR_DIM, XML_DESCRIPTOR_DIM),
+                )
+                nn.init.zeros_(self.local_order_projection[-1].weight)
+                nn.init.zeros_(self.local_order_projection[-1].bias)
             self.text_to_hidden = nn.Linear(TEXT_DESCRIPTOR_DIM, cfg.hidden_dim)
             self.visual_to_hidden = nn.Linear(visual_dim, cfg.hidden_dim)
             self.xml_to_hidden = nn.Linear(XML_DESCRIPTOR_DIM, cfg.hidden_dim)
@@ -340,6 +387,14 @@ def build_geometric_matcher(config: Any) -> Any:
                 nn.GELU(),
                 nn.Linear(cfg.relation_hidden_dim * 2, cfg.relation_hidden_dim),
             )
+            self.local_head_projection = nn.Sequential(
+                nn.LayerNorm(cfg.num_heads * cfg.relation_hidden_dim),
+                nn.Linear(
+                    cfg.num_heads * cfg.relation_hidden_dim,
+                    cfg.relation_hidden_dim,
+                ),
+                nn.GELU(),
+            )
             self.correspondence_evidence = nn.Linear(1, 1, bias=False)
 
             self.page_attention = nn.Sequential(
@@ -400,7 +455,11 @@ def build_geometric_matcher(config: Any) -> Any:
             visual = visual_mask * visual + (1.0 - visual_mask) * (
                 self.missing_visual.unsqueeze(0).expand_as(visual)
             )
-            xml = self.xml_projection(numeric_features)
+            xml = self.xml_projection(numeric_features[:, :base_numeric_dim])
+            if cfg.feature_schema_id == LOCAL_ORDER_GEOMETRIC_FEATURE_SCHEMA_ID:
+                xml = xml + self.local_order_projection(
+                    numeric_features[:, base_numeric_dim:]
+                )
             modalities = torch.stack(
                 (
                     self.text_to_hidden(text),
@@ -436,8 +495,9 @@ def build_geometric_matcher(config: Any) -> Any:
             relations: Any,
         ) -> tuple[Any, Any, Any, Any, Any]:
             count = states.shape[0]
-            available = relations[..., 17].gt(0.0)
-            available = available & ~torch.eye(
+            # Every other page node may be useful.  Geometry and XML structure
+            # affect the learned score but never act as a hard candidate cutoff.
+            available = ~torch.eye(
                 count,
                 dtype=torch.bool,
                 device=relations.device,
@@ -550,26 +610,44 @@ def build_geometric_matcher(config: Any) -> Any:
             target_relations: Any,
             target_mask: Any,
             target_neighbor_indices: Any,
-        ) -> tuple[Any, Any, Any, Any]:
-            query = self.relation_query(pair_features)
-            source_keys = self.relation_key(source_relations)
-            target_keys = self.relation_key(target_relations)
+        ) -> tuple[Any, Any, Any, Any, Any]:
+            query = self.relation_query(pair_features).reshape(
+                pair_features.shape[0],
+                pair_features.shape[1],
+                cfg.num_heads,
+                local_head_dim,
+            )
+            source_keys = self.relation_key(source_relations).reshape(
+                source_relations.shape[0],
+                source_relations.shape[1],
+                cfg.num_heads,
+                local_head_dim,
+            )
+            target_keys = self.relation_key(target_relations).reshape(
+                target_relations.shape[0],
+                target_relations.shape[1],
+                cfg.num_heads,
+                local_head_dim,
+            )
             compatibility = torch.einsum(
-                "nkr,mlr->nmkl",
+                "nkhd,mlhd->nmhkl",
                 source_keys,
                 target_keys,
-            ) / math.sqrt(float(cfg.relation_hidden_dim))
+            ) / math.sqrt(float(local_head_dim))
             compatibility = compatibility + torch.einsum(
-                "nmr,nkr->nmk",
+                "nmhd,nkhd->nmhk",
                 query,
                 source_keys,
             ).unsqueeze(-1)
             compatibility = compatibility + torch.einsum(
-                "nmr,mlr->nml",
+                "nmhd,mlhd->nmhl",
                 query,
                 target_keys,
             ).unsqueeze(-2)
-            mask = source_mask[:, None, :, None] & target_mask[None, :, None, :]
+            mask = (
+                source_mask[:, None, None, :, None]
+                & target_mask[None, :, None, None, :]
+            )
             anchor_confidence = soft_correspondence[
                 source_neighbor_indices[:, None, :, None],
                 target_neighbor_indices[None, :, None, :],
@@ -582,9 +660,11 @@ def build_geometric_matcher(config: Any) -> Any:
             ]
             evidence = compatibility + self.correspondence_evidence(
                 correspondence_support.unsqueeze(-1)
-            ).squeeze(-1)
-            flat_mask = mask.flatten(start_dim=2)
-            flat_evidence = evidence.flatten(start_dim=2)
+            ).squeeze(-1).unsqueeze(2)
+            flat_mask = mask.expand(-1, -1, cfg.num_heads, -1, -1).flatten(
+                start_dim=3
+            )
+            flat_evidence = evidence.flatten(start_dim=3)
             masked_evidence = flat_evidence.masked_fill(~flat_mask, -1e4)
             flat_weights = torch.softmax(masked_evidence, dim=-1)
             flat_weights = flat_weights * flat_mask.to(flat_weights.dtype)
@@ -592,7 +672,7 @@ def build_geometric_matcher(config: Any) -> Any:
                 dim=-1,
                 keepdim=True,
             ).clamp_min(1.0)
-            weights = flat_weights.reshape_as(evidence)
+            head_weights = flat_weights.reshape_as(evidence)
             valid_count = flat_mask.sum(dim=-1).clamp_min(1)
             valid_any = flat_mask.any(dim=-1)
             soft_or = torch.logsumexp(masked_evidence, dim=-1) - torch.log(
@@ -603,16 +683,16 @@ def build_geometric_matcher(config: Any) -> Any:
                 torch.sigmoid(flat_evidence) * flat_mask.to(flat_evidence.dtype)
             ).sum(dim=-1) / valid_count.to(flat_evidence.dtype)
             source_context = torch.einsum(
-                "nmkl,nkr->nmr",
-                weights,
+                "nmhkl,nkr->nmhr",
+                head_weights,
                 source_relations,
             )
             target_context = torch.einsum(
-                "nmkl,mlr->nmr",
-                weights,
+                "nmhkl,mlr->nmhr",
+                head_weights,
                 target_relations,
             )
-            context = self.local_pair(
+            context_by_head = self.local_pair(
                 torch.cat(
                     (
                         source_context,
@@ -625,8 +705,12 @@ def build_geometric_matcher(config: Any) -> Any:
                     dim=-1,
                 )
             )
-            support = torch.stack((soft_or, coverage), dim=-1)
-            return context, weights, anchor_confidence, support
+            context = self.local_head_projection(
+                context_by_head.flatten(start_dim=2)
+            )
+            support = torch.stack((soft_or, coverage), dim=-1).mean(dim=2)
+            weights = head_weights.mean(dim=2)
+            return context, weights, anchor_confidence, support, head_weights
 
         @staticmethod
         def _relative_correspondence_support(soft_correspondence: Any) -> Any:
@@ -782,6 +866,7 @@ def build_geometric_matcher(config: Any) -> Any:
             soft_correspondences = []
             local_corrections = []
             local_weights_by_layer = []
+            local_head_weights_by_layer = []
             local_anchor_confidence_by_layer = []
             local_support_by_layer = []
             source_states_by_layer = []
@@ -806,6 +891,7 @@ def build_geometric_matcher(config: Any) -> Any:
                     local_weights,
                     local_anchor_confidence,
                     local_support,
+                    local_head_weights,
                 ) = self._local_match(
                     pair_features,
                     soft_correspondence,
@@ -838,6 +924,7 @@ def build_geometric_matcher(config: Any) -> Any:
                 assignment_scores.append(logits)
                 local_corrections.append(local_correction)
                 local_weights_by_layer.append(local_weights)
+                local_head_weights_by_layer.append(local_head_weights)
                 local_anchor_confidence_by_layer.append(local_anchor_confidence)
                 local_support_by_layer.append(local_support)
                 source_states_by_layer.append(source_states)
@@ -898,8 +985,12 @@ def build_geometric_matcher(config: Any) -> Any:
                     "neighbor_selection_weights"
                 ],
                 "local_match_weights": local_weights,
+                "local_match_head_weights": local_head_weights,
                 "local_anchor_confidence": local_anchor_confidence,
                 "local_match_weights_by_layer": tuple(local_weights_by_layer),
+                "local_match_head_weights_by_layer": tuple(
+                    local_head_weights_by_layer
+                ),
                 "local_anchor_confidence_by_layer": tuple(
                     local_anchor_confidence_by_layer
                 ),

@@ -1544,6 +1544,36 @@ def batch_self_view_node_matching_loss(
     }
 
 
+def _final_margin_row_weight(
+    final_scores: Any,
+    positive_indices: Any,
+    *,
+    hard_row_weight: float,
+) -> tuple[Any, int, float]:
+    """Focus the same assignment loss on final Rank-1/Rank-2 boundaries."""
+
+    positive_score = final_scores[positive_indices].max()
+    negative_mask = final_scores.new_ones(
+        final_scores.shape,
+        dtype=_require_torch().bool,
+    )
+    negative_mask[positive_indices] = False
+    if not bool(negative_mask.any()):
+        return final_scores.detach().new_tensor(1.0), 1, float("inf")
+    negative_scores = final_scores[negative_mask]
+    strongest_negative = negative_scores.max()
+    rank = 1 + int(
+        (negative_scores > positive_score).sum().detach().cpu()
+    )
+    margin = float((positive_score - strongest_negative).detach().cpu())
+    if hard_row_weight <= 0.0 or rank > 2:
+        return final_scores.detach().new_tensor(1.0), rank, margin
+    difficulty = _require_torch().sigmoid(
+        (strongest_negative - positive_score).detach()
+    )
+    return 1.0 + float(hard_row_weight) * difficulty, rank, margin
+
+
 def batch_supervised_node_matching_loss(
     model: Any,
     pairs: Iterable[CorrespondencePair],
@@ -1579,6 +1609,9 @@ def batch_supervised_node_matching_loss(
     unary_correct = 0
     refinement_help = 0
     refinement_hurt = 0
+    final_rank_one_rows = 0
+    final_rank_two_rows = 0
+    final_rank_three_plus_rows = 0
     human_labels = 0
     positive_scores = []
     hard_negative_scores = []
@@ -1669,10 +1702,14 @@ def batch_supervised_node_matching_loss(
                         strict=True,
                     )
                 )
-                gold_probability = torch.exp(-row_loss.detach()).clamp(0.0, 1.0)
-                row_weight = 1.0 + float(hard_row_weight) * (
-                    1.0 - gold_probability
+                row_weight, final_gold_rank, _ = _final_margin_row_weight(
+                    row,
+                    target_tensor,
+                    hard_row_weight=hard_row_weight,
                 )
+                final_rank_one_rows += int(final_gold_rank == 1)
+                final_rank_two_rows += int(final_gold_rank == 2)
+                final_rank_three_plus_rows += int(final_gold_rank >= 3)
                 weighted_row_loss = row_weight * row_loss
                 total = (
                     weighted_row_loss
@@ -1741,6 +1778,10 @@ def batch_supervised_node_matching_loss(
         "supervised_layers": float(supervised_layer_count),
         "supervised_score_matrices": float(supervised_score_matrix_count),
         "hard_row_weight": float(hard_row_weight),
+        "hard_row_definition": "final_rank1_rank2_margin",
+        "final_rank_one_rows": float(final_rank_one_rows),
+        "final_rank_two_rows": float(final_rank_two_rows),
+        "final_rank_three_plus_rows": float(final_rank_three_plus_rows),
         "mean_training_row_weight": float(
             (total_row_weight / query_rows).detach().cpu()
         ),

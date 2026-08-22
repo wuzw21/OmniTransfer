@@ -24,10 +24,16 @@ RELATION_FEATURE_DIM = 18
 LEGACY_XML_NODE_FEATURE_DIM = 32
 PARENT_RELATIVE_LAYOUT_FEATURE_DIM = 6
 NODE_STATE_FEATURE_DIM = 12
+EXACT_LOCAL_ORDER_BUCKETS = 18
+LOCAL_POSITION_BUCKETS = 9
+LOCAL_ORDER_FEATURE_DIM = 7 * EXACT_LOCAL_ORDER_BUCKETS + 2 * LOCAL_POSITION_BUCKETS
 XML_NODE_FEATURE_DIM = (
     LEGACY_XML_NODE_FEATURE_DIM + PARENT_RELATIVE_LAYOUT_FEATURE_DIM
 )
 STATE_AWARE_XML_NODE_FEATURE_DIM = XML_NODE_FEATURE_DIM + NODE_STATE_FEATURE_DIM
+LOCAL_ORDER_XML_NODE_FEATURE_DIM = (
+    STATE_AWARE_XML_NODE_FEATURE_DIM + LOCAL_ORDER_FEATURE_DIM
+)
 TEXT_DESCRIPTOR_DIM = 48
 VISUAL_DESCRIPTOR_DIM = 48
 MULTISCALE_VISUAL_DESCRIPTOR_DIM = VISUAL_DESCRIPTOR_DIM * 2
@@ -38,6 +44,7 @@ NODE_DESCRIPTOR_DIM = (
 LEGACY_GEOMETRIC_FEATURE_SCHEMA_ID = "omnitransfer-direct-pair-evidence-v7"
 GEOMETRIC_FEATURE_SCHEMA_ID = "omnitransfer-parent-relative-layout-v8"
 STATE_AWARE_GEOMETRIC_FEATURE_SCHEMA_ID = "omnitransfer-state-aware-v9"
+LOCAL_ORDER_GEOMETRIC_FEATURE_SCHEMA_ID = "omnitransfer-local-order-v10"
 OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE = (
     "omnitransfer_geometric_alignment_v9"
 )
@@ -166,7 +173,7 @@ class MatcherConfig:
     semantic_exact_decoder_bonus: float = 0.0
     semantic_exact_decoder_top_k: int = SEMANTIC_EXACT_DECODER_TOP_K
     semantic_exact_decoder_max_margin: float = SEMANTIC_EXACT_DECODER_MAX_MARGIN
-    feature_schema_id: str = STATE_AWARE_GEOMETRIC_FEATURE_SCHEMA_ID
+    feature_schema_id: str = LOCAL_ORDER_GEOMETRIC_FEATURE_SCHEMA_ID
     score_update: str = UNARY_RESIDUAL_SCORE_UPDATE
     neighbor_selection: str = LEARNED_NEIGHBOR_SELECTION
     local_neighbor_limit: int = 5
@@ -187,6 +194,8 @@ def xml_node_feature_dim(feature_schema_id: str) -> int:
         return XML_NODE_FEATURE_DIM
     if feature_schema_id == STATE_AWARE_GEOMETRIC_FEATURE_SCHEMA_ID:
         return STATE_AWARE_XML_NODE_FEATURE_DIM
+    if feature_schema_id == LOCAL_ORDER_GEOMETRIC_FEATURE_SCHEMA_ID:
+        return LOCAL_ORDER_XML_NODE_FEATURE_DIM
     raise ValueError(f"unsupported matcher feature schema: {feature_schema_id}")
 
 
@@ -256,6 +265,7 @@ def encode_graph(
         LEGACY_GEOMETRIC_FEATURE_SCHEMA_ID,
         GEOMETRIC_FEATURE_SCHEMA_ID,
         STATE_AWARE_GEOMETRIC_FEATURE_SCHEMA_ID,
+        LOCAL_ORDER_GEOMETRIC_FEATURE_SCHEMA_ID,
     }:
         raise ValueError(f"unsupported matcher feature schema: {feature_schema_id}")
     relation_context = (
@@ -902,6 +912,7 @@ NODE_ENCODER_PARAMETER_PREFIXES = (
     "token_embedding.",
     "text_projection.",
     "xml_projection.",
+    "local_order_projection.",
     "visual_encoder.",
     "present_text",
     "missing_text",
@@ -972,6 +983,31 @@ def _initialize_parameters_from_checkpoint(
             continue
         target_value = target_state.get(name)
         if target_value is None:
+            continue
+        if (
+            name == "missing_visual"
+            and target_value.ndim == source_value.ndim == 1
+            and target_value.shape[0] == source_value.shape[0] * 2
+        ):
+            widened = target_value.detach().clone().zero_()
+            widened[: source_value.shape[0]] = source_value.to(
+                target_value.device
+            )
+            target_state[name] = widened
+            transferred.append(name)
+            continue
+        if (
+            name == "visual_to_hidden.weight"
+            and target_value.ndim == source_value.ndim == 2
+            and target_value.shape[0] == source_value.shape[0]
+            and target_value.shape[1] == source_value.shape[1] * 2
+        ):
+            widened = target_value.detach().clone().zero_()
+            widened[:, : source_value.shape[1]] = source_value.to(
+                target_value.device
+            )
+            target_state[name] = widened
+            transferred.append(name)
             continue
         if (
             name == "xml_projection.1.weight"
@@ -1586,6 +1622,13 @@ def _multimodal_xml_features(
             *_parent_relative_layout_features(node, graph),
             *_node_state_features(node),
         )
+    elif feature_schema_id == LOCAL_ORDER_GEOMETRIC_FEATURE_SCHEMA_ID:
+        values = (
+            *legacy_values,
+            *_parent_relative_layout_features(node, graph),
+            *_node_state_features(node),
+            *_exact_local_order_features(node, graph),
+        )
     else:
         raise ValueError(f"unsupported matcher feature schema: {feature_schema_id}")
     if len(values) != xml_node_feature_dim(feature_schema_id):
@@ -1610,6 +1653,85 @@ def _node_state_features(node: UINode) -> tuple[float, ...]:
             )
         )
     return tuple(values)
+
+
+def _categorical_one_hot(
+    value: int | None,
+    *,
+    maximum: int = 15,
+) -> tuple[float, ...]:
+    """Preserve an exact local integer with overflow and missing buckets."""
+
+    bucket_count = maximum + 3
+    bucket = maximum + 2 if value is None or value < 0 else min(value, maximum + 1)
+    return tuple(float(index == bucket) for index in range(bucket_count))
+
+
+def _local_position_one_hot(value: float | None) -> tuple[float, ...]:
+    """Discretize a parent-relative coordinate with an explicit missing bucket."""
+
+    bucket = 8 if value is None else min(7, max(0, int(value * 8.0)))
+    return tuple(float(index == bucket) for index in range(LOCAL_POSITION_BUCKETS))
+
+
+def _exact_local_order_features(
+    node: UINode,
+    graph: UIGraph,
+) -> tuple[float, ...]:
+    """Return categorical local order evidence without treating paths as identity."""
+
+    nodes_by_id = {candidate.node_id: candidate for candidate in graph.nodes}
+    parent = nodes_by_id.get(node.parent_id or "")
+
+    def child_position(candidate: UINode | None) -> tuple[int | None, int | None, int]:
+        if candidate is None or not candidate.parent_id:
+            return None, None, 0
+        candidate_parent = nodes_by_id.get(candidate.parent_id)
+        if candidate_parent is None:
+            return None, None, 0
+        siblings = candidate_parent.child_ids
+        try:
+            index = siblings.index(candidate.node_id)
+        except ValueError:
+            return None, None, len(siblings)
+        return index, len(siblings) - index - 1, len(siblings)
+
+    sibling_index, reverse_sibling_index, sibling_count = child_position(node)
+    parent_index, _, _ = child_position(parent)
+    grandparent = nodes_by_id.get(parent.parent_id or "") if parent else None
+    grandparent_index, _, _ = child_position(grandparent)
+
+    node_bbox = _normalized_bbox(node.bbox, graph)
+    parent_bbox = _normalized_bbox(parent.bbox, graph) if parent is not None else None
+    if node_bbox is None or parent_bbox is None:
+        relative_x = relative_y = None
+    else:
+        parent_width = max(parent_bbox[2] - parent_bbox[0], 1e-6)
+        parent_height = max(parent_bbox[3] - parent_bbox[1], 1e-6)
+        relative_x = (
+            (node_bbox[0] + node_bbox[2]) * 0.5 - parent_bbox[0]
+        ) / parent_width
+        relative_y = (
+            (node_bbox[1] + node_bbox[3]) * 0.5 - parent_bbox[1]
+        ) / parent_height
+
+    exact_values = (
+        sibling_index,
+        reverse_sibling_index,
+        sibling_count,
+        len(node.child_ids),
+        int(node.depth),
+        parent_index,
+        grandparent_index,
+    )
+    values = tuple(
+        feature
+        for value in exact_values
+        for feature in _categorical_one_hot(value)
+    ) + _local_position_one_hot(relative_x) + _local_position_one_hot(relative_y)
+    if len(values) != LOCAL_ORDER_FEATURE_DIM:
+        raise AssertionError("unexpected exact local order feature dimension")
+    return values
 
 
 def _parent_relative_layout_features(
