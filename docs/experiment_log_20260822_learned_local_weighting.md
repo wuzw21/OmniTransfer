@@ -63,10 +63,67 @@ tags: [ASE, local-correspondence, hard-negative, visual, exact-order]
 2. 下一步只验证 candidate-conditioned neighbour weighting：针对正在比较的候选对选择 witness，而不是先做 page-only Top-5。不要再扩 CNN 或增加规则分数。
 3. 单独报告 textless、near-confusion 与页面缓存后的 `encode_page` / `match_page` 延迟。
 
+# 2026-08-23 上限审计
+
+## 候选重排上限
+
+发布评估器的 1,566 条 Dev 预测中：
+
+| Oracle | 正确数 | 上限 |
+|---|---:|---:|
+| Top-1 | 1,247 | 79.63% |
+| Top-2 | 1,376 | 87.87% |
+| Top-3 | 1,423 | 90.87% |
+| Top-5 | 1,476 | 94.25% |
+
+- 85% 至少需要 1,332 条正确，即净修 85 条。
+- 90% 至少需要 1,410 条正确，即净修 163 条；等价于无损解决 176 条 Rank-2/3 错误中的 92.6%。
+- 因此 Top-3 召回在数学上刚够 90%，但不代表一个实际 reranker 能达到 90%。
+
+## 两个诊断探针
+
+1. Train-only 精确 XML 序号、role、位置、card 分桶的 Top-2 logistic 探针，Dev 最好仅从 79.63% 到 80.08%（净修 7 条）。这条路径既弱，又依赖不完整 source 图统计，只能作为反证：最后添加 one-hot/规则不是主要答案。
+2. candidate-conditioned local oracle：使用同一页面对中“其他节点”的 gold correspondence 作为局部锚点；严格排除与当前 query source 或候选 target 相连的 gold 边；固定 Train→Dev 的 85D probe，候选只取当前 Top-5。
+
+| Probe | Dev Top-1 | fixes | harms | net | Rank-2 修正 |
+|---|---:|---:|---:|---:|---:|
+| base score | 79.76% | 3 | 1 | +2 | 3/129 |
+| 单节点 pair 属性 | 80.78% | 31 | 13 | +18 | 23/129 |
+| clean local correspondence oracle | **85.89%** | 104 | 6 | **+98** | **68/129 (52.7%)** |
+| local + gold target occupancy（乐观 assignment oracle） | 86.08% | 111 | 10 | +101 | 71/129 |
+
+`clean local correspondence oracle` 是能力诊断，不是可部署精度。它使用其他节点的 gold 对应，且 probe 的 Train 预测来自最终 Train-fitted matcher，不是 OOF；因此只能回答“局部对应信号是否足够”，不能作为正式模型结果。结论仍然尖锐：**正确局部对应足以越过 85%，但这一简单 oracle 仍距 90% 约 65 条。**
+
+## 35 条分层人工审核
+
+为 Rank-2 全量 129 条建立带框页面：蓝框 source，红框 P1，绿框 gold，橙框为同页最近的三条其他 gold correspondence。按六个症状层分层抽取 35 条并逐条查看截图。
+
+人工主因：
+
+| 主因 | 样本数 |
+|---|---:|
+| 局部对应可救 | 17/35 |
+| endpoint 粒度 | 8/35 |
+| 单节点/视觉或文本识别 | 6/35 |
+| gold/页面待审 | 4/35 |
+
+按六个症状层的全量数量回权后，Rank-2 中估计约 70/129（54.3%）属于局部对应可救，与 clean oracle 实测 68/129（52.7%）高度一致。其余约 29 条是同框 wrapper/leaf endpoint，约 14 条是单节点文字/视觉识别，约 16 条需要复核 gold 或页面状态。该回权是分层定向抽样估计，不是随机抽样置信区间。
+
+## Go / No-Go
+
+- **Go**：实现 candidate-conditioned local correspondence；它是目前唯一被 oracle 与逐条视觉审核同时支持、并能跨过 85% 的改动。
+- **No-Go**：继续加 exact ordinal one-hot、规则 bonus 或独立 rerank；它们在真实 Dev 上只净修 0–7 条。
+- **90% 尚未被证明**：local 先解决约一半 Rank-2；之后仍必须处理 textless 的候选召回、同框 endpoint 标注/规范化和可疑 gold。
+
 # 原始材料
 
 - `output/rank2_disambiguation_20260822_r001/full8/report.json`
 - `output/rank2_disambiguation_20260822_r001/full8/history.jsonl`
 - `output/rank2_disambiguation_20260822_r001/visual_full8_full_lr_hardcut_r002/report.json`
 - `output/rank2_disambiguation_20260822_r001/visual_full8_full_lr_all_candidates/report.json`
+- `output/rank2_disambiguation_20260822_r001/visual_full8_full_lr_all_candidates/candidate_conditioned_local_upper_bound.json`
+- `output/rank2_disambiguation_20260822_r001/visual_full8_full_lr_all_candidates/exact_structure_top2_correction.json`
+- `output/rank2_disambiguation_20260822_r001/manual_rank2_upper_bound_review/rank2_local_sample.html`
+- `output/rank2_disambiguation_20260822_r001/manual_rank2_upper_bound_review/manual_sample_verdicts.json`
+- `output/rank2_disambiguation_20260822_r001/manual_rank2_upper_bound_review/manual_upper_bound_summary.json`
 - 4090：`/home/zewen/omnitransfer_runs/rank2_disambiguation_20260822_r001/output/`
