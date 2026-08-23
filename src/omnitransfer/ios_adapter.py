@@ -26,6 +26,9 @@ from omnitransfer.ui_graph import graph_from_record, graph_to_record
 
 IOS_ADAPTER_SCHEMA_VERSION = "omnitransfer.ios_screen_adapter.v1"
 IOS_PLATFORM_NAMES = frozenset({"ios", "iphoneos", "ipad os", "ipados"})
+IOS_LOGICAL_XML_PIXELS = "logical_xml_pixels"
+IOS_SCREENSHOT_PIXELS = "screenshot_pixels"
+IOS_NORMALIZED = "normalized_0_1"
 
 
 class IOSAdapterError(ValueError):
@@ -43,8 +46,6 @@ def _node_payload(node: Mapping[str, Any]) -> dict[str, Any]:
     """Serialize a parser node without changing its semantic attributes."""
 
     metadata = dict(node.get("metadata") or {})
-    if metadata.get("visual_bbox") is not None:
-        metadata["visual_bbox_coordinate_space"] = "page_pixels"
     return {
         "node_id": node["node_id"],
         "origin_id": node.get("origin_id") or node["node_id"],
@@ -66,7 +67,12 @@ def _node_payload(node: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def correct_ios_coordinate_spaces(
-    graph: dict[str, Any], *, visual_width: float = 0, visual_height: float = 0
+    graph: dict[str, Any],
+    *,
+    visual_width: float = 0,
+    visual_height: float = 0,
+    bbox_coordinate_space: str | None = None,
+    visual_bbox_coordinate_space: str | None = None,
 ) -> None:
     """Normalize iOS XML and visual bounds in-place.
 
@@ -96,16 +102,42 @@ def correct_ios_coordinate_spaces(
         or (scale_x >= 1.25 and (max_right < width / 1.25 or max_bottom < height / 1.25))
     )
 
-    def restore_xml_bbox(bbox: list[float] | tuple[float, ...]) -> list[float]:
+    def coordinate_space(value: Any, *, default: str) -> str:
+        normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+        aliases = {
+            "logical": IOS_LOGICAL_XML_PIXELS,
+            "logical_pixels": IOS_LOGICAL_XML_PIXELS,
+            "xml_pixels": IOS_LOGICAL_XML_PIXELS,
+            "logical_xml": IOS_LOGICAL_XML_PIXELS,
+            "screenshot": IOS_SCREENSHOT_PIXELS,
+            "screen_pixels": IOS_SCREENSHOT_PIXELS,
+            "visual_pixels": IOS_SCREENSHOT_PIXELS,
+            # ``page_pixels`` is used by older records for screenshot space.
+            "page_pixels": IOS_SCREENSHOT_PIXELS,
+            "normalized": IOS_NORMALIZED,
+            "normalized_coordinates": IOS_NORMALIZED,
+            "xml_relative_0_1": IOS_NORMALIZED,
+            "screenshot_relative_0_1": IOS_NORMALIZED,
+            "visual_relative_0_1": IOS_NORMALIZED,
+            "relative": IOS_NORMALIZED,
+            "unit": IOS_NORMALIZED,
+            "unit_coordinates": IOS_NORMALIZED,
+        }
+        return aliases.get(normalized, normalized or default)
+
+    def restore_xml_bbox(
+        bbox: list[float] | tuple[float, ...], *, declared_space: Any = None
+    ) -> list[float]:
         values = [float(value) for value in bbox]
-        if max(values) <= 1.000001:
+        space = coordinate_space(declared_space, default="")
+        if space == IOS_NORMALIZED or (not space and max(values) <= 1.000001):
             return [
                 values[0] * width,
                 values[1] * height,
                 values[2] * width,
                 values[3] * height,
             ]
-        if screenshot_scaled_xml:
+        if space == IOS_SCREENSHOT_PIXELS or (not space and screenshot_scaled_xml):
             return [
                 values[0] * scale_x,
                 values[1] * scale_y,
@@ -114,28 +146,54 @@ def correct_ios_coordinate_spaces(
             ]
         return values
 
-    def restore_visual_bbox(bbox: list[float] | tuple[float, ...]) -> list[float]:
+    def restore_visual_bbox(
+        bbox: list[float] | tuple[float, ...], *, declared_space: Any = None
+    ) -> list[float]:
         values = [float(value) for value in bbox]
-        if max(values) <= 1.000001 and visual_width > 1 and visual_height > 1:
+        space = coordinate_space(declared_space, default=IOS_SCREENSHOT_PIXELS)
+        if space == IOS_NORMALIZED or (
+            not declared_space and max(values) <= 1.000001
+        ):
             return [
                 values[0] * visual_width,
                 values[1] * visual_height,
                 values[2] * visual_width,
                 values[3] * visual_height,
             ]
+        if space == IOS_LOGICAL_XML_PIXELS:
+            return [
+                values[0] / scale_x,
+                values[1] / scale_y,
+                values[2] / scale_x,
+                values[3] / scale_y,
+            ]
         return values
 
     for node in nodes:
+        metadata = node.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+            node["metadata"] = metadata
+        node_bbox_space = metadata.get("bbox_coordinate_space") or bbox_coordinate_space
+        node_visual_space = (
+            metadata.get("visual_bbox_coordinate_space")
+            or visual_bbox_coordinate_space
+        )
         bbox = node.get("bbox")
         if bbox:
-            node["bbox"] = restore_xml_bbox(bbox)
+            node["bbox"] = restore_xml_bbox(bbox, declared_space=node_bbox_space)
+            metadata["bbox_coordinate_space"] = IOS_LOGICAL_XML_PIXELS
         visual_bbox = node.get("visual_bbox")
         if visual_bbox:
-            node["visual_bbox"] = restore_visual_bbox(visual_bbox)
-        metadata = node.get("metadata")
-        if isinstance(metadata, dict) and metadata.get("visual_bbox"):
-            metadata["visual_bbox"] = restore_visual_bbox(metadata["visual_bbox"])
-            metadata["visual_bbox_coordinate_space"] = "page_pixels"
+            node["visual_bbox"] = restore_visual_bbox(
+                visual_bbox, declared_space=node_visual_space
+            )
+        if metadata.get("visual_bbox"):
+            metadata["visual_bbox"] = restore_visual_bbox(
+                metadata["visual_bbox"], declared_space=node_visual_space
+            )
+        if visual_bbox or metadata.get("visual_bbox"):
+            metadata["visual_bbox_coordinate_space"] = IOS_SCREENSHOT_PIXELS
 
 
 def load_ios_screen(raw: Mapping[str, Any], *, root: Path | None = None) -> dict[str, Any]:
@@ -181,10 +239,30 @@ def load_ios_screen(raw: Mapping[str, Any], *, root: Path | None = None) -> dict
     graph_record["nodes"] = [_node_payload(node) for node in graph_record["nodes"]]
     display_width = display_width or float(graph_record["width"] or 0)
     display_height = display_height or float(graph_record["height"] or 0)
+    root_metadata = (
+        graph_record["nodes"][0].get("metadata", {})
+        if graph_record.get("nodes")
+        else {}
+    )
+    declared_bbox_space = (
+        raw.get("bbox_coordinate_space")
+        or raw.get("xml_bbox_coordinate_space")
+        or raw.get("coordinate-space")
+        or raw.get("coordinate_space")
+        or root_metadata.get("bbox_coordinate_space")
+    )
+    declared_visual_bbox_space = (
+        raw.get("visual_bbox_coordinate_space")
+        or raw.get("visual-coordinate-space")
+        or raw.get("visual_coordinate_space")
+        or root_metadata.get("visual_bbox_coordinate_space")
+    )
     correct_ios_coordinate_spaces(
         graph_record,
         visual_width=display_width,
         visual_height=display_height,
+        bbox_coordinate_space=declared_bbox_space,
+        visual_bbox_coordinate_space=declared_visual_bbox_space,
     )
     graph_record.setdefault("metadata", {})["visual_display_size"] = [
         display_width,

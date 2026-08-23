@@ -743,6 +743,32 @@ def _node_metadata(payload: dict[str, Any]) -> dict[str, Any]:
     )
     if visual_bbox is not None:
         metadata["visual_bbox"] = visual_bbox
+    bbox_coordinate_space = _first_present(
+        payload,
+        (
+            "bbox-coordinate-space",
+            "bbox_coordinate_space",
+            "xml-bbox-coordinate-space",
+            "xml_bbox_coordinate_space",
+            "coordinate-space",
+            "coordinate_space",
+        ),
+    )
+    if bbox_coordinate_space is not None:
+        metadata["bbox_coordinate_space"] = str(bbox_coordinate_space)
+    visual_bbox_coordinate_space = _first_present(
+        payload,
+        (
+            "visual-bbox-coordinate-space",
+            "visual_bbox_coordinate_space",
+            "visual-coordinate-space",
+            "visual_coordinate_space",
+        ),
+    )
+    if visual_bbox_coordinate_space is not None:
+        metadata["visual_bbox_coordinate_space"] = str(
+            visual_bbox_coordinate_space
+        )
     if "candidate" in payload:
         metadata["candidate"] = _truthy(payload.get("candidate"))
     if "node-id" in payload:
