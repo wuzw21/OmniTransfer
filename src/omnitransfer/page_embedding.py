@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import hashlib
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -18,13 +19,14 @@ from omnitransfer.ui_graph import UIGraph, graph_from_record
 
 
 DEFAULT_PAGE_EMBEDDING_CHECKPOINT = (
-    Path(__file__).resolve().parent
-    / "checkpoints"
-    / "omnitransfer_unified_association_v1_20260819"
-    / "relation_slots_l3_h64_seed17.npz"
+    Path(__file__).resolve().parents[2]
+    / "output"
+    / "point_sparse_graph_original_multimodal_v1"
+    / "full_seed17"
+    / "model.pt"
 )
 DEFAULT_PAGE_EMBEDDING_CHECKPOINT_SHA256 = (
-    "c262f03c32c4b88d2933323fe2b33007281224ef1a8aae1418a9844d354de232"
+    "3b783ed113fc37397e2f092d133e970ec36bdbf0d26e262d9273389e4729d16f"
 )
 PAGE_EMBEDDING_TYPE = "configuration"
 STABLE_CONFIGURATION_EMBEDDING_TYPE = "stable_configuration"
@@ -34,6 +36,21 @@ PAGE_EMBEDDING_TYPES = (
     ACTIVE_STATE_EMBEDDING_TYPE,
     PAGE_EMBEDDING_TYPE,
 )
+
+
+def configured_matcher_checkpoint(
+    checkpoint: str | Path | None = None,
+) -> Path:
+    """Resolve the one V10 checkpoint used by page and node matching."""
+
+    configured = str(os.environ.get("OMNITRANSFER_MATCHER_CHECKPOINT") or "").strip()
+    return (
+        Path(checkpoint).expanduser().resolve()
+        if checkpoint is not None
+        else Path(configured).expanduser().resolve()
+        if configured
+        else DEFAULT_PAGE_EMBEDDING_CHECKPOINT.resolve()
+    )
 
 
 @dataclass(frozen=True)
@@ -93,11 +110,7 @@ class OmniTransferPageEmbedder:
         *,
         device: str = "cpu",
     ) -> None:
-        selected = (
-            Path(checkpoint).expanduser().resolve()
-            if checkpoint is not None
-            else DEFAULT_PAGE_EMBEDDING_CHECKPOINT.resolve()
-        )
+        selected = configured_matcher_checkpoint(checkpoint)
         if not selected.is_file():
             raise FileNotFoundError(f"page embedding checkpoint missing: {selected}")
         self.checkpoint_path = selected

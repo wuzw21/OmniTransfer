@@ -738,6 +738,13 @@ def _node_metadata(payload: dict[str, Any]) -> dict[str, Any]:
         raw_value = _first_present(payload, aliases)
         metadata[f"{name}_present"] = raw_value is not None
         metadata[name] = _truthy(raw_value) if raw_value is not None else False
+    long_clickable = _first_present(
+        payload,
+        ("long-clickable", "long_clickable", "isLongClickable"),
+    )
+    metadata["long_clickable"] = (
+        _truthy(long_clickable) if long_clickable is not None else False
+    )
     visual_bbox = _parse_bounds(
         _first_present(payload, ("visual-bbox", "visual_bbox"))
     )

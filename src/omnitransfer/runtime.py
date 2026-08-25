@@ -16,22 +16,23 @@ from omnitransfer.numpy_v9_matcher import NumpyGeometricAlignmentMatcher
 from omnitransfer.page_embedding import (
     DEFAULT_PAGE_EMBEDDING_CHECKPOINT,
     DEFAULT_PAGE_EMBEDDING_CHECKPOINT_SHA256,
+    configured_matcher_checkpoint,
 )
 from omnitransfer.ui_graph import UIGraph, UINode, graph_from_record
 
 _MIN_ANCHOR_OFFSET = -1.0
 _MAX_ANCHOR_OFFSET = 2.0
-_MATCHER_RELEASE = "omnitransfer-unified-association-v1-mobile"
-_MATCHER_MODE = "omnitransfer_unified_association_v1"
+_MATCHER_RELEASE = "omnitransfer-point-conditioned-sparse-graph-v10"
+_MATCHER_MODE = "omnitransfer_point_conditioned_sparse_graph_v10"
 _DEFAULT_MATCHER_CHECKPOINT = DEFAULT_PAGE_EMBEDDING_CHECKPOINT
 _DEFAULT_MATCHER_SHA256 = DEFAULT_PAGE_EMBEDDING_CHECKPOINT_SHA256
-_MATCHER_FEATURE_SCHEMA_ID = "omnitransfer-unified-association-v1"
+_MATCHER_FEATURE_SCHEMA_ID = "omnitransfer-point-conditioned-sparse-graph-v10"
 _MATCHER_FEATURE_SCHEMA_SPEC = (
     "node_encoder=learned_token_lookup,content_desc,class,action_state,deterministic_icon_v1;"
     "modality_fusion=sharp_learned_attention_missing_aware;"
-    "within_page_relations=typed_hierarchy,sibling,ancestor,descendant,row,column,"
-    "overlap,neighbors,near,control_context;"
-    "refinement=three_layer_local_graph_plus_bidirectional_cross_page_attention;"
+    "within_page_relations=point_conditioned_sparse_graph,typed_hierarchy,sibling,"
+    "ancestor,descendant,row,column,overlap,neighbors,near,control_context;"
+    "refinement=two_layer_sparse_local_graph_plus_bidirectional_cross_page_attention;"
     "assignment=partial_bidirectional_matchability;"
     "page_embedding=attention_pool_normalized;"
     "forbidden=resource_id_lookup,node_id_lookup,raw_absolute_position,"
@@ -44,7 +45,7 @@ _CANDIDATE_RANKING_SCHEMA_VERSION = "omnitransfer.candidate-ranking.v1"
 
 
 def _configured_matcher_checkpoint() -> Path:
-    return _DEFAULT_MATCHER_CHECKPOINT.resolve()
+    return configured_matcher_checkpoint()
 
 
 def _configured_matcher_mode() -> str:
@@ -132,7 +133,16 @@ def rank_action_candidates(
             top_k=top_k,
             identity=identity,
         )
-    offset = _source_offset(source_node, source_point, source_offset)
+    source_execution_node = _execution_target(
+        source,
+        source_node,
+        action_type=action_type,
+    )
+    offset = _source_offset(
+        source_execution_node or source_node,
+        source_point,
+        source_offset,
+    )
     if offset is None:
         return _candidate_ranking_result(
             status="invalid_input",
@@ -239,7 +249,12 @@ def _candidate_ranking_result(
     if mapping_mode is None:
         mapping_mode = _configured_matcher_mode()
     ranked_values = list(ranked or ())
-    candidates = _projected_candidate_dicts(ranked_values, offset)
+    candidates = _projected_candidate_dicts(
+        ranked_values,
+        offset,
+        target,
+        action_type=action_type,
+    )
     result: dict[str, Any] = {
         "schema_version": _CANDIDATE_RANKING_SCHEMA_VERSION,
         "status": status,
@@ -269,13 +284,22 @@ def _candidate_ranking_result(
 def _projected_candidate_dicts(
     ranked: list[tuple[float, UINode]],
     offset: tuple[float, float] | None,
+    graph: UIGraph | None,
+    *,
+    action_type: str,
 ) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     for candidate_score, candidate in ranked:
         bounds = candidate.bbox
         if bounds is None:
             continue
-        projected = _project_offset(offset or (0.5, 0.5), bounds)
+        execution = (
+            _execution_target(graph, candidate, action_type=action_type)
+            if graph is not None
+            else None
+        )
+        execution_bounds = execution.bbox if execution is not None else bounds
+        projected = _project_offset(offset or (0.5, 0.5), execution_bounds)
         candidates.append(
             {
                 "candidate_id": _public_node_id(candidate),
@@ -284,12 +308,43 @@ def _projected_candidate_dicts(
                 "content_desc": candidate.content_desc,
                 "class": candidate.class_name,
                 "bbox": list(bounds),
+                "execution_candidate_id": (
+                    _public_node_id(execution) if execution is not None else ""
+                ),
+                "execution_bbox": list(execution_bounds),
+                "executable": execution is not None,
                 "score": float(candidate_score),
                 "new_x": projected[0],
                 "new_y": projected[1],
             }
         )
     return candidates
+
+
+def _execution_target(
+    graph: UIGraph,
+    node: UINode,
+    *,
+    action_type: str,
+) -> UINode | None:
+    """Resolve physical action ownership without changing correspondence identity."""
+
+    nodes = {candidate.node_id: candidate for candidate in graph.nodes}
+    current: UINode | None = node
+    while current is not None:
+        if current.bbox is not None and current.enabled:
+            if action_type == "click" and current.clickable:
+                return current
+            if action_type == "input_text" and current.editable:
+                return current
+            if action_type == "swipe" and current.scrollable:
+                return current
+            if action_type == "long_press" and bool(
+                current.metadata.get("long_clickable")
+            ):
+                return current
+        current = nodes.get(current.parent_id or "")
+    return None
 
 
 def _page_identity(
@@ -496,6 +551,8 @@ def _source_offset(
     point: tuple[float, float] | None,
     explicit: tuple[float, float] | None,
 ) -> tuple[float, float] | None:
+    if point is not None and source.bbox is not None:
+        return _offset(point, source.bbox)
     if explicit is not None:
         try:
             offset = float(explicit[0]), float(explicit[1])
@@ -508,8 +565,6 @@ def _source_offset(
         ):
             return None
         return offset
-    if point is not None and source.bbox is not None:
-        return _offset(point, source.bbox)
     if source.bbox is not None:
         return 0.5, 0.5
     return None
