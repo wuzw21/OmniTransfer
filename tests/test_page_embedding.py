@@ -43,11 +43,13 @@ def test_page_embedding_uses_contextual_page_attention_output(monkeypatch) -> No
         "graph_from_record",
         lambda *_args, **_kwargs: SimpleNamespace(nodes=[object(), object()]),
     )
-    monkeypatch.setattr(
-        page_embedding,
-        "matcher_inputs",
-        lambda *_args, **_kwargs: tuple(object() for _ in range(11)),
-    )
+    calls = []
+
+    def single_page_inputs(*_args, **_kwargs):
+        calls.append("page")
+        return tuple(object() for _ in range(5))
+
+    monkeypatch.setattr(page_embedding, "page_inputs", single_page_inputs)
     embedder = _embedder(Model())
 
     result = embedder.embed(
@@ -62,6 +64,7 @@ def test_page_embedding_uses_contextual_page_attention_output(monkeypatch) -> No
     assert result.graph_id == "page"
     assert result.checkpoint_sha256 == "checkpoint-sha"
     assert result.backend == "torch"
+    assert calls == ["page"]
 
 
 @pytest.mark.parametrize(
@@ -91,8 +94,8 @@ def test_page_embedding_selects_the_requested_shared_readout(
     )
     monkeypatch.setattr(
         page_embedding,
-        "matcher_inputs",
-        lambda *_args, **_kwargs: tuple(object() for _ in range(11)),
+        "page_inputs",
+        lambda *_args, **_kwargs: tuple(object() for _ in range(5)),
     )
 
     result = _embedder(Model()).embed(

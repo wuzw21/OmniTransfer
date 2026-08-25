@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import math
 import re
 from collections.abc import Iterable
@@ -24,16 +25,10 @@ RELATION_FEATURE_DIM = 18
 LEGACY_XML_NODE_FEATURE_DIM = 32
 PARENT_RELATIVE_LAYOUT_FEATURE_DIM = 6
 NODE_STATE_FEATURE_DIM = 12
-EXACT_LOCAL_ORDER_BUCKETS = 18
-LOCAL_POSITION_BUCKETS = 9
-LOCAL_ORDER_FEATURE_DIM = 7 * EXACT_LOCAL_ORDER_BUCKETS + 2 * LOCAL_POSITION_BUCKETS
 XML_NODE_FEATURE_DIM = (
     LEGACY_XML_NODE_FEATURE_DIM + PARENT_RELATIVE_LAYOUT_FEATURE_DIM
 )
 STATE_AWARE_XML_NODE_FEATURE_DIM = XML_NODE_FEATURE_DIM + NODE_STATE_FEATURE_DIM
-LOCAL_ORDER_XML_NODE_FEATURE_DIM = (
-    STATE_AWARE_XML_NODE_FEATURE_DIM + LOCAL_ORDER_FEATURE_DIM
-)
 TEXT_DESCRIPTOR_DIM = 48
 VISUAL_DESCRIPTOR_DIM = 48
 MULTISCALE_VISUAL_DESCRIPTOR_DIM = VISUAL_DESCRIPTOR_DIM * 2
@@ -44,9 +39,17 @@ NODE_DESCRIPTOR_DIM = (
 LEGACY_GEOMETRIC_FEATURE_SCHEMA_ID = "omnitransfer-direct-pair-evidence-v7"
 GEOMETRIC_FEATURE_SCHEMA_ID = "omnitransfer-parent-relative-layout-v8"
 STATE_AWARE_GEOMETRIC_FEATURE_SCHEMA_ID = "omnitransfer-state-aware-v9"
-LOCAL_ORDER_GEOMETRIC_FEATURE_SCHEMA_ID = "omnitransfer-local-order-v10"
 OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE = (
     "omnitransfer_geometric_alignment_v9"
+)
+POINT_CONDITIONED_SPARSE_GRAPH_ARCHITECTURE = (
+    "omnitransfer_point_conditioned_sparse_graph_v10"
+)
+SUPPORTED_MATCHER_ARCHITECTURES = frozenset(
+    {
+        OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE,
+        POINT_CONDITIONED_SPARSE_GRAPH_ARCHITECTURE,
+    }
 )
 DIRECT_PAIR_EVIDENCE_NAMES = (
     "semantic_exact",
@@ -128,6 +131,7 @@ REPLACEMENT_SCORE_UPDATE = "replacement_v1"
 UNARY_RESIDUAL_SCORE_UPDATE = "unary_plus_local_v2"
 FIXED_NEIGHBOR_SELECTION = "fixed_priority_v1"
 LEARNED_NEIGHBOR_SELECTION = "learned_relation_v2"
+POINT_CONDITIONED_SPARSE_GRAPH_SELECTION = "point_conditioned_sparse_graph_v1"
 
 
 def is_multiscale_visual_encoder(visual_encoder: str) -> bool:
@@ -173,10 +177,19 @@ class MatcherConfig:
     semantic_exact_decoder_bonus: float = 0.0
     semantic_exact_decoder_top_k: int = SEMANTIC_EXACT_DECODER_TOP_K
     semantic_exact_decoder_max_margin: float = SEMANTIC_EXACT_DECODER_MAX_MARGIN
-    feature_schema_id: str = LOCAL_ORDER_GEOMETRIC_FEATURE_SCHEMA_ID
+    feature_schema_id: str = STATE_AWARE_GEOMETRIC_FEATURE_SCHEMA_ID
     score_update: str = UNARY_RESIDUAL_SCORE_UPDATE
     neighbor_selection: str = LEARNED_NEIGHBOR_SELECTION
     local_neighbor_limit: int = 5
+    local_graph_layers: int = 2
+    # Hard cap for the pre-model locality envelope.  This is separate from
+    # local_neighbor_limit: v10 still learns variable active support with
+    # entmax, but it never materializes an N x N relation tensor first.
+    local_candidate_limit: int = 16
+    # These are tolerant high-recall envelopes, not learned importance cutoffs.
+    # Point-conditioned bandwidths learn the effective scale inside them.
+    local_spatial_radius: float = 0.35
+    local_tree_hops: int = 4
 
 
 def visual_descriptor_dim(visual_encoder: str) -> int:
@@ -194,8 +207,6 @@ def xml_node_feature_dim(feature_schema_id: str) -> int:
         return XML_NODE_FEATURE_DIM
     if feature_schema_id == STATE_AWARE_GEOMETRIC_FEATURE_SCHEMA_ID:
         return STATE_AWARE_XML_NODE_FEATURE_DIM
-    if feature_schema_id == LOCAL_ORDER_GEOMETRIC_FEATURE_SCHEMA_ID:
-        return LOCAL_ORDER_XML_NODE_FEATURE_DIM
     raise ValueError(f"unsupported matcher feature schema: {feature_schema_id}")
 
 
@@ -209,6 +220,23 @@ class EncodedGraph:
     token_ids: tuple[tuple[int, ...], ...]
     numeric_features: tuple[tuple[float, ...], ...]
     relation_features: Any
+
+
+@dataclass(frozen=True)
+class BoundedRelations:
+    """Per-node bounded relation features in padded adjacency-list form."""
+
+    features: Any
+    neighbor_indices: Any
+    mask: Any
+
+
+@dataclass(frozen=True)
+class _KdNode:
+    index: int
+    axis: int
+    left: "_KdNode | None"
+    right: "_KdNode | None"
 
 
 @dataclass(frozen=True)
@@ -265,7 +293,6 @@ def encode_graph(
         LEGACY_GEOMETRIC_FEATURE_SCHEMA_ID,
         GEOMETRIC_FEATURE_SCHEMA_ID,
         STATE_AWARE_GEOMETRIC_FEATURE_SCHEMA_ID,
-        LOCAL_ORDER_GEOMETRIC_FEATURE_SCHEMA_ID,
     }:
         raise ValueError(f"unsupported matcher feature schema: {feature_schema_id}")
     relation_context = (
@@ -292,7 +319,16 @@ def encode_graph(
             )
             for node in graph.nodes
         ),
-        relation_features=_relation_features(graph),
+        relation_features=(
+            _bounded_relation_features(
+                graph,
+                candidate_limit=cfg.local_candidate_limit,
+                spatial_radius=cfg.local_spatial_radius,
+                tree_hops=cfg.local_tree_hops,
+            )
+            if cfg.architecture == POINT_CONDITIONED_SPARSE_GRAPH_ARCHITECTURE
+            else _relation_features(graph)
+        ),
     )
 
 
@@ -494,8 +530,8 @@ def build_geometric_v9_matcher(
     """Build the canonical geometric-v9 matcher."""
 
     cfg = config or MatcherConfig()
-    if cfg.architecture != OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE:
-        raise ValueError("only the geometric-v9 matcher is supported")
+    if cfg.architecture not in SUPPORTED_MATCHER_ARCHITECTURES:
+        raise ValueError("unsupported OmniTransfer matcher architecture")
     from omnitransfer.geometric_matcher import build_geometric_matcher
 
     return build_geometric_matcher(cfg)
@@ -544,11 +580,30 @@ def page_inputs(
         dtype=torch.float32,
         device=device,
     )
-    relations = torch.as_tensor(
-        encoded.relation_features,
-        dtype=torch.float32,
-        device=device,
-    )
+    if isinstance(encoded.relation_features, BoundedRelations):
+        relations = BoundedRelations(
+            features=torch.as_tensor(
+                encoded.relation_features.features,
+                dtype=torch.float32,
+                device=device,
+            ),
+            neighbor_indices=torch.as_tensor(
+                encoded.relation_features.neighbor_indices,
+                dtype=torch.long,
+                device=device,
+            ),
+            mask=torch.as_tensor(
+                encoded.relation_features.mask,
+                dtype=torch.bool,
+                device=device,
+            ),
+        )
+    else:
+        relations = torch.as_tensor(
+            encoded.relation_features,
+            dtype=torch.float32,
+            device=device,
+        )
     visual, visual_mask = _visual_inputs(
         graph,
         patch_size=cfg.visual_patch_size,
@@ -634,8 +689,8 @@ class GeometricMatcher:
         if int(config_payload.get("state_embedding_dim") or 0) <= 0:
             config_payload["state_embedding_dim"] = MatcherConfig().state_embedding_dim
         config = MatcherConfig(**config_payload)
-        if config.architecture != OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE:
-            raise ValueError("only geometric-v9 checkpoints are supported")
+        if config.architecture not in SUPPORTED_MATCHER_ARCHITECTURES:
+            raise ValueError("unsupported OmniTransfer checkpoint architecture")
         model = build_geometric_v9_matcher(config)
         state_dict = dict(payload["state_dict"])
         if payload.get("schema_version") == "omnitransfer.page_local_matcher.v1":
@@ -650,11 +705,34 @@ class GeometricMatcher:
                 "page_pair_context.1.weight",
                 "page_pair_context.1.bias",
             }
+            deprecated_prefixes: tuple[str, ...] = ()
+            if config.architecture == POINT_CONDITIONED_SPARSE_GRAPH_ARCHITECTURE:
+                # Early v10 checkpoints inherited dormant v9 local modules.
+                # They never participated in the v10 forward path, so compact
+                # checkpoints omit them without changing learned behavior.
+                deprecated.update(
+                    {
+                        "relation_compatibility",
+                        "correspondence_evidence.weight",
+                    }
+                )
+                deprecated_prefixes = (
+                    "relation_key.",
+                )
             unexpected = set(state_dict).difference(target_state)
-            if unexpected.difference(deprecated):
+            unsupported = {
+                name
+                for name in unexpected.difference(deprecated)
+                if not name.startswith(deprecated_prefixes)
+                and not (
+                    name.startswith("association_layers.")
+                    and ".local." in name
+                )
+            }
+            if unsupported:
                 raise ValueError(
                     "checkpoint contains unsupported parameters: "
-                    + ", ".join(sorted(unexpected.difference(deprecated)))
+                    + ", ".join(sorted(unsupported))
                 )
             compatible = {}
             for name, target in target_state.items():
@@ -895,8 +973,8 @@ def save_matcher_checkpoint(
     torch = _require_torch()
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    if config.architecture != OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE:
-        raise ValueError("only geometric-v9 checkpoints are supported")
+    if config.architecture not in SUPPORTED_MATCHER_ARCHITECTURES:
+        raise ValueError("unsupported OmniTransfer checkpoint architecture")
     torch.save(
         {
             "schema_version": "omnitransfer.page_local_matcher.v1",
@@ -912,7 +990,6 @@ NODE_ENCODER_PARAMETER_PREFIXES = (
     "token_embedding.",
     "text_projection.",
     "xml_projection.",
-    "local_order_projection.",
     "visual_encoder.",
     "present_text",
     "missing_text",
@@ -964,6 +1041,23 @@ def initialize_v9_backbone_from_checkpoint(
     )
 
 
+def initialize_complete_matcher_from_checkpoint(
+    model: Any,
+    checkpoint: str | Path,
+) -> tuple[str, ...]:
+    """Load every shape-compatible parameter from a matcher checkpoint."""
+
+    # Use the current state names as exact prefixes.  This keeps the helper
+    # tolerant of experimental heads being added or removed while preserving
+    # the existing XML widening rule in the common initializer.
+    return _initialize_parameters_from_checkpoint(
+        model,
+        checkpoint,
+        prefixes=tuple(model.state_dict().keys()),
+        description="complete matcher",
+    )
+
+
 def _initialize_parameters_from_checkpoint(
     model: Any,
     checkpoint: str | Path,
@@ -983,31 +1077,6 @@ def _initialize_parameters_from_checkpoint(
             continue
         target_value = target_state.get(name)
         if target_value is None:
-            continue
-        if (
-            name == "missing_visual"
-            and target_value.ndim == source_value.ndim == 1
-            and target_value.shape[0] == source_value.shape[0] * 2
-        ):
-            widened = target_value.detach().clone().zero_()
-            widened[: source_value.shape[0]] = source_value.to(
-                target_value.device
-            )
-            target_state[name] = widened
-            transferred.append(name)
-            continue
-        if (
-            name == "visual_to_hidden.weight"
-            and target_value.ndim == source_value.ndim == 2
-            and target_value.shape[0] == source_value.shape[0]
-            and target_value.shape[1] == source_value.shape[1] * 2
-        ):
-            widened = target_value.detach().clone().zero_()
-            widened[:, : source_value.shape[1]] = source_value.to(
-                target_value.device
-            )
-            target_state[name] = widened
-            transferred.append(name)
             continue
         if (
             name == "xml_projection.1.weight"
@@ -1622,13 +1691,6 @@ def _multimodal_xml_features(
             *_parent_relative_layout_features(node, graph),
             *_node_state_features(node),
         )
-    elif feature_schema_id == LOCAL_ORDER_GEOMETRIC_FEATURE_SCHEMA_ID:
-        values = (
-            *legacy_values,
-            *_parent_relative_layout_features(node, graph),
-            *_node_state_features(node),
-            *_exact_local_order_features(node, graph),
-        )
     else:
         raise ValueError(f"unsupported matcher feature schema: {feature_schema_id}")
     if len(values) != xml_node_feature_dim(feature_schema_id):
@@ -1653,85 +1715,6 @@ def _node_state_features(node: UINode) -> tuple[float, ...]:
             )
         )
     return tuple(values)
-
-
-def _categorical_one_hot(
-    value: int | None,
-    *,
-    maximum: int = 15,
-) -> tuple[float, ...]:
-    """Preserve an exact local integer with overflow and missing buckets."""
-
-    bucket_count = maximum + 3
-    bucket = maximum + 2 if value is None or value < 0 else min(value, maximum + 1)
-    return tuple(float(index == bucket) for index in range(bucket_count))
-
-
-def _local_position_one_hot(value: float | None) -> tuple[float, ...]:
-    """Discretize a parent-relative coordinate with an explicit missing bucket."""
-
-    bucket = 8 if value is None else min(7, max(0, int(value * 8.0)))
-    return tuple(float(index == bucket) for index in range(LOCAL_POSITION_BUCKETS))
-
-
-def _exact_local_order_features(
-    node: UINode,
-    graph: UIGraph,
-) -> tuple[float, ...]:
-    """Return categorical local order evidence without treating paths as identity."""
-
-    nodes_by_id = {candidate.node_id: candidate for candidate in graph.nodes}
-    parent = nodes_by_id.get(node.parent_id or "")
-
-    def child_position(candidate: UINode | None) -> tuple[int | None, int | None, int]:
-        if candidate is None or not candidate.parent_id:
-            return None, None, 0
-        candidate_parent = nodes_by_id.get(candidate.parent_id)
-        if candidate_parent is None:
-            return None, None, 0
-        siblings = candidate_parent.child_ids
-        try:
-            index = siblings.index(candidate.node_id)
-        except ValueError:
-            return None, None, len(siblings)
-        return index, len(siblings) - index - 1, len(siblings)
-
-    sibling_index, reverse_sibling_index, sibling_count = child_position(node)
-    parent_index, _, _ = child_position(parent)
-    grandparent = nodes_by_id.get(parent.parent_id or "") if parent else None
-    grandparent_index, _, _ = child_position(grandparent)
-
-    node_bbox = _normalized_bbox(node.bbox, graph)
-    parent_bbox = _normalized_bbox(parent.bbox, graph) if parent is not None else None
-    if node_bbox is None or parent_bbox is None:
-        relative_x = relative_y = None
-    else:
-        parent_width = max(parent_bbox[2] - parent_bbox[0], 1e-6)
-        parent_height = max(parent_bbox[3] - parent_bbox[1], 1e-6)
-        relative_x = (
-            (node_bbox[0] + node_bbox[2]) * 0.5 - parent_bbox[0]
-        ) / parent_width
-        relative_y = (
-            (node_bbox[1] + node_bbox[3]) * 0.5 - parent_bbox[1]
-        ) / parent_height
-
-    exact_values = (
-        sibling_index,
-        reverse_sibling_index,
-        sibling_count,
-        len(node.child_ids),
-        int(node.depth),
-        parent_index,
-        grandparent_index,
-    )
-    values = tuple(
-        feature
-        for value in exact_values
-        for feature in _categorical_one_hot(value)
-    ) + _local_position_one_hot(relative_x) + _local_position_one_hot(relative_y)
-    if len(values) != LOCAL_ORDER_FEATURE_DIM:
-        raise AssertionError("unexpected exact local order feature dimension")
-    return values
 
 
 def _parent_relative_layout_features(
@@ -1818,6 +1801,160 @@ def _hashed_attribute_features(value: str, dimension: int) -> tuple[float, ...]:
     return tuple(values)
 
 
+
+
+def _build_kd_tree(
+    indices: list[int],
+    centers: tuple[tuple[float, float], ...],
+    *,
+    depth: int = 0,
+) -> _KdNode | None:
+    if not indices:
+        return None
+    axis = depth % 2
+    ordered = sorted(indices, key=lambda index: (centers[index][axis], index))
+    middle = len(ordered) // 2
+    return _KdNode(
+        index=ordered[middle],
+        axis=axis,
+        left=_build_kd_tree(ordered[:middle], centers, depth=depth + 1),
+        right=_build_kd_tree(ordered[middle + 1 :], centers, depth=depth + 1),
+    )
+
+
+def _nearest_spatial_indices(
+    root: _KdNode | None,
+    centers: tuple[tuple[float, float], ...],
+    *,
+    query_index: int,
+    limit: int,
+    radius: float,
+) -> tuple[int, ...]:
+    """Return exact bounded nearest neighbours without an all-pairs scan."""
+
+    if root is None or limit <= 0:
+        return ()
+    query = centers[query_index]
+    radius_squared = float(radius) ** 2
+    heap: list[tuple[float, int]] = []
+
+    def visit(node: _KdNode | None) -> None:
+        if node is None:
+            return
+        point = centers[node.index]
+        delta_x = point[0] - query[0]
+        delta_y = point[1] - query[1]
+        distance_squared = delta_x * delta_x + delta_y * delta_y
+        if node.index != query_index and distance_squared <= radius_squared:
+            candidate = (-distance_squared, -node.index)
+            if len(heap) < limit:
+                heapq.heappush(heap, candidate)
+            elif candidate > heap[0]:
+                heapq.heapreplace(heap, candidate)
+
+        axis_delta = point[node.axis] - query[node.axis]
+        near = node.left if axis_delta > 0.0 else node.right
+        far = node.right if axis_delta > 0.0 else node.left
+        visit(near)
+        threshold = radius_squared
+        if len(heap) >= limit:
+            threshold = min(threshold, -heap[0][0])
+        if axis_delta * axis_delta <= threshold:
+            visit(far)
+
+    visit(root)
+    return tuple(
+        -item[1]
+        for item in sorted(
+            heap,
+            key=lambda item: (-item[0], -item[1]),
+        )
+    )
+
+
+def _bounded_relation_features(
+    graph: UIGraph,
+    *,
+    candidate_limit: int,
+    spatial_radius: float,
+    tree_hops: int,
+) -> BoundedRelations:
+    """Build a bounded local graph while retaining every node as an endpoint."""
+
+    if candidate_limit <= 0:
+        raise ValueError("local candidate limit must be positive")
+    np = _require_numpy()
+    context = _relation_context(graph)
+    node_count = len(graph.nodes)
+    width = max(1, min(int(candidate_limit), max(1, node_count - 1)))
+    features = np.zeros(
+        (node_count, width, RELATION_FEATURE_DIM),
+        dtype=np.float32,
+    )
+    neighbor_indices = np.zeros((node_count, width), dtype=np.int64)
+    mask = np.zeros((node_count, width), dtype=bool)
+    if node_count <= 1:
+        return BoundedRelations(features, neighbor_indices, mask)
+
+    nodes_by_id = {node.node_id: node for node in graph.nodes}
+    spatial_indices = [
+        index for index, bbox in enumerate(context.bboxes) if bbox is not None
+    ]
+    spatial_tree = _build_kd_tree(spatial_indices, context.centers)
+
+    for source_index, source_node in enumerate(graph.nodes):
+        candidates: list[int] = []
+        seen = {source_index}
+
+        def add(target_index: int | None) -> None:
+            if (
+                target_index is not None
+                and target_index not in seen
+                and len(candidates) < width
+            ):
+                seen.add(target_index)
+                candidates.append(target_index)
+
+        # Preserve the strongest XML topology first.  Adjacent siblings carry
+        # sequence role without turning a wide container into a clique.
+        add(context.node_indices.get(source_node.parent_id or ""))
+        for child_id in source_node.child_ids:
+            add(context.node_indices.get(child_id))
+        parent = nodes_by_id.get(source_node.parent_id or "")
+        if parent is not None and source_node.node_id in parent.child_ids:
+            position = parent.child_ids.index(source_node.node_id)
+            for sibling_position in (position - 1, position + 1):
+                if 0 <= sibling_position < len(parent.child_ids):
+                    add(context.node_indices.get(parent.child_ids[sibling_position]))
+        for ancestor_id in context.ancestor_paths[source_node.node_id][
+            1 : int(tree_hops) + 1
+        ]:
+            add(context.node_indices.get(ancestor_id))
+
+        if context.bboxes[source_index] is not None and len(candidates) < width:
+            for target_index in _nearest_spatial_indices(
+                spatial_tree,
+                context.centers,
+                query_index=source_index,
+                limit=width,
+                radius=spatial_radius,
+            ):
+                add(target_index)
+
+        for slot, target_index in enumerate(candidates):
+            neighbor_indices[source_index, slot] = target_index
+            mask[source_index, slot] = True
+            features[source_index, slot] = _contextual_node_relation(
+                source_index,
+                target_index,
+                context,
+                context,
+                same_graph=True,
+            )
+        if len(candidates) < width:
+            neighbor_indices[source_index, len(candidates) :] = source_index
+
+    return BoundedRelations(features, neighbor_indices, mask)
 
 
 def _relation_features(

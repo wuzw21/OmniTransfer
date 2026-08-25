@@ -1,10 +1,10 @@
 """The single trainable OmniTransfer page-local correspondence model.
 
-The model has one path: reuse the geometric-v9 multimodal node encoder, learn
-and fuse a bounded local neighbourhood, then repeatedly refine one real-node
-score matrix from the current soft correspondence.  The same encoded nodes
-also produce the 1024D state readout.  There is no NULL class, gate, score
-bonus, reranker, or auxiliary inference path.
+The v9 checkpoint keeps its bounded-neighbour path.  The v10 variant exposes a
+point-conditioned sparse local graph learned inside a tolerant spatial/tree
+envelope, then aligns those graphs through the same real-node correspondence
+matrix.  Both variants share one multimodal encoder and one 1024D page readout;
+neither adds a match NULL class, reranker, or auxiliary inference path.
 """
 
 from __future__ import annotations
@@ -27,19 +27,18 @@ def build_geometric_matcher(config: Any) -> Any:
         LEARNED_NEIGHBOR_SELECTION,
         LEARNED_TOKEN_LOOKUP_ENCODER,
         LEGACY_GLOBAL_POOL_VISUAL_ENCODER,
-        LOCAL_ORDER_FEATURE_DIM,
-        LOCAL_ORDER_GEOMETRIC_FEATURE_SCHEMA_ID,
         MULTISCALE_HASH_VISUAL_ENCODER,
         MULTISCALE_RESIDUAL_VISUAL_ENCODER,
-        OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE,
+        POINT_CONDITIONED_SPARSE_GRAPH_ARCHITECTURE,
+        POINT_CONDITIONED_SPARSE_GRAPH_SELECTION,
         RELATION_FEATURE_DIM,
         SPATIAL_CNN_VISUAL_ENCODER,
-        STATE_AWARE_XML_NODE_FEATURE_DIM,
         TEXT_DESCRIPTOR_DIM,
         TYPED_RELATION_NAMES,
         UNARY_RESIDUAL_SCORE_UPDATE,
         VISUAL_DESCRIPTOR_DIM,
         XML_DESCRIPTOR_DIM,
+        SUPPORTED_MATCHER_ARCHITECTURES,
         _require_torch,
         hashed_ngram_descriptor_torch,
         mutual_log_assignment,
@@ -53,22 +52,28 @@ def build_geometric_matcher(config: Any) -> Any:
     )
 
     cfg = config
-    if cfg.architecture != OMNITRANSFER_GEOMETRIC_ALIGNMENT_ARCHITECTURE:
-        raise ValueError("only the canonical OmniTransfer matcher is supported")
+    if cfg.architecture not in SUPPORTED_MATCHER_ARCHITECTURES:
+        raise ValueError("unsupported OmniTransfer matcher architecture")
     if cfg.candidate_policy != ALL_NODE_CANDIDATE_POLICY:
         raise ValueError("the matcher requires the all-node candidate policy")
     if cfg.hidden_dim <= 0:
         raise ValueError("hidden_dim must be positive")
     if cfg.relation_hidden_dim <= 0:
         raise ValueError("relation_hidden_dim must be positive")
-    if cfg.num_heads <= 0 or cfg.relation_hidden_dim % cfg.num_heads:
-        raise ValueError("num_heads must divide relation_hidden_dim")
     if cfg.association_layers <= 0:
         raise ValueError("page-local matching requires correspondence stages")
     if cfg.source_context_nodes <= 0 or cfg.target_context_nodes <= 0:
         raise ValueError("context node limits must be positive")
-    if cfg.local_neighbor_limit <= 0:
-        raise ValueError("local_neighbor_limit must be positive")
+    if cfg.local_neighbor_limit < 0:
+        raise ValueError("local_neighbor_limit must be non-negative")
+    if cfg.local_graph_layers <= 0:
+        raise ValueError("local_graph_layers must be positive")
+    if cfg.local_candidate_limit <= 0:
+        raise ValueError("local_candidate_limit must be positive")
+    if not 0.0 < cfg.local_spatial_radius <= 1.0:
+        raise ValueError("local_spatial_radius must be in (0, 1]")
+    if cfg.local_tree_hops <= 0:
+        raise ValueError("local_tree_hops must be positive")
     if cfg.router_temperature <= 0.0:
         raise ValueError("router_temperature must be positive")
     if cfg.state_embedding_dim <= 0:
@@ -78,22 +83,214 @@ def build_geometric_matcher(config: Any) -> Any:
     if cfg.neighbor_selection not in {
         FIXED_NEIGHBOR_SELECTION,
         LEARNED_NEIGHBOR_SELECTION,
+        POINT_CONDITIONED_SPARSE_GRAPH_SELECTION,
     }:
         raise ValueError(f"unsupported neighbor selection: {cfg.neighbor_selection}")
+    if cfg.architecture == POINT_CONDITIONED_SPARSE_GRAPH_ARCHITECTURE:
+        if cfg.neighbor_selection != POINT_CONDITIONED_SPARSE_GRAPH_SELECTION:
+            raise ValueError("v10 requires point-conditioned sparse graph selection")
+        if cfg.local_neighbor_limit != 0:
+            raise ValueError("v10 learns variable graph support; local limit must be 0")
 
     torch = _require_torch()
     nn = torch.nn
     visual_dim = visual_descriptor_dim(cfg.visual_encoder)
     numeric_dim = xml_node_feature_dim(cfg.feature_schema_id)
-    base_numeric_dim = (
-        STATE_AWARE_XML_NODE_FEATURE_DIM
-        if cfg.feature_schema_id == LOCAL_ORDER_GEOMETRIC_FEATURE_SCHEMA_ID
-        else numeric_dim
-    )
+    # A positive value keeps the historical bounded selector.  Zero is the
+    # explicit full-local mode used by the correspondence-conditioned learner:
+    # every valid within-page relation remains available to each refinement
+    # stage, with padding only to the page's maximum valid degree.
     max_neighbours = cfg.local_neighbor_limit
     state_slots = cfg.state_embedding_dim // cfg.hidden_dim
     relation_count = len(TYPED_RELATION_NAMES)
-    local_head_dim = cfg.relation_hidden_dim // cfg.num_heads
+
+    def entmax15(values: Any, *, dim: int = -1) -> Any:
+        """Differentiable 1.5-entmax with exact zeros and variable support."""
+
+        scaled = values / 2.0
+        scaled = scaled - scaled.max(dim=dim, keepdim=True).values
+        sorted_values = scaled.sort(dim=dim, descending=True).values
+        dimension = sorted_values.shape[dim]
+        view = [1] * sorted_values.ndim
+        view[dim] = dimension
+        rho = torch.arange(
+            1,
+            dimension + 1,
+            dtype=values.dtype,
+            device=values.device,
+        ).view(view)
+        mean = sorted_values.cumsum(dim) / rho
+        mean_square = sorted_values.square().cumsum(dim) / rho
+        variance_sum = rho * (mean_square - mean.square())
+        delta = (1.0 - variance_sum) / rho
+        taus = mean - delta.clamp_min(torch.finfo(values.dtype).eps).sqrt()
+        support = taus.le(sorted_values)
+        support_size = support.sum(dim=dim, keepdim=True).clamp_min(1)
+        tau_star = taus.gather(dim, support_size - 1)
+        probabilities = (scaled - tau_star).clamp_min(0.0).square()
+        return probabilities / probabilities.sum(dim=dim, keepdim=True).clamp_min(
+            torch.finfo(probabilities.dtype).eps
+        )
+
+    class PointConditionedGraphLearner(nn.Module):
+        """Learn a sparse graph only inside a tolerant local access envelope."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.query = nn.Linear(
+                cfg.hidden_dim,
+                cfg.relation_hidden_dim,
+                bias=False,
+            )
+            self.key = nn.Linear(
+                cfg.hidden_dim,
+                cfg.relation_hidden_dim,
+                bias=False,
+            )
+            self.relation_score = nn.Sequential(
+                nn.LayerNorm(RELATION_FEATURE_DIM),
+                nn.Linear(RELATION_FEATURE_DIM, cfg.relation_hidden_dim),
+                nn.GELU(),
+                nn.Linear(cfg.relation_hidden_dim, 1, bias=False),
+            )
+            self.bandwidth = nn.Sequential(
+                nn.LayerNorm(cfg.hidden_dim),
+                nn.Linear(cfg.hidden_dim, 2),
+            )
+            self.null_score = nn.Sequential(
+                nn.LayerNorm(cfg.hidden_dim),
+                nn.Linear(cfg.hidden_dim, 1),
+            )
+            nn.init.zeros_(self.bandwidth[-1].weight)
+            nn.init.zeros_(self.bandwidth[-1].bias)
+            nn.init.zeros_(self.null_score[-1].weight)
+            nn.init.constant_(self.null_score[-1].bias, -1.0)
+
+        def _locality(
+            self,
+            relations: Any,
+            numeric: Any,
+        ) -> tuple[Any, Any, Any, Any, Any]:
+            features = relations.features
+            neighbor_indices = relations.neighbor_indices
+            bbox_present = numeric[:, 4].gt(0.0)
+            bbox_pair = bbox_present[:, None] & bbox_present[neighbor_indices]
+            spatial_distance = torch.sqrt(
+                features[..., 11].square() + features[..., 12].square()
+            )
+            spatial_local = bbox_pair & spatial_distance.le(
+                float(cfg.local_spatial_radius)
+            )
+            structural_relation = features[..., 1:6].gt(0.0).any(dim=-1)
+            tree_distance = features[..., 16].clamp(0.0, 1.0)
+            structural_local = structural_relation & tree_distance.le(
+                float(cfg.local_tree_hops) / 16.0
+            )
+            available = relations.mask & (spatial_local | structural_local)
+            return (
+                available,
+                spatial_local,
+                structural_local,
+                spatial_distance,
+                tree_distance,
+            )
+
+        def forward(
+            self,
+            states: Any,
+            relations: Any,
+            numeric: Any,
+        ) -> dict[str, Any]:
+            (
+                available,
+                spatial_local,
+                structural_local,
+                spatial_distance,
+                tree_distance,
+            ) = self._locality(relations, numeric)
+            raw_bandwidth = torch.sigmoid(self.bandwidth(states))
+            spatial_bandwidth = 0.05 + raw_bandwidth[:, 0] * float(
+                cfg.local_spatial_radius
+            )
+            tree_bandwidth = (1.0 + raw_bandwidth[:, 1] * float(
+                cfg.local_tree_hops
+            )) / 16.0
+            neighbor_keys = self.key(states)[relations.neighbor_indices]
+            point_score = torch.sum(
+                self.query(states).unsqueeze(1) * neighbor_keys,
+                dim=-1,
+            ) / math.sqrt(float(cfg.relation_hidden_dim))
+            relation_score = self.relation_score(relations.features).squeeze(-1)
+            spatial_penalty = torch.where(
+                spatial_local,
+                spatial_distance / spatial_bandwidth[:, None],
+                torch.zeros_like(spatial_distance),
+            )
+            tree_penalty = torch.where(
+                structural_local,
+                tree_distance / tree_bandwidth[:, None],
+                torch.zeros_like(tree_distance),
+            )
+            edge_scores = point_score + relation_score - spatial_penalty - tree_penalty
+            edge_scores = edge_scores.masked_fill(~available, -1e4)
+            logits = torch.cat((edge_scores, self.null_score(states)), dim=1)
+            distribution = entmax15(logits, dim=1)
+            edge_weights = distribution[:, :-1] * available.to(distribution.dtype)
+            null_weights = distribution[:, -1]
+            return {
+                "locality_mask": available,
+                "neighbor_indices": relations.neighbor_indices,
+                "spatial_locality_mask": spatial_local & available,
+                "structural_locality_mask": structural_local & available,
+                "edge_scores": edge_scores,
+                "edge_weights": edge_weights,
+                "null_weights": null_weights,
+                "bandwidths": torch.stack(
+                    (spatial_bandwidth, tree_bandwidth * 16.0),
+                    dim=1,
+                ),
+            }
+
+    class SparseGraphUpdate(nn.Module):
+        """Update points through learned edge states without destroying identity."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.node_value = nn.Linear(
+                cfg.hidden_dim,
+                cfg.relation_hidden_dim,
+                bias=False,
+            )
+            self.edge_value = nn.Sequential(
+                nn.LayerNorm(RELATION_FEATURE_DIM),
+                nn.Linear(RELATION_FEATURE_DIM, cfg.relation_hidden_dim),
+                nn.GELU(),
+            )
+            self.message_projection = nn.Linear(
+                cfg.relation_hidden_dim,
+                cfg.hidden_dim,
+                bias=False,
+            )
+            self.message_norm = nn.LayerNorm(cfg.hidden_dim)
+            self.feed_forward = nn.Sequential(
+                nn.Linear(cfg.hidden_dim, cfg.hidden_dim * 2),
+                nn.GELU(),
+                nn.Dropout(cfg.dropout),
+                nn.Linear(cfg.hidden_dim * 2, cfg.hidden_dim),
+            )
+            self.output_norm = nn.LayerNorm(cfg.hidden_dim)
+            self.dropout = nn.Dropout(cfg.dropout)
+
+        def forward(self, states: Any, relations: Any, edge_weights: Any) -> Any:
+            neighbor_values = self.node_value(states)[relations.neighbor_indices]
+            edge_messages = neighbor_values + self.edge_value(relations.features)
+            message = torch.sum(edge_weights.unsqueeze(-1) * edge_messages, dim=1)
+            updated = self.message_norm(
+                states + self.dropout(self.message_projection(message))
+            )
+            return self.output_norm(
+                updated + self.dropout(self.feed_forward(updated))
+            )
 
     class DeterministicIconEncoder(nn.Module):
         def forward(self, patches: Any) -> Any:
@@ -103,27 +300,30 @@ def build_geometric_matcher(config: Any) -> Any:
         def forward(self, patches: Any) -> Any:
             return multiscale_hash_descriptor_torch(patches, torch=torch)
 
-    class MultiscaleResidualEncoder(nn.Module):
-        """Keep the stable descriptor and learn only its missing visual evidence."""
+    class TrainableMultiscaleResidualEncoder(nn.Module):
+        """Keep the stable descriptor while learning spatial ROI corrections."""
 
         def __init__(self) -> None:
             super().__init__()
             self.features = nn.Sequential(
-                nn.Conv2d(6, 16, kernel_size=5, padding=2),
+                nn.Conv2d(6, 16, kernel_size=3, padding=1),
                 nn.GELU(),
                 nn.Conv2d(16, 24, kernel_size=3, stride=2, padding=1),
                 nn.GELU(),
                 nn.Conv2d(24, 32, kernel_size=3, stride=2, padding=1),
                 nn.GELU(),
-                nn.AdaptiveAvgPool2d((4, 4)),
                 nn.Flatten(),
             )
+            spatial_size = math.ceil(float(cfg.visual_patch_size) / 4.0)
             self.dense_readout = nn.Linear(
-                32 * 4 * 4,
+                32 * int(spatial_size) * int(spatial_size),
                 visual_dim,
+                bias=False,
             )
+            # The first forward is exactly the stable descriptor.  The shared
+            # assignment loss then learns a spatial correction from the tight
+            # ROI and its context ring instead of learning from random vision.
             nn.init.zeros_(self.dense_readout.weight)
-            nn.init.zeros_(self.dense_readout.bias)
 
         def forward(self, patches: Any) -> Any:
             fixed = multiscale_hash_descriptor_torch(patches, torch=torch)
@@ -167,9 +367,7 @@ def build_geometric_matcher(config: Any) -> Any:
         if cfg.visual_encoder == MULTISCALE_HASH_VISUAL_ENCODER:
             return MultiscaleHashEncoder()
         if cfg.visual_encoder == MULTISCALE_RESIDUAL_VISUAL_ENCODER:
-            if cfg.visual_patch_size != 32:
-                raise ValueError("multiscale residual encoding requires 32x32 crops")
-            return MultiscaleResidualEncoder()
+            return TrainableMultiscaleResidualEncoder()
         raise ValueError(f"unsupported visual encoder: {cfg.visual_encoder}")
 
     class LocalGraphLayer(nn.Module):
@@ -221,7 +419,8 @@ def build_geometric_matcher(config: Any) -> Any:
 
         def __init__(self) -> None:
             super().__init__()
-            self.local = LocalGraphLayer()
+            if cfg.architecture != POINT_CONDITIONED_SPARSE_GRAPH_ARCHITECTURE:
+                self.local = LocalGraphLayer()
             self.query = nn.Linear(cfg.hidden_dim, cfg.hidden_dim, bias=False)
             self.key = nn.Linear(cfg.hidden_dim, cfg.hidden_dim, bias=False)
             self.value = nn.Linear(cfg.hidden_dim, cfg.hidden_dim, bias=False)
@@ -258,12 +457,19 @@ def build_geometric_matcher(config: Any) -> Any:
             target_bases: Any,
             relation_compatibility: Any,
         ) -> tuple[Any, Any]:
-            source_local = self.local(
-                source_states, source_bases, relation_compatibility
-            )
-            target_local = self.local(
-                target_states, target_bases, relation_compatibility
-            )
+            if cfg.architecture == POINT_CONDITIONED_SPARSE_GRAPH_ARCHITECTURE:
+                # The page encoder has already produced and exposed the learned
+                # sparse local graph. Correspondence stages only exchange
+                # cross-page evidence, avoiding a second hidden graph owner.
+                source_local = source_states
+                target_local = target_states
+            else:
+                source_local = self.local(
+                    source_states, source_bases, relation_compatibility
+                )
+                target_local = self.local(
+                    target_states, target_bases, relation_compatibility
+                )
             return (
                 self._update(
                     source_local,
@@ -299,20 +505,11 @@ def build_geometric_matcher(config: Any) -> Any:
             self.missing_text = nn.Parameter(torch.zeros(TEXT_DESCRIPTOR_DIM))
             self.missing_visual = nn.Parameter(torch.zeros(visual_dim))
             self.xml_projection = nn.Sequential(
-                nn.LayerNorm(base_numeric_dim),
-                nn.Linear(base_numeric_dim, XML_DESCRIPTOR_DIM),
+                nn.LayerNorm(numeric_dim),
+                nn.Linear(numeric_dim, XML_DESCRIPTOR_DIM),
                 nn.GELU(),
                 nn.Linear(XML_DESCRIPTOR_DIM, XML_DESCRIPTOR_DIM),
             )
-            if cfg.feature_schema_id == LOCAL_ORDER_GEOMETRIC_FEATURE_SCHEMA_ID:
-                self.local_order_projection = nn.Sequential(
-                    nn.LayerNorm(LOCAL_ORDER_FEATURE_DIM),
-                    nn.Linear(LOCAL_ORDER_FEATURE_DIM, XML_DESCRIPTOR_DIM),
-                    nn.GELU(),
-                    nn.Linear(XML_DESCRIPTOR_DIM, XML_DESCRIPTOR_DIM),
-                )
-                nn.init.zeros_(self.local_order_projection[-1].weight)
-                nn.init.zeros_(self.local_order_projection[-1].bias)
             self.text_to_hidden = nn.Linear(TEXT_DESCRIPTOR_DIM, cfg.hidden_dim)
             self.visual_to_hidden = nn.Linear(visual_dim, cfg.hidden_dim)
             self.xml_to_hidden = nn.Linear(XML_DESCRIPTOR_DIM, cfg.hidden_dim)
@@ -333,7 +530,10 @@ def build_geometric_matcher(config: Any) -> Any:
             self.logit_scale = nn.Parameter(
                 torch.tensor(math.log(5.0), dtype=torch.float32)
             )
-            self.relation_compatibility = nn.Parameter(torch.eye(relation_count))
+            if cfg.architecture != POINT_CONDITIONED_SPARSE_GRAPH_ARCHITECTURE:
+                self.relation_compatibility = nn.Parameter(
+                    torch.eye(relation_count)
+                )
             self.association_layers = nn.ModuleList(
                 ContextualRefinementLayer()
                 for _ in range(cfg.association_layers)
@@ -342,6 +542,15 @@ def build_geometric_matcher(config: Any) -> Any:
                 nn.LayerNorm(cfg.hidden_dim),
                 nn.Linear(cfg.hidden_dim, 1),
             )
+
+            if cfg.architecture == POINT_CONDITIONED_SPARSE_GRAPH_ARCHITECTURE:
+                self.sparse_graph_learners = nn.ModuleList(
+                    PointConditionedGraphLearner()
+                    for _ in range(cfg.local_graph_layers)
+                )
+                self.sparse_graph_updates = nn.ModuleList(
+                    SparseGraphUpdate() for _ in range(cfg.local_graph_layers)
+                )
 
             relation_input_dim = cfg.hidden_dim + RELATION_FEATURE_DIM
             self.relation_encoder = nn.Sequential(
@@ -373,11 +582,12 @@ def build_geometric_matcher(config: Any) -> Any:
                 nn.Linear(pair_dim, cfg.relation_hidden_dim),
                 nn.Tanh(),
             )
-            self.relation_key = nn.Linear(
-                cfg.relation_hidden_dim,
-                cfg.relation_hidden_dim,
-                bias=False,
-            )
+            if cfg.architecture != POINT_CONDITIONED_SPARSE_GRAPH_ARCHITECTURE:
+                self.relation_key = nn.Linear(
+                    cfg.relation_hidden_dim,
+                    cfg.relation_hidden_dim,
+                    bias=False,
+                )
             self.local_pair = nn.Sequential(
                 nn.LayerNorm(cfg.relation_hidden_dim * 4 + 2),
                 nn.Linear(
@@ -387,15 +597,10 @@ def build_geometric_matcher(config: Any) -> Any:
                 nn.GELU(),
                 nn.Linear(cfg.relation_hidden_dim * 2, cfg.relation_hidden_dim),
             )
-            self.local_head_projection = nn.Sequential(
-                nn.LayerNorm(cfg.num_heads * cfg.relation_hidden_dim),
-                nn.Linear(
-                    cfg.num_heads * cfg.relation_hidden_dim,
-                    cfg.relation_hidden_dim,
-                ),
-                nn.GELU(),
-            )
-            self.correspondence_evidence = nn.Linear(1, 1, bias=False)
+            if cfg.architecture != POINT_CONDITIONED_SPARSE_GRAPH_ARCHITECTURE:
+                self.correspondence_evidence = nn.Linear(1, 1, bias=False)
+            if cfg.architecture == POINT_CONDITIONED_SPARSE_GRAPH_ARCHITECTURE:
+                self.graph_prior_scale = nn.Parameter(torch.tensor(1.0))
 
             self.page_attention = nn.Sequential(
                 nn.LayerNorm(cfg.hidden_dim),
@@ -418,7 +623,8 @@ def build_geometric_matcher(config: Any) -> Any:
             )
             nn.init.normal_(self.pair_scorer[-1].weight, std=1e-3)
             nn.init.zeros_(self.pair_scorer[-1].bias)
-            nn.init.ones_(self.correspondence_evidence.weight)
+            if cfg.architecture != POINT_CONDITIONED_SPARSE_GRAPH_ARCHITECTURE:
+                nn.init.ones_(self.correspondence_evidence.weight)
             nn.init.orthogonal_(self.state_attention.weight)
 
         @property
@@ -455,11 +661,7 @@ def build_geometric_matcher(config: Any) -> Any:
             visual = visual_mask * visual + (1.0 - visual_mask) * (
                 self.missing_visual.unsqueeze(0).expand_as(visual)
             )
-            xml = self.xml_projection(numeric_features[:, :base_numeric_dim])
-            if cfg.feature_schema_id == LOCAL_ORDER_GEOMETRIC_FEATURE_SCHEMA_ID:
-                xml = xml + self.local_order_projection(
-                    numeric_features[:, base_numeric_dim:]
-                )
+            xml = self.xml_projection(numeric_features)
             modalities = torch.stack(
                 (
                     self.text_to_hidden(text),
@@ -493,16 +695,39 @@ def build_geometric_matcher(config: Any) -> Any:
             self,
             states: Any,
             relations: Any,
+            learned_graph: dict[str, Any] | None = None,
         ) -> tuple[Any, Any, Any, Any, Any]:
             count = states.shape[0]
-            # Every other page node may be useful.  Geometry and XML structure
-            # affect the learned score but never act as a hard candidate cutoff.
-            available = ~torch.eye(
-                count,
-                dtype=torch.bool,
-                device=relations.device,
-            )
-            if cfg.neighbor_selection == LEARNED_NEIGHBOR_SELECTION:
+            if learned_graph is not None:
+                available = learned_graph["locality_mask"]
+                priority = learned_graph["edge_scores"]
+                full_selection_weights = learned_graph["edge_weights"]
+                active = available & full_selection_weights.gt(0.0)
+                kept = max(1, int(active.sum(dim=1).max().item()))
+                ranking_scores = priority.masked_fill(~active, -1e4)
+                selected_slots = ranking_scores.topk(kept, dim=1).indices
+                indices = relations.neighbor_indices.gather(1, selected_slots)
+                mask = active.gather(1, selected_slots)
+                selected_scores = priority.gather(1, selected_slots)
+                selection_weights = full_selection_weights.gather(
+                    1, selected_slots
+                )
+                relation_values = relations.features.gather(
+                    1,
+                    selected_slots.unsqueeze(-1).expand(
+                        -1,
+                        -1,
+                        relations.features.shape[-1],
+                    ),
+                )
+            else:
+                available = relations[..., 17].gt(0.0)
+                available = available & ~torch.eye(
+                    count,
+                    dtype=torch.bool,
+                    device=relations.device,
+                )
+            if learned_graph is None and cfg.neighbor_selection == LEARNED_NEIGHBOR_SELECTION:
                 queries = self.neighbor_query(states)
                 keys = self.neighbor_key(states)
                 priority = (queries @ keys.T) / math.sqrt(
@@ -511,38 +736,49 @@ def build_geometric_matcher(config: Any) -> Any:
                 priority = priority + self.neighbor_relation_score(
                     relations
                 ).squeeze(-1)
-            else:
+            elif learned_graph is None:
                 priority = relations[..., 1:9].abs().sum(dim=-1)
                 priority = priority + 1.0 - 0.5 * (
                     relations[..., 11] + relations[..., 12]
                 ).clamp(max=2.0)
-            priority = priority.masked_fill(~available, -1e4)
-            kept = min(max_neighbours, count)
-            indices = priority.topk(kept, dim=1).indices
-            mask = available.gather(1, indices)
-            selected_scores = priority.gather(1, indices)
-            relation_values = relations.gather(
-                1,
-                indices.unsqueeze(-1).expand(
-                    -1,
-                    -1,
-                    relations.shape[-1],
-                ),
-            )
+            if learned_graph is None:
+                priority = priority.masked_fill(~available, -1e4)
+                kept = count if max_neighbours == 0 else min(max_neighbours, count)
+                indices = priority.topk(kept, dim=1).indices
+                mask = available.gather(1, indices)
+                selected_scores = priority.gather(1, indices)
+                relation_values = relations.gather(
+                    1,
+                    indices.unsqueeze(-1).expand(
+                        -1,
+                        -1,
+                        relations.shape[-1],
+                    ),
+                )
             selected_tokens = self.relation_encoder(
                 torch.cat((states[indices], relation_values), dim=-1)
             )
-            masked_scores = selected_scores.masked_fill(~mask, -1e4)
-            if cfg.neighbor_selection == LEARNED_NEIGHBOR_SELECTION:
-                selection_weights = torch.softmax(masked_scores, dim=1)
+            if learned_graph is None:
+                masked_scores = selected_scores.masked_fill(~mask, -1e4)
+                if cfg.neighbor_selection == LEARNED_NEIGHBOR_SELECTION:
+                    selection_weights = torch.softmax(masked_scores, dim=1)
+                else:
+                    selection_weights = mask.to(selected_scores.dtype)
+                selection_weights = selection_weights * mask.to(selected_scores.dtype)
+                selection_weights = selection_weights / selection_weights.sum(
+                    dim=1,
+                    keepdim=True,
+                ).clamp_min(1.0)
             else:
-                selection_weights = mask.to(selected_scores.dtype)
-            selection_weights = selection_weights * mask.to(selected_scores.dtype)
-            selection_weights = selection_weights / selection_weights.sum(
-                dim=1,
-                keepdim=True,
-            ).clamp_min(1.0)
-            if self.training and cfg.neighbor_selection == LEARNED_NEIGHBOR_SELECTION:
+                selection_weights = selection_weights * mask.to(
+                    selection_weights.dtype
+                )
+            if (
+                self.training
+                and learned_graph is None
+                and cfg.neighbor_selection == LEARNED_NEIGHBOR_SELECTION
+                and max_neighbours > 0
+            ):
                 # Forward remains an exact Top-K model.  The backward pass sees
                 # every structurally OR spatially OR order-connected candidate,
                 # so an initially excluded useful neighbour can still be learned.
@@ -607,47 +843,31 @@ def build_geometric_matcher(config: Any) -> Any:
             source_relations: Any,
             source_mask: Any,
             source_neighbor_indices: Any,
+            source_graph_weights: Any,
             target_relations: Any,
             target_mask: Any,
             target_neighbor_indices: Any,
-        ) -> tuple[Any, Any, Any, Any, Any]:
-            query = self.relation_query(pair_features).reshape(
-                pair_features.shape[0],
-                pair_features.shape[1],
-                cfg.num_heads,
-                local_head_dim,
-            )
-            source_keys = self.relation_key(source_relations).reshape(
-                source_relations.shape[0],
-                source_relations.shape[1],
-                cfg.num_heads,
-                local_head_dim,
-            )
-            target_keys = self.relation_key(target_relations).reshape(
-                target_relations.shape[0],
-                target_relations.shape[1],
-                cfg.num_heads,
-                local_head_dim,
-            )
+            target_graph_weights: Any,
+        ) -> tuple[Any, Any, Any, Any]:
+            query = self.relation_query(pair_features)
+            source_keys = self.relation_key(source_relations)
+            target_keys = self.relation_key(target_relations)
             compatibility = torch.einsum(
-                "nkhd,mlhd->nmhkl",
+                "nkr,mlr->nmkl",
                 source_keys,
                 target_keys,
-            ) / math.sqrt(float(local_head_dim))
+            ) / math.sqrt(float(cfg.relation_hidden_dim))
             compatibility = compatibility + torch.einsum(
-                "nmhd,nkhd->nmhk",
+                "nmr,nkr->nmk",
                 query,
                 source_keys,
             ).unsqueeze(-1)
             compatibility = compatibility + torch.einsum(
-                "nmhd,mlhd->nmhl",
+                "nmr,mlr->nml",
                 query,
                 target_keys,
             ).unsqueeze(-2)
-            mask = (
-                source_mask[:, None, None, :, None]
-                & target_mask[None, :, None, None, :]
-            )
+            mask = source_mask[:, None, :, None] & target_mask[None, :, None, :]
             anchor_confidence = soft_correspondence[
                 source_neighbor_indices[:, None, :, None],
                 target_neighbor_indices[None, :, None, :],
@@ -660,11 +880,18 @@ def build_geometric_matcher(config: Any) -> Any:
             ]
             evidence = compatibility + self.correspondence_evidence(
                 correspondence_support.unsqueeze(-1)
-            ).squeeze(-1).unsqueeze(2)
-            flat_mask = mask.expand(-1, -1, cfg.num_heads, -1, -1).flatten(
-                start_dim=3
-            )
-            flat_evidence = evidence.flatten(start_dim=3)
+            ).squeeze(-1)
+            if cfg.architecture == POINT_CONDITIONED_SPARSE_GRAPH_ARCHITECTURE:
+                tiny = torch.finfo(evidence.dtype).eps
+                graph_log_prior = (
+                    source_graph_weights[:, None, :, None].clamp_min(tiny).log()
+                    + target_graph_weights[None, :, None, :]
+                    .clamp_min(tiny)
+                    .log()
+                )
+                evidence = evidence + self.graph_prior_scale * graph_log_prior
+            flat_mask = mask.flatten(start_dim=2)
+            flat_evidence = evidence.flatten(start_dim=2)
             masked_evidence = flat_evidence.masked_fill(~flat_mask, -1e4)
             flat_weights = torch.softmax(masked_evidence, dim=-1)
             flat_weights = flat_weights * flat_mask.to(flat_weights.dtype)
@@ -672,7 +899,7 @@ def build_geometric_matcher(config: Any) -> Any:
                 dim=-1,
                 keepdim=True,
             ).clamp_min(1.0)
-            head_weights = flat_weights.reshape_as(evidence)
+            weights = flat_weights.reshape_as(evidence)
             valid_count = flat_mask.sum(dim=-1).clamp_min(1)
             valid_any = flat_mask.any(dim=-1)
             soft_or = torch.logsumexp(masked_evidence, dim=-1) - torch.log(
@@ -683,16 +910,16 @@ def build_geometric_matcher(config: Any) -> Any:
                 torch.sigmoid(flat_evidence) * flat_mask.to(flat_evidence.dtype)
             ).sum(dim=-1) / valid_count.to(flat_evidence.dtype)
             source_context = torch.einsum(
-                "nmhkl,nkr->nmhr",
-                head_weights,
+                "nmkl,nkr->nmr",
+                weights,
                 source_relations,
             )
             target_context = torch.einsum(
-                "nmhkl,mlr->nmhr",
-                head_weights,
+                "nmkl,mlr->nmr",
+                weights,
                 target_relations,
             )
-            context_by_head = self.local_pair(
+            context = self.local_pair(
                 torch.cat(
                     (
                         source_context,
@@ -705,12 +932,92 @@ def build_geometric_matcher(config: Any) -> Any:
                     dim=-1,
                 )
             )
-            context = self.local_head_projection(
-                context_by_head.flatten(start_dim=2)
+            support = torch.stack((soft_or, coverage), dim=-1)
+            return context, weights, anchor_confidence, support
+
+        def _sparse_graph_match(
+            self,
+            pair_features: Any,
+            soft_correspondence: Any,
+            source_graph: dict[str, Any],
+            source_edge_tokens: Any,
+            target_graph: dict[str, Any],
+            target_edge_tokens: Any,
+        ) -> tuple[Any, Any, Any, Any]:
+            """Align two explicit learned graphs without enumerating edge pairs."""
+
+            source_edges = (
+                source_graph["edge_weights"].unsqueeze(-1) * source_edge_tokens
             )
-            support = torch.stack((soft_or, coverage), dim=-1).mean(dim=2)
-            weights = head_weights.mean(dim=2)
-            return context, weights, anchor_confidence, support, head_weights
+            target_edges = (
+                target_graph["edge_weights"].unsqueeze(-1) * target_edge_tokens
+            )
+            source_neighbor_correspondence = soft_correspondence[
+                source_graph["neighbor_indices"]
+            ]
+            source_aligned = torch.einsum(
+                "ikr,ikm->imr",
+                source_edges,
+                source_neighbor_correspondence,
+            )
+            source_support = torch.einsum(
+                "ik,ikm->im",
+                source_graph["edge_weights"],
+                source_neighbor_correspondence,
+            )
+            relation_consistency = torch.zeros(
+                pair_features.shape[0],
+                pair_features.shape[1],
+                source_edge_tokens.shape[-1],
+                dtype=pair_features.dtype,
+                device=pair_features.device,
+            )
+            graph_support = torch.zeros_like(soft_correspondence)
+            for slot in range(target_graph["neighbor_indices"].shape[1]):
+                target_indices = target_graph["neighbor_indices"][:, slot]
+                relation_consistency = relation_consistency + (
+                    source_aligned[:, target_indices, :]
+                    * target_edges[:, slot, :].unsqueeze(0)
+                )
+                graph_support = graph_support + (
+                    source_support[:, target_indices]
+                    * target_graph["edge_weights"][:, slot].unsqueeze(0)
+                )
+            source_mass = source_graph["edge_weights"].sum(dim=1)
+            target_mass = target_graph["edge_weights"].sum(dim=1)
+            available_mass = source_mass[:, None] * target_mass[None, :]
+            stable_mass = 1e-4
+            normalized_support = graph_support / available_mass.clamp_min(stable_mass)
+            normalized_consistency = relation_consistency / graph_support.clamp_min(
+                stable_mass
+            ).unsqueeze(-1)
+            normalized_consistency = torch.where(
+                graph_support.unsqueeze(-1).gt(stable_mass),
+                normalized_consistency,
+                torch.zeros_like(normalized_consistency),
+            )
+            normalized_support = torch.where(
+                available_mass.gt(stable_mass),
+                normalized_support,
+                torch.zeros_like(normalized_support),
+            )
+            query = self.relation_query(pair_features)
+            scaled_consistency = self.graph_prior_scale * normalized_consistency
+            context = self.local_pair(
+                torch.cat(
+                    (
+                        query,
+                        scaled_consistency,
+                        torch.abs(query - scaled_consistency),
+                        query * scaled_consistency,
+                        graph_support.unsqueeze(-1),
+                        normalized_support.unsqueeze(-1),
+                    ),
+                    dim=-1,
+                )
+            )
+            support = torch.stack((graph_support, normalized_support), dim=-1)
+            return context, graph_support, graph_support, support
 
         @staticmethod
         def _relative_correspondence_support(soft_correspondence: Any) -> Any:
@@ -811,20 +1118,32 @@ def build_geometric_matcher(config: Any) -> Any:
                 visual,
                 visual_mask,
             )
+            states = base_states
+            learned_graph = None
+            learned_graph_by_layer = []
+            if cfg.architecture == POINT_CONDITIONED_SPARSE_GRAPH_ARCHITECTURE:
+                for graph_learner, graph_update in zip(
+                    self.sparse_graph_learners,
+                    self.sparse_graph_updates,
+                    strict=True,
+                ):
+                    learned_graph = graph_learner(states, relations, numeric)
+                    learned_graph_by_layer.append(learned_graph)
+                    states = graph_update(
+                        states,
+                        relations,
+                        learned_graph["edge_weights"],
+                    )
             (
                 relation_tokens,
                 relation_mask,
                 relation_neighbor_indices,
                 neighbor_selection_scores,
                 neighbor_selection_weights,
-            ) = self._relations(base_states, relations)
-            # Local relations stay explicit until a source-target pair is
-            # compared.  Pre-aggregating them into a node hid region identity
-            # and was causally inactive in Dev ablation.
-            states = base_states
+            ) = self._relations(states, relations, learned_graph)
             page_hidden, _ = self._page(states)
             state_embedding = self._state_embedding(states)
-            return {
+            encoded = {
                 "base_states": base_states,
                 "states": states,
                 "visual_descriptors": visual_descriptors,
@@ -836,10 +1155,15 @@ def build_geometric_matcher(config: Any) -> Any:
                 "relation_neighbor_indices": relation_neighbor_indices,
                 "neighbor_selection_scores": neighbor_selection_scores,
                 "neighbor_selection_weights": neighbor_selection_weights,
-                "relation_bases": typed_relation_bases(
-                    relations,
-                    numeric,
-                    feature_schema_id=cfg.feature_schema_id,
+                "relation_bases": (
+                    None
+                    if cfg.architecture
+                    == POINT_CONDITIONED_SPARSE_GRAPH_ARCHITECTURE
+                    else typed_relation_bases(
+                        relations,
+                        numeric,
+                        feature_schema_id=cfg.feature_schema_id,
+                    )
                 ),
                 "page_hidden": page_hidden,
                 "page_embedding": state_embedding,
@@ -848,6 +1172,29 @@ def build_geometric_matcher(config: Any) -> Any:
                 "stable_state_embedding": state_embedding,
                 "active_state_embedding": state_embedding,
             }
+            if learned_graph is not None:
+                local_graph_edge_tokens = self.relation_encoder(
+                    torch.cat(
+                        (
+                            states[relations.neighbor_indices],
+                            relations.features,
+                        ),
+                        dim=-1,
+                    )
+                )
+                encoded.update(
+                    {
+                        "local_graph": learned_graph,
+                        "local_graph_by_layer": tuple(learned_graph_by_layer),
+                        "local_graph_edge_tokens": local_graph_edge_tokens,
+                        "locality_mask": learned_graph["locality_mask"],
+                        "local_graph_edge_scores": learned_graph["edge_scores"],
+                        "local_graph_edge_weights": learned_graph["edge_weights"],
+                        "local_graph_null_weights": learned_graph["null_weights"],
+                        "local_graph_bandwidths": learned_graph["bandwidths"],
+                    }
+                )
+            return encoded
 
         def match_pages(
             self,
@@ -866,7 +1213,6 @@ def build_geometric_matcher(config: Any) -> Any:
             soft_correspondences = []
             local_corrections = []
             local_weights_by_layer = []
-            local_head_weights_by_layer = []
             local_anchor_confidence_by_layer = []
             local_support_by_layer = []
             source_states_by_layer = []
@@ -881,27 +1227,48 @@ def build_geometric_matcher(config: Any) -> Any:
                     target_states,
                     source_page["relation_bases"],
                     target_page["relation_bases"],
-                    self.relation_compatibility,
+                    (
+                        None
+                        if cfg.architecture
+                        == POINT_CONDITIONED_SPARSE_GRAPH_ARCHITECTURE
+                        else self.relation_compatibility
+                    ),
                 )
                 pair_features = self._pair_features(source_states, target_states)
                 soft_correspondence = self._soft_correspondence(logits)
                 soft_correspondences.append(soft_correspondence)
-                (
-                    local_context,
-                    local_weights,
-                    local_anchor_confidence,
-                    local_support,
-                    local_head_weights,
-                ) = self._local_match(
-                    pair_features,
-                    soft_correspondence,
-                    source_page["relation_tokens"],
-                    source_page["relation_mask"],
-                    source_page["relation_neighbor_indices"],
-                    target_page["relation_tokens"],
-                    target_page["relation_mask"],
-                    target_page["relation_neighbor_indices"],
-                )
+                if cfg.architecture == POINT_CONDITIONED_SPARSE_GRAPH_ARCHITECTURE:
+                    (
+                        local_context,
+                        local_weights,
+                        local_anchor_confidence,
+                        local_support,
+                    ) = self._sparse_graph_match(
+                        pair_features,
+                        soft_correspondence,
+                        source_page["local_graph"],
+                        source_page["local_graph_edge_tokens"],
+                        target_page["local_graph"],
+                        target_page["local_graph_edge_tokens"],
+                    )
+                else:
+                    (
+                        local_context,
+                        local_weights,
+                        local_anchor_confidence,
+                        local_support,
+                    ) = self._local_match(
+                        pair_features,
+                        soft_correspondence,
+                        source_page["relation_tokens"],
+                        source_page["relation_mask"],
+                        source_page["relation_neighbor_indices"],
+                        source_page["neighbor_selection_weights"],
+                        target_page["relation_tokens"],
+                        target_page["relation_mask"],
+                        target_page["relation_neighbor_indices"],
+                        target_page["neighbor_selection_weights"],
+                    )
                 # The v9 assignment logits naturally span well beyond [-1, 1].
                 # Capping this residual made the learned local evidence unable
                 # to change a ranking even when its neighbourhood was decisive.
@@ -924,13 +1291,12 @@ def build_geometric_matcher(config: Any) -> Any:
                 assignment_scores.append(logits)
                 local_corrections.append(local_correction)
                 local_weights_by_layer.append(local_weights)
-                local_head_weights_by_layer.append(local_head_weights)
                 local_anchor_confidence_by_layer.append(local_anchor_confidence)
                 local_support_by_layer.append(local_support)
                 source_states_by_layer.append(source_states)
                 target_states_by_layer.append(target_states)
             logits_ba = logits.T
-            return {
+            output = {
                 "logits_ab": logits,
                 "logits_ba": logits_ba,
                 "unary_logits": unary_logits,
@@ -985,12 +1351,8 @@ def build_geometric_matcher(config: Any) -> Any:
                     "neighbor_selection_weights"
                 ],
                 "local_match_weights": local_weights,
-                "local_match_head_weights": local_head_weights,
                 "local_anchor_confidence": local_anchor_confidence,
                 "local_match_weights_by_layer": tuple(local_weights_by_layer),
-                "local_match_head_weights_by_layer": tuple(
-                    local_head_weights_by_layer
-                ),
                 "local_anchor_confidence_by_layer": tuple(
                     local_anchor_confidence_by_layer
                 ),
@@ -1012,6 +1374,20 @@ def build_geometric_matcher(config: Any) -> Any:
                     "active_state_embedding"
                 ],
             }
+            if cfg.architecture == POINT_CONDITIONED_SPARSE_GRAPH_ARCHITECTURE:
+                output.update(
+                    {
+                        "source_local_graph": source_page["local_graph"],
+                        "target_local_graph": target_page["local_graph"],
+                        "source_local_graph_by_layer": source_page[
+                            "local_graph_by_layer"
+                        ],
+                        "target_local_graph_by_layer": target_page[
+                            "local_graph_by_layer"
+                        ],
+                    }
+                )
+            return output
 
         def forward(
             self,

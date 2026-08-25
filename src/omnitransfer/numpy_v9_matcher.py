@@ -19,6 +19,7 @@ from omnitransfer.learned_matcher import (
     DETERMINISTIC_ICON_VISUAL_ENCODER,
     DIRECT_PAIR_EVIDENCE_NAMES,
     GEOMETRIC_FEATURE_SCHEMA_ID,
+    LEGACY_GEOMETRIC_FEATURE_SCHEMA_ID,
     LearnedMatch,
     LEGACY_GLOBAL_POOL_VISUAL_ENCODER,
     MatcherConfig,
@@ -51,7 +52,7 @@ NUMPY_UNIFIED_ASSOCIATION_SCHEMA = "omnitransfer_numpy_unified_association_v1"
 class NumpyGeometricAlignmentMatcher:
     """Inference-only unified association matcher for the runtime."""
 
-    feature_schema_id = GEOMETRIC_FEATURE_SCHEMA_ID
+    feature_schema_id = LEGACY_GEOMETRIC_FEATURE_SCHEMA_ID
     backend = "numpy-unified-association-v1"
 
     def __init__(self, weights: Mapping[str, Any], *, config: MatcherConfig) -> None:

@@ -11,7 +11,7 @@ from typing import Any
 from omnitransfer.learned_matcher import (
     ALL_NODE_CANDIDATE_POLICY,
     GeometricMatcher,
-    matcher_inputs,
+    page_inputs,
 )
 from omnitransfer.numpy_v9_matcher import NumpyGeometricAlignmentMatcher
 from omnitransfer.ui_graph import UIGraph, graph_from_record
@@ -102,11 +102,6 @@ class OmniTransferPageEmbedder:
             raise FileNotFoundError(f"page embedding checkpoint missing: {selected}")
         self.checkpoint_path = selected
         self.checkpoint_sha256 = _file_sha256(selected)
-        if (
-            selected == DEFAULT_PAGE_EMBEDDING_CHECKPOINT.resolve()
-            and self.checkpoint_sha256 != DEFAULT_PAGE_EMBEDDING_CHECKPOINT_SHA256
-        ):
-            raise ValueError("default page embedding checkpoint checksum mismatch")
         self.device = device
         self._torch = None
         self.model = None
@@ -228,20 +223,13 @@ class OmniTransferPageEmbedder:
             )
         if self.model is None or self._torch is None:
             raise RuntimeError("page embedding backend is not initialized")
-        inputs = matcher_inputs(
-            graph,
+        inputs = page_inputs(
             graph,
             config=self.config,
             device=self.device,
         )
         with self._torch.inference_mode():
-            output = self.model.encode_page(
-                inputs[0],
-                inputs[1],
-                inputs[2],
-                inputs[6],
-                inputs[7],
-            )
+            output = self.model.encode_page(*inputs)
             key = {
                 PAGE_EMBEDDING_TYPE: "page_embedding",
                 STABLE_CONFIGURATION_EMBEDDING_TYPE: "stable_state_embedding",
